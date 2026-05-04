@@ -258,10 +258,32 @@ FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
 ## 10. CI / Release
 
 `.github/workflows/build-release.yml` 會在以下情況跑 PyInstaller 打 Windows EXE：
-- GitHub Release **published** 時（自動）
+- 任何 push 到 `main`（自動）
 - 從 Actions 頁面手動 `workflow_dispatch`
 
-PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免日後上游 release 突然壞掉而沒人發現。Release 時會把 `SST39FlashProgrammer.exe` 自動掛到對應 Release assets。
+純文件變更（`README.md` / `**/*.md` / `spec/**` / `.gitignore`）會被 `paths-ignore` 跳過，不浪費 runner 分鐘。
+
+### 自動 release 規則
+
+每個觸發成功的 build 會自動建一個 **prerelease**：
+- Tag 格式：`build-YYYYMMDD-HHMMSS-<7位commit sha>`
+- Release 名稱：`Auto build build-YYYYMMDD-HHMMSS-<sha>`
+- 內文：commit SHA + commit message
+- Asset：`SST39FlashProgrammer.exe`
+
+PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免上游升版突然壞掉。
+
+### 自動 prune（保留最近 4 份 EXE）
+
+每次 build 結束後會清理：
+- 撈出所有 `build-*` 開頭的 release，按 `publishedAt` 排序
+- 第 5 個（含）以後的 release 上的 `SST39FlashProgrammer.exe` asset 會被刪掉
+- **Release notes、tag、source code zip 都保留**，方便回顧 commit 歷史
+- 你手動發的 semver release（例如 `v0.1.0`）**不會被碰**，因為 prefix 不符
+
+### 想停掉自動 build？
+
+把 `.github/workflows/build-release.yml` 開頭的 `push:` 區塊整段拿掉就會回到「只在手動 dispatch 時 build」。
 
 ## 11. 待辦 / 可改進
 

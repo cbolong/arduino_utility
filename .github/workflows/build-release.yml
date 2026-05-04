@@ -1,8 +1,13 @@
-name: Build Windows EXE on Release
+name: Build Windows EXE on every commit
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "**/*.md"
+      - "spec/**"
+      - ".gitignore"
   workflow_dispatch:
 
 permissions:
@@ -33,14 +38,40 @@ jobs:
       - name: Build EXE with PyInstaller
         run: pyinstaller --noconfirm --onefile --windowed --name SST39FlashProgrammer binFileTransferGui.py
 
-      - name: Upload build artifact (always)
-        uses: actions/upload-artifact@v4
-        with:
-          name: SST39FlashProgrammer
-          path: dist/SST39FlashProgrammer.exe
+      - name: Compute build tag
+        id: tag
+        shell: bash
+        run: |
+          ts=$(date -u +%Y%m%d-%H%M%S)
+          short_sha=${GITHUB_SHA:0:7}
+          echo "tag=build-${ts}-${short_sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Attach EXE to Release
-        if: github.event_name == 'release'
+      - name: Create release with EXE
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Auto build ${{ steps.tag.outputs.tag }}"
+          body: |
+            Auto-built EXE for commit ${{ github.sha }}.
+
+            Commit message:
+            ${{ github.event.head_commit.message }}
+          prerelease: true
           files: dist/SST39FlashProgrammer.exe
+
+      - name: Prune old auto-build EXE assets, keep latest 4
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName,publishedAt \
+            --jq 'map(select(.tagName | startswith("build-"))) |
+                  sort_by(.publishedAt) | reverse | .[4:] | .[].tagName' \
+          | while read -r tag; do
+              [ -z "$tag" ] && continue
+              echo "Pruning EXE asset from $tag"
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '.assets[] | select(.name=="SST39FlashProgrammer.exe") | .name' \
+              | xargs -r -I{} gh release delete-asset "$tag" "{}" --repo "$GITHUB_REPOSITORY" --yes
+            done
