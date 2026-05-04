@@ -160,7 +160,7 @@ MCU: CHIP ERASE SUCCESSFUL!
 
 ## 6. 通訊協定（PC ⇄ MCU 握手）
 
-UART：**115200 8N1**，chunk size = **4096 bytes**。
+UART：**500000 8N1**，chunk size = **4096 bytes**。
 
 | 階段 | 方向 | 訊息字串 | 意義 |
 |------|------|----------|------|
@@ -170,14 +170,19 @@ UART：**115200 8N1**，chunk size = **4096 bytes**。
 | 4 | PC → MCU | （4096 bytes raw binary）| 一個 chunk 的資料 |
 | 5 | MCU → PC | `ARDUINO_RECEIVED_LINE_DONE` | 該 chunk 已 Program + Read-Back + Verify 完成 |
 | — | 重複 4–5 直到 32 個 chunk（128 KB）送完 | | |
-| 6 | MCU → PC | `ARDUINO_DATA_COMPLETED` | 10 秒 idle 後 MCU 認定傳輸結束 |
+| 6 | PC → MCU | `ARDUINO_TRANSFER_DONE_SIGNAL` | 顯式通知傳輸結束（取代等 10 秒 idle）|
+| 7 | MCU → PC | `Timing (ms): total=..., program=..., readback=..., compare=..., uart+idle=...` | 該次燒錄的分段耗時 |
+| 8 | MCU → PC | `ARDUINO_DATA_COMPLETED` | MCU 認定傳輸結束 |
 | ✗ | MCU → PC | `ARDUINO_ERROR` | 任何 fatal error（ID 不符 / Erase 失敗 / Verify 失敗）|
 
+如果新版 PC 工具配上舊版 `.ino`，舊 MCU 不認得 `ARDUINO_TRANSFER_DONE_SIGNAL` 但仍會在 10 秒 idle 後送 `ARDUINO_DATA_COMPLETED`（10 秒 timeout 仍保留作為 fallback）；速度退回舊行為，功能不會壞。
+
 對應字串常數：
-- `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strTransferCompleted` / `strError`
-- `.py`：`MCU_ERASE_READY` 等同名變數，集中在 `binFileTransfer_core.py`
+- `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strTransferDone` / `strTransferCompleted` / `strError`
+- `.py`：`MCU_ERASE_READY` / `MCU_ERASE_TRIGGER` / `MCU_READY_TO_START` / `MCU_RECEIVED_LINE_RESPONSE` / `MCU_TRANSFER_DONE_SIGNAL` / `MCU_TRANSFER_COMPLETED` / `MCU_ERROR`，集中在 `binFileTransfer_core.py`
 
 > 改字串時 **兩邊一定要一起改**，否則 PC 端會等到 `handshake_timeout_s`（預設 30 秒）超時並退出，MCU 端則卡在 `while(true)`。
+> 改 `BAUD` 也是兩邊都改。混搭不同 baud 會收到亂碼。
 
 ---
 
@@ -229,14 +234,16 @@ Datasheet 標稱 Chip Erase typ. 70 ms。`.ino` 目前用 `delay(100)` 後做 10
 
 `binFileProgram.ino`：
 ```c
-#define UART_BAUDRATE         115200
+#define UART_BAUDRATE         500000
 #define CHUNK_SIZE            4096
-#define RECEIVED_DATA_TIMEOUT 10000   // ms，最後一段過 10s 就視為結束
+#define EXPECTED_CHUNKS       32      // 128 KB / CHUNK_SIZE
+#define RECEIVED_DATA_TIMEOUT 10000   // ms，僅作為舊版 host 的 fallback
+                                      // （新版 host 會送 TRANSFER_DONE_SIGNAL）
 ```
 
 `binFileTransfer_core.py`（CLI 與 GUI 共用）：
 ```python
-BAUD                        = 115200
+BAUD                        = 500000
 CHUNK_SIZE                  = 4096
 FILE_SIZE_SUPPORT           = 128 * 1024
 TARGET_VID                  = 0x2341     # Arduino
@@ -251,7 +258,7 @@ DEFAULT_HANDSHAKE_TIMEOUT_S = 30.0
 FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
 ```
 
-兩邊（`.ino` 與 `.py`）的 `BAUD` 與 `CHUNK_SIZE` **必須一致**；6 個握手字串也必須一致。
+兩邊（`.ino` 與 `.py`）的 `BAUD` 與 `CHUNK_SIZE` **必須一致**；7 個握手字串也必須一致（含新增的 `ARDUINO_TRANSFER_DONE_SIGNAL`）。
 
 ---
 

@@ -1,9 +1,12 @@
 
 // USER define
-#define UART_BAUDRATE 115200
+#define UART_BAUDRATE 500000
 #define CHUNK_SIZE 4096
+#define EXPECTED_CHUNKS 32                // 128 KB / CHUNK_SIZE
 
-#define RECEIVED_DATA_TIMEOUT 10000       // 10 sec
+#define RECEIVED_DATA_TIMEOUT 10000       // 10 sec, kept only as fallback
+                                          // (host now sends an explicit
+                                          // ARDUINO_TRANSFER_DONE_SIGNAL)
 
 
 
@@ -12,6 +15,7 @@ const char* strEraseReady = "ARDUINO_ERASE_READY";
 const char* strEraseTrigger = "ARDUINO_ERASE_TRIGGER";
 const char* strReadyStart = "ARDUINO_READY_TO_RECEIVED_DATA";
 const char* strLineReceivedResponse = "ARDUINO_RECEIVED_LINE_DONE";
+const char* strTransferDone = "ARDUINO_TRANSFER_DONE_SIGNAL";
 const char* strTransferCompleted = "ARDUINO_DATA_COMPLETED";
 const char* strError = "ARDUINO_ERROR";
 
@@ -229,7 +233,7 @@ void compareChunkData(uint32_t chunk) {
 
 void setup() {
   delay(2000);
-  Serial.begin(115200);
+  Serial.begin(UART_BAUDRATE);
 
   Serial.println("Pins initial.");
   // Initial All Pins
@@ -278,65 +282,82 @@ void setup() {
 }
 
 void loop() {
-  // 1. 檢查是否有資料進來
-  if (Serial.available() > 0) {
-    isTransferring = true;     // 開始接收，設為傳輸中
-    lastRecvTime = millis();   // 更新最後接收時間點
+  // Phase A: while we still expect chunk data, accumulate bytes.
+  // Phase B: once all EXPECTED_CHUNKS chunks have been ACKed, switch to
+  // line-based reading to look for the explicit ARDUINO_TRANSFER_DONE_SIGNAL
+  // sentinel from the host. The 10 s timeout below is kept only as a fallback
+  // for legacy hosts that don't send the sentinel.
 
-    byte incomingByte = Serial.read();
+  if (chunkCount < EXPECTED_CHUNKS) {
+    if (Serial.available() > 0) {
+      isTransferring = true;     // 開始接收，設為傳輸中
+      lastRecvTime = millis();   // 更新最後接收時間點
 
-    if (bytesRead < CHUNK_SIZE) {
-      buffer[bytesRead++] = incomingByte;
+      byte incomingByte = Serial.read();
+
+      if (bytesRead < CHUNK_SIZE) {
+        buffer[bytesRead++] = incomingByte;
+      }
+
+      // 當收滿 4KB 時
+      if (bytesRead >= CHUNK_SIZE) {
+        chunkCount++;
+        processChunk(chunkCount);
+
+        // Program complete, send strLineReceivedResponse
+        Serial.println(strLineReceivedResponse);
+        bytesRead = 0; // 重置計數器
+      }
     }
-
-    // 當收滿 4KB 時
-    if (bytesRead >= CHUNK_SIZE) {
-      chunkCount++;
-      processChunk(chunkCount);
-
-      // Program complete, send strLineReceivedResponse
-      Serial.println(strLineReceivedResponse);
-      bytesRead = 0; // 重置計數器
+  } else {
+    // Post-data phase: scan for ARDUINO_TRANSFER_DONE_SIGNAL.
+    if (Serial.available() > 0) {
+      lastRecvTime = millis();
+      String input = Serial.readStringUntil('\n');
+      input.trim();
+      if (input == strTransferDone) {
+        finishTransfer();
+        return;
+      }
+      // Unknown line — ignore and keep waiting (timeout fallback below).
     }
   }
 
-  // 2. 檢查是否超時（10秒沒新資料）
+  // 2. 檢查是否超時（10秒沒新資料）— fallback for hosts that never send the sentinel.
   if (isTransferring && (millis() - lastRecvTime > (unsigned long)RECEIVED_DATA_TIMEOUT)) {
-    // 如果最後一段不足 4KB 但有殘餘資料，也可以在這裡處理
-    if (bytesRead > 0) {
-        Serial.print("Final fragment received: ");
-        Serial.print(bytesRead);
-        Serial.println(" bytes.");
-        // 如果需要，可以在這裡呼叫 processChunk 處理最後不足 4K 的部分
-    }
-
-    // verifyReadData();
-
-    // readROMData();
-
-    // Timing summary — captured by host log so we can compare across runs.
-    unsigned long total_ms = millis() - t_recv_start_ms;
-    unsigned long uart_overhead_ms = total_ms
-      - t_program_total_ms - t_read_total_ms - t_compare_total_ms;
-    Serial.print("Timing (ms): total=");
-    Serial.print(total_ms);
-    Serial.print(", program=");
-    Serial.print(t_program_total_ms);
-    Serial.print(", readback=");
-    Serial.print(t_read_total_ms);
-    Serial.print(", compare=");
-    Serial.print(t_compare_total_ms);
-    Serial.print(", uart+idle=");
-    Serial.println(uart_overhead_ms);
-
-    Serial.println(strTransferCompleted); // 印出結束訊息
-
-    // 重置狀態，等待下一次可能的傳輸
-    isTransferring = false;
-    bytesRead = 0;
-    chunkCount = 0;
-
+    finishTransfer();
   }
+}
+
+void finishTransfer() {
+  // 如果最後一段不足 4KB 但有殘餘資料，紀錄一下
+  if (bytesRead > 0) {
+    Serial.print("Final fragment received: ");
+    Serial.print(bytesRead);
+    Serial.println(" bytes.");
+  }
+
+  // Timing summary — captured by host log so we can compare across runs.
+  unsigned long total_ms = millis() - t_recv_start_ms;
+  unsigned long uart_overhead_ms = total_ms
+    - t_program_total_ms - t_read_total_ms - t_compare_total_ms;
+  Serial.print("Timing (ms): total=");
+  Serial.print(total_ms);
+  Serial.print(", program=");
+  Serial.print(t_program_total_ms);
+  Serial.print(", readback=");
+  Serial.print(t_read_total_ms);
+  Serial.print(", compare=");
+  Serial.print(t_compare_total_ms);
+  Serial.print(", uart+idle=");
+  Serial.println(uart_overhead_ms);
+
+  Serial.println(strTransferCompleted);
+
+  // 重置狀態，等待下一次可能的傳輸
+  isTransferring = false;
+  bytesRead = 0;
+  chunkCount = 0;
 }
 
 

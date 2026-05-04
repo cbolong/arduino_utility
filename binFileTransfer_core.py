@@ -8,7 +8,7 @@ import serial
 import serial.tools.list_ports
 
 
-BAUD = 115200
+BAUD = 500000
 CHUNK_SIZE = 4096
 FILE_SIZE_SUPPORT = 128 * 1024
 
@@ -21,6 +21,7 @@ MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
 MCU_READY_TO_START = "ARDUINO_READY_TO_RECEIVED_DATA"
 MCU_RECEIVED_LINE_RESPONSE = "ARDUINO_RECEIVED_LINE_DONE"
+MCU_TRANSFER_DONE_SIGNAL = "ARDUINO_TRANSFER_DONE_SIGNAL"
 MCU_TRANSFER_COMPLETED = "ARDUINO_DATA_COMPLETED"
 MCU_ERROR = "ARDUINO_ERROR"
 
@@ -140,6 +141,12 @@ def program_firmware(
                 f"File transfer completed. Total {chunk_count:2d} chunks.",
                 "ok",
             )
+
+            # Tell the MCU explicitly that the binary stream is done so it
+            # doesn't have to wait the full RECEIVED_DATA_TIMEOUT (~10s) of
+            # silence before declaring completion.
+            log(f"handshake send     : {MCU_TRANSFER_DONE_SIGNAL}", "info")
+            ser.write(f"{MCU_TRANSFER_DONE_SIGNAL}\n".encode("UTF-8"))
 
             if not _wait_for_line(
                 ser, MCU_TRANSFER_COMPLETED, log, handshake_timeout_s
