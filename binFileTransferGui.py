@@ -1,14 +1,16 @@
+from __future__ import annotations
+
 import os
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from binFileTransfer_core import program_firmware
 
 
 APP_TITLE = "SST39 Flash Programmer"
-WINDOW_SIZE = "780x520"
+WINDOW_SIZE = "780x560"
 
 LEVEL_TAGS = {
     "info": ("log_info", "#1a1a1a"),
@@ -19,6 +21,16 @@ LEVEL_TAGS = {
 }
 
 
+# Sentinel posted on log_queue to signal worker thread completion. Using a
+# unique object instead of a magic string avoids any collision with caller-
+# provided log messages.
+class _DoneSentinel:
+    __slots__ = ("success",)
+
+    def __init__(self, success: bool) -> None:
+        self.success = success
+
+
 class ProgrammerGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -26,7 +38,7 @@ class ProgrammerGui:
         self.root.geometry(WINDOW_SIZE)
 
         self.firmware_path: str | None = None
-        self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.log_queue: queue.Queue[tuple[str, str] | _DoneSentinel] = queue.Queue()
         self.worker: threading.Thread | None = None
 
         self._build_widgets()
@@ -45,6 +57,18 @@ class ProgrammerGui:
         self.browse_btn = ttk.Button(top, text="Browse...", command=self._on_browse)
         self.browse_btn.pack(side=tk.LEFT)
 
+        port_row = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        port_row.pack(fill=tk.X)
+        ttk.Label(port_row, text="Port (optional):").pack(side=tk.LEFT)
+        self.port_var = tk.StringVar(value="")
+        self.port_entry = ttk.Entry(port_row, textvariable=self.port_var, width=20)
+        self.port_entry.pack(side=tk.LEFT, padx=(6, 6))
+        ttk.Label(
+            port_row,
+            text="(leave blank to auto-detect Arduino Due Programming Port)",
+            foreground="#666666",
+        ).pack(side=tk.LEFT)
+
         mid = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         mid.pack(fill=tk.X)
         self.start_btn = ttk.Button(
@@ -62,9 +86,17 @@ class ProgrammerGui:
         scroll_y = ttk.Scrollbar(
             log_frame, orient=tk.VERTICAL, command=self.log_text.yview
         )
-        self.log_text.configure(yscrollcommand=scroll_y.set)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_x = ttk.Scrollbar(
+            log_frame, orient=tk.HORIZONTAL, command=self.log_text.xview
+        )
+        self.log_text.configure(
+            yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set
+        )
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
 
         for tag, color in LEVEL_TAGS.values():
             self.log_text.tag_configure(tag, foreground=color)
@@ -105,36 +137,48 @@ class ProgrammerGui:
         self._set_status("Programming...", "#a06400")
         self.start_btn.config(state=tk.DISABLED)
         self.browse_btn.config(state=tk.DISABLED)
+        self.port_entry.config(state=tk.DISABLED)
+
+        port = self.port_var.get().strip() or None
 
         self.worker = threading.Thread(
-            target=self._run_transfer, args=(self.firmware_path,), daemon=True
+            target=self._run_transfer,
+            args=(self.firmware_path, port),
+            daemon=True,
         )
         self.worker.start()
 
-    def _run_transfer(self, firmware_path: str) -> None:
+    def _run_transfer(self, firmware_path: str, port: str | None) -> None:
         def log_cb(message: str, level: str) -> None:
             self.log_queue.put((message, level))
 
         try:
-            success = program_firmware(firmware_path, log_cb)
+            success = program_firmware(firmware_path, log_cb, port=port)
         except Exception as e:
             self.log_queue.put((f"Unexpected error: {e}", "err"))
             success = False
 
-        self.log_queue.put((("__DONE_OK__" if success else "__DONE_FAIL__"), "ctrl"))
+        self.log_queue.put(_DoneSentinel(success))
 
     def _drain_log_queue(self) -> None:
         try:
             while True:
-                message, level = self.log_queue.get_nowait()
-                if level == "ctrl":
-                    if message == "__DONE_OK__":
+                item = self.log_queue.get_nowait()
+                if isinstance(item, _DoneSentinel):
+                    if item.success:
                         self._set_status("Success", "#1f7a1f")
+                        self._append_log(
+                            f"{os.path.basename(self.firmware_path or '')} "
+                            "Program Successful.",
+                            "ok",
+                        )
                     else:
                         self._set_status("Error", "#b00020")
                     self.start_btn.config(state=tk.NORMAL)
                     self.browse_btn.config(state=tk.NORMAL)
+                    self.port_entry.config(state=tk.NORMAL)
                 else:
+                    message, level = item
                     self._append_log(message, level)
         except queue.Empty:
             pass
@@ -158,6 +202,11 @@ class ProgrammerGui:
 
     def _on_close(self) -> None:
         if self.worker and self.worker.is_alive():
+            messagebox.showinfo(
+                "Busy",
+                "Programming is in progress. Please wait for it to finish "
+                "before closing.",
+            )
             return
         self.root.destroy()
 

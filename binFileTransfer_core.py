@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 from typing import Callable
@@ -12,6 +14,8 @@ FILE_SIZE_SUPPORT = 128 * 1024
 
 TARGET_VID = 0x2341
 TARGET_PID = 0x003D
+
+DEFAULT_HANDSHAKE_TIMEOUT_S = 30.0
 
 MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
@@ -31,8 +35,11 @@ def _find_arduino_port() -> str | None:
     return None
 
 
-def _wait_for_line(ser: serial.Serial, expected: str, log: LogCallback) -> bool:
+def _wait_for_line(
+    ser: serial.Serial, expected: str, log: LogCallback, timeout_s: float
+) -> bool:
     log(f"handshake wait     : {expected}", "wait")
+    deadline = time.monotonic() + timeout_s
     while True:
         if ser.in_waiting > 0:
             line = ser.readline().decode(errors="ignore").strip()
@@ -44,19 +51,35 @@ def _wait_for_line(ser: serial.Serial, expected: str, log: LogCallback) -> bool:
                 return False
             if line:
                 log(f"MCU: {line}", "info")
+        if time.monotonic() > deadline:
+            log(
+                f"Timeout after {timeout_s:.1f}s waiting for: {expected}",
+                "err",
+            )
+            return False
         time.sleep(0.01)
 
 
-def program_firmware(firmware_path: str, log: LogCallback) -> bool:
+def program_firmware(
+    firmware_path: str,
+    log: LogCallback,
+    *,
+    port: str | None = None,
+    handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+) -> bool:
     """Program the given firmware.bin to a connected Arduino-Due-driven SST39 flash.
 
     log(message, level) where level is one of: info, ok, warn, err, wait.
+    If `port` is given, skip USB VID/PID auto-detection and use it directly.
+    `handshake_timeout_s` bounds each wait for an MCU response so a stuck MCU
+    no longer hangs the caller forever.
     Returns True on success, False on any failure. Never calls sys.exit / input.
     """
-    port = _find_arduino_port()
     if port is None:
-        log("Arduino Device not found.", "err")
-        return False
+        port = _find_arduino_port()
+        if port is None:
+            log("Arduino Device not found.", "err")
+            return False
     log(f"Arduino Found : {port}.", "ok")
 
     if not os.path.isfile(firmware_path):
@@ -74,13 +97,13 @@ def program_firmware(firmware_path: str, log: LogCallback) -> bool:
 
     try:
         with serial.Serial(port, BAUD, timeout=0.1) as ser:
-            if not _wait_for_line(ser, MCU_ERASE_READY, log):
+            if not _wait_for_line(ser, MCU_ERASE_READY, log, handshake_timeout_s):
                 return False
 
             log(f"handshake send     : {MCU_ERASE_TRIGGER}", "info")
             ser.write(f"{MCU_ERASE_TRIGGER}\n".encode("UTF-8"))
 
-            if not _wait_for_line(ser, MCU_READY_TO_START, log):
+            if not _wait_for_line(ser, MCU_READY_TO_START, log, handshake_timeout_s):
                 return False
 
             with open(firmware_path, "rb") as f:
@@ -108,7 +131,9 @@ def program_firmware(firmware_path: str, log: LogCallback) -> bool:
                     f"Chunk {chunk_count} sending     | Waiting for MCU response ...",
                     "info",
                 )
-                if not _wait_for_line(ser, MCU_RECEIVED_LINE_RESPONSE, log):
+                if not _wait_for_line(
+                    ser, MCU_RECEIVED_LINE_RESPONSE, log, handshake_timeout_s
+                ):
                     return False
 
             log(
@@ -116,10 +141,11 @@ def program_firmware(firmware_path: str, log: LogCallback) -> bool:
                 "ok",
             )
 
-            if not _wait_for_line(ser, MCU_TRANSFER_COMPLETED, log):
+            if not _wait_for_line(
+                ser, MCU_TRANSFER_COMPLETED, log, handshake_timeout_s
+            ):
                 return False
 
-        log("firmware program successful.", "ok")
         return True
 
     except serial.SerialException as e:

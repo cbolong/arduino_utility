@@ -1,7 +1,13 @@
+from __future__ import annotations
+
+import argparse
 import os
 import sys
 
-from binFileTransfer_core import program_firmware
+from binFileTransfer_core import (
+    DEFAULT_HANDSHAKE_TIMEOUT_S,
+    program_firmware,
+)
 
 
 FILE_NAME = "firmware.bin"
@@ -31,16 +37,50 @@ def cli_log(message: str, level: str) -> None:
         print(f"{prefix}{message}")
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Upload firmware.bin to an Arduino-Due-driven SST39 flash programmer.",
+    )
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="Serial port (e.g. COM19, /dev/ttyACM0). If omitted, auto-detects "
+        "by Arduino Due Programming Port USB VID/PID.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_HANDSHAKE_TIMEOUT_S,
+        help=f"Per-handshake timeout in seconds (default: {DEFAULT_HANDSHAKE_TIMEOUT_S}).",
+    )
+    parser.add_argument(
+        "--file",
+        default=None,
+        help=f"Path to firmware binary (default: ./{FILE_NAME}).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
     os.system("")  # enable ANSI on legacy Windows consoles
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    firmware_path = os.path.join(base_dir, FILE_NAME)
+    args = _parse_args(argv)
 
-    success = program_firmware(firmware_path, cli_log)
+    if args.file:
+        firmware_path = os.path.abspath(args.file)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        firmware_path = os.path.join(base_dir, FILE_NAME)
+
+    success = program_firmware(
+        firmware_path,
+        cli_log,
+        port=args.port,
+        handshake_timeout_s=args.timeout,
+    )
 
     if success:
-        cli_log(f"{FILE_NAME} Program Successful.", "ok")
+        cli_log(f"{os.path.basename(firmware_path)} Program Successful.", "ok")
     input(PYTHON_DONE)
     return 0 if success else 1
 
