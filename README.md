@@ -274,6 +274,37 @@ FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
 
 PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免上游升版突然壞掉。
 
+### EXE 是 self-contained 的（給接到 EXE 的人）
+
+`SST39FlashProgrammer.exe` 直接 build 在 Windows runner 上，**單檔可執行，不用裝 Python、不用裝 Visual C++ Redist、不用 pip**。Build 內含：
+- Python 3.12 直譯器
+- `tkinter` GUI runtime（標準庫，PyInstaller 自動包入）
+- `pyserial` + Windows COM port enumeration backend（用 `--collect-submodules serial` + `--hidden-import serial.tools.list_ports_windows` 強制納入，避免 PyInstaller 漏掉動態載入的子模組）
+
+唯一 host 端要有的東西是 **Arduino Due Programming Port 的 USB CDC driver**，這個 Windows Update 在第一次插上 Due 時會自動安裝，不用人工處理。
+
+#### 第一次執行的 SmartScreen 警告
+
+EXE **沒有 code signing 憑證**（憑證是要花錢買的，目前沒做），所以第一次在乾淨的 Windows 跑會跳：
+
+> Windows protected your PC
+
+點 **More info → Run anyway** 即可。同一台機器之後就不會再跳了。
+
+如果之後願意花錢買 OV/EV code signing 憑證，把 PFX 設進 GitHub Secrets，build 步驟可以加 `signtool` 簽章，這個警告就會永遠消失。
+
+#### EXE 的 Windows 版本資訊
+
+build 時 workflow 會動態產生 `version.txt` 並用 `--version-file` 嵌進 EXE。Right-click EXE → Properties → Details 可以看到：
+- `FileDescription`：SST39 Flash EEPROM Programmer
+- `ProductName`：SST39 Flash Programmer
+- `FileVersion` / `ProductVersion`：`build-YYYY.MM.DD-<sha>`
+- `CompanyName`：cbolong
+
+#### EXE 的 icon
+
+`assets/icon.ico` 是一個 256/128/64/48/32/16 多解析度的 chip-style icon，build 時用 `--icon` 嵌入。Explorer thumbnail 與 taskbar 顯示用的就是這個。要換 icon 直接覆蓋這個檔案即可（保持 multi-resolution `.ico` 格式）。
+
 ### 自動 prune（保留最近 4 份 EXE）
 
 每次 build 結束後會清理：
