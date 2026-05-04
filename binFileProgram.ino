@@ -45,6 +45,12 @@ uint32_t chunkCount = 0;
 unsigned long lastRecvTime = 0;      // last received data time
 bool isTransferring = false;         // is transferring flag
 
+// Timing instrumentation (cumulative, ms). Reset on transfer start.
+unsigned long t_recv_start_ms = 0;   // millis() when strReadyStart was sent
+unsigned long t_program_total_ms = 0;
+unsigned long t_read_total_ms = 0;
+unsigned long t_compare_total_ms = 0;
+
 
 void processChunk(uint32_t num) {
   digitalWrite(LED_BUILTIN, HIGH);
@@ -57,12 +63,20 @@ void processChunk(uint32_t num) {
     Serial.print(" ");
   }
   Serial.println();
-  delay(50); 
+  delay(50);
   digitalWrite(LED_BUILTIN, LOW);
 
+  unsigned long t0 = millis();
   programChunkData(num);
+  unsigned long t1 = millis();
   readChunkData(num);
+  unsigned long t2 = millis();
   compareChunkData(num);
+  unsigned long t3 = millis();
+
+  t_program_total_ms += (t1 - t0);
+  t_read_total_ms    += (t2 - t1);
+  t_compare_total_ms += (t3 - t2);
 }
 
 void readSoftwareID() {
@@ -253,6 +267,12 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
 
+  // Reset timing counters before the transfer phase begins.
+  t_program_total_ms = 0;
+  t_read_total_ms = 0;
+  t_compare_total_ms = 0;
+  t_recv_start_ms = millis();
+
   // Send strReadyStart to start receive data
   Serial.println(strReadyStart);
 }
@@ -293,8 +313,24 @@ void loop() {
     // verifyReadData();
 
     // readROMData();
+
+    // Timing summary — captured by host log so we can compare across runs.
+    unsigned long total_ms = millis() - t_recv_start_ms;
+    unsigned long uart_overhead_ms = total_ms
+      - t_program_total_ms - t_read_total_ms - t_compare_total_ms;
+    Serial.print("Timing (ms): total=");
+    Serial.print(total_ms);
+    Serial.print(", program=");
+    Serial.print(t_program_total_ms);
+    Serial.print(", readback=");
+    Serial.print(t_read_total_ms);
+    Serial.print(", compare=");
+    Serial.print(t_compare_total_ms);
+    Serial.print(", uart+idle=");
+    Serial.println(uart_overhead_ms);
+
     Serial.println(strTransferCompleted); // 印出結束訊息
-    
+
     // 重置狀態，等待下一次可能的傳輸
     isTransferring = false;
     bytesRead = 0;
