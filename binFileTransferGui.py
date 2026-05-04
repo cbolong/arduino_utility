@@ -4,14 +4,13 @@ import os
 import queue
 import threading
 import tkinter as tk
-from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
-from binFileTransfer_core import gpio_read, gpio_set, program_firmware
+from binFileTransfer_core import GpioSession, program_firmware
 
 
 APP_TITLE = "SST39 Flash Programmer"
-WINDOW_SIZE = "820x620"
+WINDOW_SIZE = "900x780"
 
 LEVEL_TAGS = {
     "info": ("log_info", "#1a1a1a"),
@@ -30,27 +29,37 @@ class _DoneSentinel:
         self.success = success
 
 
-# Pin choices for the GPIO tab. Order matches README §3 wiring tables so the
-# Due labels users see in the dropdown line up with what they read in the
-# datasheet section. Each entry: (display_label, due_pin_number).
-GPIO_PIN_CHOICES: list[tuple[str, int]] = [
-    # Address bus (A0..A18)
-    ("A0  (D44)", 44), ("A1  (D42)", 42), ("A2  (D40)", 40),
-    ("A3  (D38)", 38), ("A4  (D36)", 36), ("A5  (D34)", 34),
-    ("A6  (D32)", 32), ("A7  (D30)", 30), ("A8  (D33)", 33),
-    ("A9  (D35)", 35), ("A10 (D41)", 41), ("A11 (D37)", 37),
-    ("A12 (D28)", 28), ("A13 (D31)", 31), ("A14 (D29)", 29),
-    ("A15 (D26)", 26), ("A16 (D24)", 24), ("A17 (D27)", 27),
-    ("A18 (D22)", 22),
-    # Data bus (DQ0..DQ7)
-    ("DQ0 (D46)", 46), ("DQ1 (D48)", 48), ("DQ2 (D50)", 50),
-    ("DQ3 (D53)", 53), ("DQ4 (D51)", 51), ("DQ5 (D49)", 49),
-    ("DQ6 (D47)", 47), ("DQ7 (D45)", 45),
-    # Control
-    ("CE# (D43)", 43), ("OE# (D39)", 39), ("WE# (D25)", 25),
-    # On-board LED
-    ("LED (D13)", 13),
+# Pin layout for the GPIO tab. Grouped by bus role; section labels appear as
+# headers in the UI. Each pin: (display_label, due_pin_number).
+GPIO_PIN_GROUPS: list[tuple[str, list[tuple[str, int]]]] = [
+    ("Address bus (A0–A18)", [
+        ("A0  (D44)", 44), ("A1  (D42)", 42), ("A2  (D40)", 40),
+        ("A3  (D38)", 38), ("A4  (D36)", 36), ("A5  (D34)", 34),
+        ("A6  (D32)", 32), ("A7  (D30)", 30), ("A8  (D33)", 33),
+        ("A9  (D35)", 35), ("A10 (D41)", 41), ("A11 (D37)", 37),
+        ("A12 (D28)", 28), ("A13 (D31)", 31), ("A14 (D29)", 29),
+        ("A15 (D26)", 26), ("A16 (D24)", 24), ("A17 (D27)", 27),
+        ("A18 (D22)", 22),
+    ]),
+    ("Data bus (DQ0–DQ7)", [
+        ("DQ0 (D46)", 46), ("DQ1 (D48)", 48), ("DQ2 (D50)", 50),
+        ("DQ3 (D53)", 53), ("DQ4 (D51)", 51), ("DQ5 (D49)", 49),
+        ("DQ6 (D47)", 47), ("DQ7 (D45)", 45),
+    ]),
+    ("Control", [
+        ("CE# (D43)", 43), ("OE# (D39)", 39), ("WE# (D25)", 25),
+    ]),
+    ("On-board", [
+        ("LED (D13)", 13),
+    ]),
 ]
+
+
+def _all_gpio_pins() -> list[tuple[str, int]]:
+    out: list[tuple[str, int]] = []
+    for _section, items in GPIO_PIN_GROUPS:
+        out.extend(items)
+    return out
 
 
 class _LoggedTab:
@@ -208,6 +217,24 @@ class FlashTab(_LoggedTab):
             self._append_log("Please select a valid firmware file first.", "err")
             return
 
+        # Disable immediately so a double-click can't fire two disconnects /
+        # two flashes.
+        self.start_btn.config(state=tk.DISABLED)
+        self.browse_btn.config(state=tk.DISABLED)
+
+        # If the GPIO tab is holding the serial port, close it first then
+        # proceed with flashing. The GpioTab does the disconnect on its
+        # worker thread and calls our continuation when done.
+        if self.app.gpio_tab.is_connected():
+            self._append_log(
+                "GPIO session is active — auto-disconnecting before flash.",
+                "info",
+            )
+            self.app.gpio_tab.disconnect_for_flash(on_done=self._do_start)
+            return
+        self._do_start()
+
+    def _do_start(self) -> None:
         port = self.app.get_port()
         firmware_path = self.firmware_path
 
@@ -216,9 +243,11 @@ class FlashTab(_LoggedTab):
 
         if self.submit_work(work):
             self.app.set_status("Programming...", "#a06400")
-            self.start_btn.config(state=tk.DISABLED)
-            self.browse_btn.config(state=tk.DISABLED)
             self.app.lock_port_entry()
+        else:
+            # Worker refused (already busy). Re-enable buttons so user can retry.
+            self.start_btn.config(state=tk.NORMAL)
+            self.browse_btn.config(state=tk.NORMAL)
 
     def _on_done(self, success: bool) -> None:
         if success:
@@ -237,143 +266,458 @@ class FlashTab(_LoggedTab):
 # ---------------------------------------------------------------------------
 # GPIO 設定 tab — Plan A (single-pin manual test).
 # ---------------------------------------------------------------------------
-class GpioTab(_LoggedTab):
-    def _build_controls(self, parent: ttk.Frame) -> None:
-        # Row 1: Pin dropdown
-        row1 = ttk.Frame(parent)
-        row1.pack(fill=tk.X)
-        ttk.Label(row1, text="Pin:").pack(side=tk.LEFT)
-        self.pin_var = tk.StringVar(value=GPIO_PIN_CHOICES[0][0])
-        self.pin_combo = ttk.Combobox(
-            row1,
-            textvariable=self.pin_var,
-            values=[label for label, _ in GPIO_PIN_CHOICES],
-            state="readonly",
-            width=18,
+class _PinRow:
+    """One row of the GPIO dashboard: label, mode, HIGH/LOW radios, read display.
+    Constructed disabled; call set_enabled(True) when the GPIO session opens.
+    Click handlers fire `on_set(pin, mode, value_or_None)` — the GpioTab is
+    expected to enqueue the actual GPIO_SET round-trip on its worker thread.
+    """
+
+    def __init__(
+        self,
+        parent: ttk.Frame,
+        label: str,
+        pin: int,
+        on_set,
+    ) -> None:
+        self.pin = pin
+        self.on_set = on_set
+        self._suppress_callbacks = False  # used while we programmatically set vars
+
+        self.frame = ttk.Frame(parent)
+        ttk.Label(self.frame, text=label, width=12, anchor="w").grid(
+            row=0, column=0, sticky="w"
         )
-        self.pin_combo.pack(side=tk.LEFT, padx=(6, 0))
 
-        # Row 2: Mode radio
-        row2 = ttk.Frame(parent)
-        row2.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(row2, text="Mode:").pack(side=tk.LEFT)
-        self.mode_var = tk.StringVar(value="OUTPUT")
-        ttk.Radiobutton(
-            row2, text="INPUT", variable=self.mode_var, value="INPUT",
-            command=self._on_mode_change,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Radiobutton(
-            row2, text="OUTPUT", variable=self.mode_var, value="OUTPUT",
-            command=self._on_mode_change,
-        ).pack(side=tk.LEFT, padx=(6, 0))
-
-        # Row 3: Value radio (only meaningful when mode=OUTPUT)
-        row3 = ttk.Frame(parent)
-        row3.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(row3, text="Value:").pack(side=tk.LEFT)
-        self.value_var = tk.StringVar(value="HIGH")
-        self.high_btn = ttk.Radiobutton(
-            row3, text="HIGH", variable=self.value_var, value="HIGH"
+        self.mode_var = tk.StringVar(value="INPUT")
+        self.mode_combo = ttk.Combobox(
+            self.frame,
+            textvariable=self.mode_var,
+            values=["OUTPUT", "INPUT"],
+            state="disabled",
+            width=8,
         )
-        self.high_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.low_btn = ttk.Radiobutton(
-            row3, text="LOW", variable=self.value_var, value="LOW"
+        self.mode_combo.grid(row=0, column=1, padx=(6, 12))
+        self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_changed)
+
+        self.value_var = tk.StringVar(value="")
+        self.high_radio = ttk.Radiobutton(
+            self.frame, text="HIGH", variable=self.value_var,
+            value="HIGH", state="disabled", command=self._on_value_changed,
         )
-        self.low_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.high_radio.grid(row=0, column=2, padx=(0, 4))
+        self.low_radio = ttk.Radiobutton(
+            self.frame, text="LOW", variable=self.value_var,
+            value="LOW", state="disabled", command=self._on_value_changed,
+        )
+        self.low_radio.grid(row=0, column=3, padx=(0, 18))
 
-        # Row 4: Action buttons
-        row4 = ttk.Frame(parent)
-        row4.pack(fill=tk.X, pady=(8, 0))
-        self.apply_btn = ttk.Button(row4, text="Apply", command=self._on_apply)
-        self.apply_btn.pack(side=tk.LEFT)
-        self.read_btn = ttk.Button(row4, text="Read once", command=self._on_read)
-        self.read_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.clear_btn = ttk.Button(row4, text="Clear Log", command=self._clear_log)
-        self.clear_btn.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(self.frame, text="Read:").grid(row=0, column=4)
+        self.read_var = tk.StringVar(value="??")
+        self.read_label = ttk.Label(
+            self.frame, textvariable=self.read_var,
+            width=6, foreground="#666666", anchor="w",
+        )
+        self.read_label.grid(row=0, column=5, padx=(4, 0))
 
-        # Row 5: Last read display
-        row5 = ttk.Frame(parent)
-        row5.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(row5, text="Last read:").pack(side=tk.LEFT)
-        self.last_read_var = tk.StringVar(value="(no read yet)")
-        ttk.Label(
-            row5, textvariable=self.last_read_var, foreground="#1a1a1a"
-        ).pack(side=tk.LEFT, padx=(6, 0))
+    def set_enabled(self, enabled: bool) -> None:
+        if not enabled:
+            self.mode_combo.config(state="disabled")
+            self.high_radio.config(state="disabled")
+            self.low_radio.config(state="disabled")
+            return
+        self.mode_combo.config(state="readonly")
+        if self.mode_var.get() == "OUTPUT":
+            self.high_radio.config(state="normal")
+            self.low_radio.config(state="normal")
+        else:
+            self.high_radio.config(state="disabled")
+            self.low_radio.config(state="disabled")
 
-    def _on_mode_change(self) -> None:
-        # Disable HIGH/LOW radios when INPUT (value is meaningless).
-        new_state = tk.NORMAL if self.mode_var.get() == "OUTPUT" else tk.DISABLED
-        self.high_btn.config(state=new_state)
-        self.low_btn.config(state=new_state)
-
-    def _selected_pin(self) -> int:
-        label = self.pin_var.get()
-        for lbl, pin in GPIO_PIN_CHOICES:
-            if lbl == label:
-                return pin
-        # Should not happen because Combobox is readonly.
-        return GPIO_PIN_CHOICES[0][1]
-
-    def _on_apply(self) -> None:
-        pin = self._selected_pin()
+    def _on_mode_changed(self, _event=None) -> None:
+        if self._suppress_callbacks:
+            return
         mode = self.mode_var.get()
-        value = self.value_var.get() if mode == "OUTPUT" else None
-        port = self.app.get_port()
-
-        def work(log_cb):
-            return gpio_set(pin, mode, value, log_cb, port=port)
-
-        if self.submit_work(work):
-            self.app.set_status(f"Setting pin {pin} {mode}...", "#a06400")
-            self._lock_controls(True)
-
-    def _on_read(self) -> None:
-        pin = self._selected_pin()
-        port = self.app.get_port()
-        # gpio_read returns "HIGH"/"LOW"/None — wrap so submit_work sees a bool.
-        result_holder: dict[str, str | None] = {"value": None}
-
-        def work(log_cb):
-            v = gpio_read(pin, log_cb, port=port)
-            result_holder["value"] = v
-            return v is not None
-
-        if self.submit_work(work):
-            self.app.set_status(f"Reading pin {pin}...", "#a06400")
-            self._lock_controls(True)
-            # Stash the holder so _on_done can pull from it.
-            self._pending_read = (pin, result_holder)
-        # If submit_work failed (a previous job is still running) keep the
-        # previous _pending_read intact so that job's result still updates
-        # the "Last read" label on its own _on_done.
-
-    def _on_done(self, success: bool) -> None:
-        # If this was a read, surface the value into the "Last read" label.
-        if getattr(self, "_pending_read", None) is not None:
-            pin, holder = self._pending_read
-            v = holder.get("value")
-            if v is not None:
-                ts = datetime.now().strftime("%H:%M:%S")
-                self.last_read_var.set(f"Pin {pin} = {v}   (at {ts})")
-            self._pending_read = None
-
-        if success:
-            self.app.set_status("OK", "#1f7a1f")
+        if mode == "OUTPUT":
+            self.high_radio.config(state="normal")
+            self.low_radio.config(state="normal")
         else:
-            self.app.set_status("Error", "#b00020")
-        self._lock_controls(False)
+            self.high_radio.config(state="disabled")
+            self.low_radio.config(state="disabled")
+            # Clear stale value selection so radios visually match disabled state.
+            self._suppress_callbacks = True
+            self.value_var.set("")
+            self._suppress_callbacks = False
+        # Tell controller — value=None means "just switch mode, don't drive".
+        self.on_set(self.pin, mode, None)
 
-    def _lock_controls(self, locked: bool) -> None:
-        s = tk.DISABLED if locked else tk.NORMAL
-        self.apply_btn.config(state=s)
-        self.read_btn.config(state=s)
-        self.pin_combo.config(state=tk.DISABLED if locked else "readonly")
-        if locked:
-            self.app.lock_port_entry()
-        else:
+    def _on_value_changed(self) -> None:
+        if self._suppress_callbacks:
+            return
+        value = self.value_var.get()
+        if value in ("HIGH", "LOW"):
+            self.on_set(self.pin, "OUTPUT", value)
+
+    def set_read_value(self, value: str) -> None:
+        """Update the right-most "Read:" cell. Coloured for readability."""
+        self.read_var.set(value)
+        self.read_label.config(
+            foreground="#1f7a1f" if value == "HIGH" else "#1a1a1a"
+        )
+
+
+class GpioTab(_LoggedTab):
+    """Plan B: persistent connection + every-pin-visible dashboard."""
+
+    def __init__(self, parent: ttk.Notebook, app: "App") -> None:
+        # Initialise persistent-worker state before super().__init__ runs
+        # _build_controls (which references some of these).
+        self._session: GpioSession | None = None
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._busy = False
+        self._auto_refresh_after_id: str | None = None
+        self._pin_rows: dict[int, _PinRow] = {}
+        super().__init__(parent, app)
+        # Persistent worker thread that drains _cmd_queue forever.
+        self._worker_thread = threading.Thread(target=self._cmd_loop, daemon=True)
+        self._worker_thread.start()
+
+    # ---- _LoggedTab overrides ---------------------------------------------
+
+    def is_busy(self) -> bool:
+        # The persistent thread is always alive; "busy" means a command is
+        # actively running. Auto-refresh and per-click sets all flow through.
+        return self._busy
+
+    def submit_work(self, target_callable) -> bool:
+        # GpioTab does not use submit_work — everything goes via _cmd_queue.
+        # Defensive override: refuse so the parent's spawn-a-thread path
+        # never gets used here.
+        raise RuntimeError("GpioTab uses _cmd_queue, not submit_work")
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        # Row 1: Connection status + Connect / Disconnect
+        conn_row = ttk.Frame(parent)
+        conn_row.pack(fill=tk.X)
+        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
+        self._conn_status_var = tk.StringVar(value="Disconnected")
+        self._conn_status_label = ttk.Label(
+            conn_row, textvariable=self._conn_status_var, foreground="#b00020"
+        )
+        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
+        self._connect_btn = ttk.Button(
+            conn_row, text="Connect", command=self._on_connect
+        )
+        self._connect_btn.pack(side=tk.LEFT)
+        self._disconnect_btn = ttk.Button(
+            conn_row, text="Disconnect",
+            command=self._on_disconnect, state=tk.DISABLED,
+        )
+        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Row 2: Read All + Auto-refresh
+        action_row = ttk.Frame(parent)
+        action_row.pack(fill=tk.X, pady=(8, 0))
+        self._read_all_btn = ttk.Button(
+            action_row, text="Read All",
+            command=self._on_read_all, state=tk.DISABLED,
+        )
+        self._read_all_btn.pack(side=tk.LEFT)
+
+        self._auto_refresh_var = tk.BooleanVar(value=False)
+        self._auto_refresh_check = ttk.Checkbutton(
+            action_row, text="Auto-refresh every",
+            variable=self._auto_refresh_var,
+            command=self._on_toggle_auto_refresh, state=tk.DISABLED,
+        )
+        self._auto_refresh_check.pack(side=tk.LEFT, padx=(16, 0))
+
+        self._auto_refresh_interval_var = tk.StringVar(value="1.0")
+        self._interval_spin = ttk.Spinbox(
+            action_row, from_=0.2, to=60.0, increment=0.5,
+            textvariable=self._auto_refresh_interval_var, width=5,
+        )
+        self._interval_spin.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(action_row, text="s").pack(side=tk.LEFT, padx=(2, 12))
+
+        self._clear_log_btn = ttk.Button(
+            action_row, text="Clear Log", command=self._clear_log
+        )
+        self._clear_log_btn.pack(side=tk.LEFT)
+
+        # Row 3+: scrollable pin panel grouped by section.
+        self._build_pin_panel(parent)
+
+    def _build_pin_panel(self, parent: ttk.Frame) -> None:
+        # Container with a Canvas that hosts an inner Frame; scrollable
+        # vertically. Cross-platform mousewheel handling included.
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        canvas = tk.Canvas(wrap, highlightthickness=0, height=420)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(inner_id, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mousewheel scroll while pointer is over the panel.
+        def _on_mousewheel(event):
+            # Windows / macOS: event.delta in multiples of 120
+            # Linux: <Button-4>/<Button-5> handled separately below
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_wheel(_e=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        def _unbind_wheel(_e=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        # Build section headers + pin rows.
+        for section_label, items in GPIO_PIN_GROUPS:
+            header = ttk.Label(
+                inner, text=f"── {section_label} ──",
+                foreground="#444444", font=("TkDefaultFont", 9, "bold"),
+            )
+            header.pack(anchor="w", pady=(8, 4), padx=(2, 0))
+            for label, pin in items:
+                row = _PinRow(inner, label, pin, on_set=self._on_pin_set)
+                row.frame.pack(fill=tk.X, anchor="w", padx=(8, 0))
+                self._pin_rows[pin] = row
+
+    def _build_log_area(self) -> None:
+        # Compact log (3-row visible height) — operations are fast so a big
+        # log eats too much real estate from the pin panel.
+        log_frame = ttk.Frame(self.frame, padding=(10, 0, 10, 10))
+        log_frame.pack(fill=tk.X)
+        self.log_text = tk.Text(
+            log_frame, wrap=tk.NONE, state=tk.DISABLED,
+            font=("Consolas", 9), height=4,
+        )
+        scroll_y = ttk.Scrollbar(
+            log_frame, orient=tk.VERTICAL, command=self.log_text.yview
+        )
+        self.log_text.configure(yscrollcommand=scroll_y.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        for tag, color in LEVEL_TAGS.values():
+            self.log_text.tag_configure(tag, foreground=color)
+
+    # ---- queue / worker ---------------------------------------------------
+
+    def _enqueue(self, cmd) -> None:
+        """Schedule `cmd()` (callable taking no args) on the persistent worker."""
+        self._cmd_queue.put(cmd)
+
+    def _cmd_loop(self) -> None:
+        while True:
+            cmd = self._cmd_queue.get()
+            if cmd is None:
+                break
+            self._busy = True
+            try:
+                cmd()
+            except Exception as e:
+                self._log_callback_threadsafe(f"GPIO cmd error: {e}", "err")
+            finally:
+                self._busy = False
+
+    # ---- connection handling ---------------------------------------------
+
+    def is_connected(self) -> bool:
+        return self._session is not None
+
+    def _set_conn_status(self, text: str, color: str) -> None:
+        self._conn_status_var.set(text)
+        self._conn_status_label.config(foreground=color)
+
+    def _on_connect(self) -> None:
+        if self._session is not None:
+            return
+        if self.app.any_tab_busy():
+            messagebox.showinfo(
+                "Busy",
+                "Another tab has an operation in progress. Please wait.",
+            )
+            return
+        port = self.app.get_port()
+        self._set_conn_status("Connecting...", "#a06400")
+        self._connect_btn.config(state=tk.DISABLED)
+        self.app.lock_port_entry()
+        self.app.set_status("GPIO connecting...", "#a06400")
+
+        def cmd():
+            session = GpioSession(self._log_callback_threadsafe, port=port)
+            success = session.open()
+            self.app.root.after(
+                0,
+                lambda: self._on_connect_done(session if success else None),
+            )
+
+        self._enqueue(cmd)
+
+    def _on_connect_done(self, session: GpioSession | None) -> None:
+        if session is None:
+            self._set_conn_status("Disconnected", "#b00020")
+            self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            # Re-respect mode radio for value buttons.
-            self._on_mode_change()
+            self.app.set_status("GPIO connect failed", "#b00020")
+            return
+
+        self._session = session
+        self._set_conn_status("Connected", "#1f7a1f")
+        self._disconnect_btn.config(state=tk.NORMAL)
+        self._read_all_btn.config(state=tk.NORMAL)
+        self._auto_refresh_check.config(state=tk.NORMAL)
+        for row in self._pin_rows.values():
+            row.set_enabled(True)
+        self.app.set_status("GPIO Connected", "#1f7a1f")
+        # Initial read so the Read column isn't a wall of "??".
+        self._on_read_all()
+
+    def _on_disconnect(self) -> None:
+        if self._session is None:
+            return
+        self._begin_disconnect()
+        # Plain disconnect — no chained callback.
+        self._enqueue(self._do_close_session)
+
+    def _begin_disconnect(self) -> None:
+        # Stop auto-refresh before tearing down the connection.
+        if self._auto_refresh_after_id is not None:
+            try:
+                self.app.root.after_cancel(self._auto_refresh_after_id)
+            except Exception:
+                pass
+            self._auto_refresh_after_id = None
+        self._auto_refresh_var.set(False)
+        # Disable everything that needs the session.
+        self._disconnect_btn.config(state=tk.DISABLED)
+        self._read_all_btn.config(state=tk.DISABLED)
+        self._auto_refresh_check.config(state=tk.DISABLED)
+        for row in self._pin_rows.values():
+            row.set_enabled(False)
+        self._set_conn_status("Disconnecting...", "#a06400")
+
+    def _do_close_session(self) -> None:
+        if self._session is not None:
+            self._session.close()
+        self.app.root.after(0, self._on_disconnect_done)
+
+    def _on_disconnect_done(self) -> None:
+        self._session = None
+        self._set_conn_status("Disconnected", "#b00020")
+        self._connect_btn.config(state=tk.NORMAL)
+        self.app.unlock_port_entry()
+        self.app.set_status("GPIO Disconnected", "#666666")
+
+    def disconnect_for_flash(self, on_done) -> None:
+        """Close the GPIO session (if open) then call on_done() on the Tk
+        thread. Used by FlashTab so the flash flow can take over the serial
+        port without the user manually clicking Disconnect first."""
+        if self._session is None:
+            on_done()
+            return
+        self._begin_disconnect()
+
+        def cmd():
+            self._do_close_session()
+            self.app.root.after(0, on_done)
+
+        # Replace the simple close with the chained variant.
+        self._enqueue(cmd)
+
+    # ---- per-pin set / read all ------------------------------------------
+
+    def _on_pin_set(self, pin: int, mode: str, value: str | None) -> None:
+        if self._session is None:
+            return
+
+        def cmd():
+            success = self._session.set_pin(pin, mode, value)
+            if success:
+                if value is not None:
+                    # OUTPUT-driven pin reads back what we wrote (no need
+                    # for an extra GPIO_READ round-trip).
+                    self.app.root.after(
+                        0, lambda: self._pin_rows[pin].set_read_value(value)
+                    )
+                else:
+                    # Mode change without a value — refresh the read so the
+                    # display reflects the new physical state.
+                    v = self._session.read_pin(pin)
+                    if v is not None:
+                        self.app.root.after(
+                            0, lambda vv=v: self._pin_rows[pin].set_read_value(vv)
+                        )
+
+        self._enqueue(cmd)
+
+    def _on_read_all(self) -> None:
+        if self._session is None:
+            return
+
+        def cmd():
+            for pin, _row in self._pin_rows.items():
+                v = self._session.read_pin(pin) if self._session is not None else None
+                if v is not None:
+                    self.app.root.after(
+                        0,
+                        lambda pp=pin, vv=v: self._pin_rows[pp].set_read_value(vv),
+                    )
+
+        self._enqueue(cmd)
+
+    # ---- auto-refresh -----------------------------------------------------
+
+    def _on_toggle_auto_refresh(self) -> None:
+        if self._auto_refresh_var.get() and self._session is not None:
+            self._schedule_auto_refresh()
+        else:
+            if self._auto_refresh_after_id is not None:
+                try:
+                    self.app.root.after_cancel(self._auto_refresh_after_id)
+                except Exception:
+                    pass
+                self._auto_refresh_after_id = None
+
+    def _schedule_auto_refresh(self) -> None:
+        try:
+            interval_ms = int(float(self._auto_refresh_interval_var.get()) * 1000)
+        except (ValueError, TypeError):
+            interval_ms = 1000
+        interval_ms = max(200, min(60000, interval_ms))
+        self._auto_refresh_after_id = self.app.root.after(
+            interval_ms, self._auto_refresh_tick
+        )
+
+    def _auto_refresh_tick(self) -> None:
+        if not self._auto_refresh_var.get() or self._session is None:
+            self._auto_refresh_after_id = None
+            return
+        # Don't pile up: skip the tick if the worker is already chewing on
+        # something. The next tick will catch up.
+        if not self._busy:
+            self._on_read_all()
+        self._schedule_auto_refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +777,14 @@ class App:
         self.port_entry.config(state=tk.DISABLED)
 
     def unlock_port_entry(self) -> None:
-        # Only unlock if no other tab is busy.
-        if not self.any_tab_busy():
-            self.port_entry.config(state=tk.NORMAL)
+        # Stay locked if another tab is busy OR if the GPIO tab is still
+        # holding the serial connection open (would conflict with any other
+        # use until disconnected).
+        if self.any_tab_busy():
+            return
+        if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
+            return
+        self.port_entry.config(state=tk.NORMAL)
 
     def set_status(self, text: str, color: str) -> None:
         self.status_var.set(text)
@@ -452,6 +801,14 @@ class App:
                 "before closing.",
             )
             return
+        # If GPIO tab still holds the serial port open, close it cleanly so
+        # the OS releases the COM port. The session.close() is fast (no Due
+        # round-trip), safe to do synchronously here.
+        if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
+            try:
+                self.gpio_tab._do_close_session()
+            except Exception:
+                pass
         self.root.destroy()
 
 

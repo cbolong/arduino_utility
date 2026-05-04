@@ -183,10 +183,12 @@ def program_firmware(
 
 # ---------------------------------------------------------------------------
 # GPIO debug commands — single-pin set/read for the GUI's "GPIO 設定" tab.
-# Each call opens a fresh serial connection, waits for the MCU's
-# ARDUINO_ERASE_READY (the MCU's idle state after boot), sends one GPIO_*
-# command, reads the reply, and closes. The Due auto-resets on every open
-# so back-to-back operations include the ~2 s setup() delay.
+#
+# Two layers:
+#   - GpioSession: holds an open serial connection across many ops, used by
+#     the GUI for instant click-to-drive interaction.
+#   - gpio_set / gpio_read free functions: open + one op + close, kept for
+#     CLI / scripting callers where one-shot semantics are simpler.
 # ---------------------------------------------------------------------------
 
 GPIO_OK = "GPIO_OK"
@@ -235,6 +237,96 @@ def _open_and_wait_idle(
     return ser
 
 
+class GpioSession:
+    """Persistent GPIO session over one open serial port.
+
+    Lifecycle: construct with port + log, call open() to connect (~2 s Due
+    reset wait), then call set_pin / read_pin as many times as needed (each
+    ~5 ms over UART), finally close(). open()/close() are idempotent.
+
+    Not thread-safe internally — callers must serialise set_pin / read_pin
+    onto a single worker thread (the GUI does this with a per-tab cmd queue).
+    """
+
+    def __init__(
+        self,
+        log: LogCallback,
+        *,
+        port: str | None = None,
+        handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+    ) -> None:
+        self._log = log
+        self._port = port
+        self._handshake_timeout_s = handshake_timeout_s
+        self._ser: serial.Serial | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._ser is not None
+
+    def open(self) -> bool:
+        if self.is_open:
+            return True
+        ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
+        if ser is None:
+            return False
+        self._ser = ser
+        return True
+
+    def close(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def set_pin(self, pin: int, mode: str, value: str | None = None) -> bool:
+        if not self.is_open:
+            self._log("GPIO session not open.", "err")
+            return False
+        if mode not in ("OUTPUT", "INPUT"):
+            self._log(f"Invalid mode: {mode}", "err")
+            return False
+        if value is not None and value not in ("HIGH", "LOW"):
+            self._log(f"Invalid value: {value}", "err")
+            return False
+
+        cmd = f"GPIO_SET {pin} {mode}"
+        if value is not None:
+            cmd += f" {value}"
+        self._log(f"send: {cmd}", "info")
+        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        reply = _read_line(self._ser, self._log, 5.0)
+        if reply == GPIO_OK:
+            self._log(f"recv: {reply}", "ok")
+            return True
+        self._log(f"recv: {reply or '(no reply)'}", "err")
+        return False
+
+    def read_pin(self, pin: int) -> str | None:
+        """Returns 'HIGH' or 'LOW' on success, None on any error."""
+        if not self.is_open:
+            self._log("GPIO session not open.", "err")
+            return None
+
+        cmd = f"GPIO_READ {pin}"
+        self._log(f"send: {cmd}", "info")
+        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        reply = _read_line(self._ser, self._log, 5.0)
+        if reply and reply.startswith(GPIO_VALUE_PREFIX):
+            # Format: "GPIO_VALUE <pin> <0|1>"
+            parts = reply.split()
+            if len(parts) == 3 and parts[2] in ("0", "1"):
+                level = "HIGH" if parts[2] == "1" else "LOW"
+                self._log(f"recv: {reply} -> {level}", "ok")
+                return level
+        self._log(f"recv: {reply or '(no reply)'}", "err")
+        return None
+
+
 def gpio_set(
     pin: int,
     mode: str,
@@ -244,37 +336,18 @@ def gpio_set(
     port: str | None = None,
     handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
 ) -> bool:
-    """Set the given Due pin's mode (and optionally value, if mode is OUTPUT).
+    """One-shot wrapper over GpioSession for CLI / scripting use.
 
-    mode: "OUTPUT" or "INPUT"
-    value: "HIGH" / "LOW" / None (None means "don't drive a value")
-    Returns True if the MCU acknowledged with GPIO_OK, False on any error.
+    Each call opens a fresh connection (incurs ~2 s Due auto-reset), runs one
+    GPIO_SET, and closes. For interactive use prefer GpioSession directly.
     """
-    if mode not in ("OUTPUT", "INPUT"):
-        log(f"Invalid mode: {mode}", "err")
-        return False
-    if value is not None and value not in ("HIGH", "LOW"):
-        log(f"Invalid value: {value}", "err")
-        return False
-
-    ser = _open_and_wait_idle(port, log, handshake_timeout_s)
-    if ser is None:
+    session = GpioSession(log, port=port, handshake_timeout_s=handshake_timeout_s)
+    if not session.open():
         return False
     try:
-        cmd = f"GPIO_SET {pin} {mode}"
-        if value is not None:
-            cmd += f" {value}"
-        log(f"send: {cmd}", "info")
-        ser.write(f"{cmd}\n".encode("UTF-8"))
-
-        reply = _read_line(ser, log, 5.0)
-        if reply == GPIO_OK:
-            log(f"recv: {reply}", "ok")
-            return True
-        log(f"recv: {reply or '(no reply)'}", "err")
-        return False
+        return session.set_pin(pin, mode, value)
     finally:
-        ser.close()
+        session.close()
 
 
 def gpio_read(
@@ -284,27 +357,11 @@ def gpio_read(
     port: str | None = None,
     handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
 ) -> str | None:
-    """Read the given Due pin's current digital value.
-
-    Returns "HIGH" or "LOW" on success, or None on any error.
-    """
-    ser = _open_and_wait_idle(port, log, handshake_timeout_s)
-    if ser is None:
+    """One-shot wrapper over GpioSession for CLI / scripting use."""
+    session = GpioSession(log, port=port, handshake_timeout_s=handshake_timeout_s)
+    if not session.open():
         return None
     try:
-        cmd = f"GPIO_READ {pin}"
-        log(f"send: {cmd}", "info")
-        ser.write(f"{cmd}\n".encode("UTF-8"))
-
-        reply = _read_line(ser, log, 5.0)
-        if reply and reply.startswith(GPIO_VALUE_PREFIX):
-            # Format: "GPIO_VALUE <pin> <0|1>"
-            parts = reply.split()
-            if len(parts) == 3 and parts[2] in ("0", "1"):
-                level = "HIGH" if parts[2] == "1" else "LOW"
-                log(f"recv: {reply} -> {level}", "ok")
-                return level
-        log(f"recv: {reply or '(no reply)'}", "err")
-        return None
+        return session.read_pin(pin)
     finally:
-        ser.close()
+        session.close()
