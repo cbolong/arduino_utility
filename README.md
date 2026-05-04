@@ -168,18 +168,22 @@ UART：**500000 8N1**，chunk size = **4096 bytes**。
 | 2 | PC → MCU | `ARDUINO_ERASE_TRIGGER` | 觸發 Chip Erase |
 | 3 | MCU → PC | `ARDUINO_READY_TO_RECEIVED_DATA` | Erase 驗證通過，可以開始送資料 |
 | 4 | PC → MCU | （4096 bytes raw binary）| 一個 chunk 的資料 |
-| 5 | MCU → PC | `ARDUINO_RECEIVED_LINE_DONE` | 該 chunk 已 Program + Read-Back + Verify 完成 |
+| 5 | MCU → PC | `ARDUINO_RECEIVED_LINE_DONE` | 該 chunk 已 Program 完成 |
 | — | 重複 4–5 直到 32 個 chunk（128 KB）送完 | | |
-| 6 | PC → MCU | `ARDUINO_TRANSFER_DONE_SIGNAL` | 顯式通知傳輸結束（取代等 10 秒 idle）|
-| 7 | MCU → PC | `Timing (ms): total=..., program=..., readback=..., compare=..., uart+idle=...` | 該次燒錄的分段耗時 |
-| 8 | MCU → PC | `ARDUINO_DATA_COMPLETED` | MCU 認定傳輸結束 |
-| ✗ | MCU → PC | `ARDUINO_ERROR` | 任何 fatal error（ID 不符 / Erase 失敗 / Verify 失敗）|
+| 6 | PC → MCU | `ARDUINO_VERIFY_REQUEST <8位 CRC32 hex>` | 要求 MCU 整片掃 CRC32 對照 |
+| 7 | MCU → PC | `ARDUINO_VERIFY_OK` | CRC32 對到，整片 ROM 與 firmware.bin 一致 |
+| 8 | PC → MCU | `ARDUINO_TRANSFER_DONE_SIGNAL` | 顯式通知傳輸結束（取代等 10 秒 idle）|
+| 9 | MCU → PC | `Timing (ms): total=..., program=..., readback=..., compare=..., uart+idle=...` | 該次燒錄的分段耗時 |
+| 10 | MCU → PC | `ARDUINO_DATA_COMPLETED` | MCU 認定傳輸結束 |
+| ✗ | MCU → PC | `ARDUINO_ERROR` | 任何 fatal error（ID 不符 / Erase 失敗 / CRC32 不對）|
 
-如果新版 PC 工具配上舊版 `.ino`，舊 MCU 不認得 `ARDUINO_TRANSFER_DONE_SIGNAL` 但仍會在 10 秒 idle 後送 `ARDUINO_DATA_COMPLETED`（10 秒 timeout 仍保留作為 fallback）；速度退回舊行為，功能不會壞。
+CRC32 是 IEEE 802.3 polynomial `0xEDB88320`，跟 Python `zlib.crc32` 相容。MCU 端是 bitwise 算法，128 KB 大約 1.3 s（read 開銷為主，CRC 計算只佔 ~150 ms）。
+
+如果新版 PC 工具配上舊版 `.ino`，舊 MCU 不認得 `ARDUINO_VERIFY_REQUEST` / `ARDUINO_TRANSFER_DONE_SIGNAL`，會在 30 秒 PC handshake timeout 內失敗——這個 commit 後跨版本不再支援，請兩邊一起更新。
 
 對應字串常數：
-- `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strTransferDone` / `strTransferCompleted` / `strError`
-- `.py`：`MCU_ERASE_READY` / `MCU_ERASE_TRIGGER` / `MCU_READY_TO_START` / `MCU_RECEIVED_LINE_RESPONSE` / `MCU_TRANSFER_DONE_SIGNAL` / `MCU_TRANSFER_COMPLETED` / `MCU_ERROR`，集中在 `binFileTransfer_core.py`
+- `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strVerifyRequest` / `strVerifyOK` / `strTransferDone` / `strTransferCompleted` / `strError`
+- `.py`：`MCU_ERASE_READY` / `MCU_ERASE_TRIGGER` / `MCU_READY_TO_START` / `MCU_RECEIVED_LINE_RESPONSE` / `MCU_VERIFY_REQUEST` / `MCU_VERIFY_OK` / `MCU_TRANSFER_DONE_SIGNAL` / `MCU_TRANSFER_COMPLETED` / `MCU_ERROR`，集中在 `binFileTransfer_core.py`
 
 > 改字串時 **兩邊一定要一起改**，否則 PC 端會等到 `handshake_timeout_s`（預設 30 秒）超時並退出，MCU 端則卡在 `while(true)`。
 > 改 `BAUD` 也是兩邊都改。混搭不同 baud 會收到亂碼。

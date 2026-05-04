@@ -15,6 +15,8 @@ const char* strEraseReady = "ARDUINO_ERASE_READY";
 const char* strEraseTrigger = "ARDUINO_ERASE_TRIGGER";
 const char* strReadyStart = "ARDUINO_READY_TO_RECEIVED_DATA";
 const char* strLineReceivedResponse = "ARDUINO_RECEIVED_LINE_DONE";
+const char* strVerifyRequest = "ARDUINO_VERIFY_REQUEST";   // followed by " <crc32_hex>"
+const char* strVerifyOK = "ARDUINO_VERIFY_OK";
 const char* strTransferDone = "ARDUINO_TRANSFER_DONE_SIGNAL";
 const char* strTransferCompleted = "ARDUINO_DATA_COMPLETED";
 const char* strError = "ARDUINO_ERROR";
@@ -40,7 +42,8 @@ const int WE_PIN = 25;
 
 // Global Variable
 unsigned char buffer[CHUNK_SIZE];
-unsigned char read_buffer[CHUNK_SIZE];
+// read_buffer[] removed: per-chunk readback replaced by single end-of-stream
+// CRC32 verify (see verifyRomCrc32). Saves 4 KB MCU RAM.
 
 uint16_t bytesRead = 0;
 uint32_t chunkCount = 0;
@@ -67,20 +70,19 @@ void processChunk(uint32_t num) {
     Serial.print(" ");
   }
   Serial.println();
-  delay(50);
+  // Cosmetic 50 ms LED-blink delay removed: 32 × 50 ms = ~1.6 s of pure
+  // wait-for-no-reason. The LED toggle stays for visual progress.
   digitalWrite(LED_BUILTIN, LOW);
 
   unsigned long t0 = millis();
   programChunkData(num);
   unsigned long t1 = millis();
-  readChunkData(num);
-  unsigned long t2 = millis();
-  compareChunkData(num);
-  unsigned long t3 = millis();
 
   t_program_total_ms += (t1 - t0);
-  t_read_total_ms    += (t2 - t1);
-  t_compare_total_ms += (t3 - t2);
+  // Per-chunk readback + compare retired in favour of one end-of-stream
+  // CRC32 sweep (see verifyRomCrc32 below). t_read_total_ms / t_compare_total_ms
+  // therefore stay 0 during the chunk loop and are reused by verifyRomCrc32
+  // to capture the verify cost.
 }
 
 void readSoftwareID() {
@@ -186,48 +188,53 @@ void programChunkData(uint32_t chunk) {
   // Serial.println("--- SST39SF010A PROGRAM : Done ---");
 }
 
-void readChunkData(uint32_t chunk) {
-  uint32_t addr = (chunk - 1) * CHUNK_SIZE;
-
-  Serial.print("Chunk ");
-  Serial.print(chunk);
-  Serial.print(" reading     | Address: 0x");
-  Serial.print(addr, HEX);
-  Serial.println("...");
-
-  for (int i = 0; i < CHUNK_SIZE; i++) {
-    uint32_t targetAddr = (uint32_t)i + (uint32_t)addr;
-    uint8_t targetData = readByte((uint32_t)targetAddr);
-
-    read_buffer[i] = targetData;
+// IEEE 802.3 CRC32 (poly 0xEDB88320, refin/refout, init/xorout 0xFFFFFFFF).
+// Bitwise form — small code, plenty fast for our 128 KB sweep
+// (~150 ms on Cortex-M3 @ 84 MHz).
+uint32_t crc32_update(uint32_t crc, uint8_t byte) {
+  crc ^= byte;
+  for (int i = 0; i < 8; i++) {
+    uint32_t mask = -(crc & 1);
+    crc = (crc >> 1) ^ (0xEDB88320 & mask);
   }
+  return crc;
 }
 
-void compareChunkData(uint32_t chunk) {
-  uint32_t addr = (chunk - 1) * CHUNK_SIZE;
+// Sweep 0..FILE_SIZE_SUPPORT-1, return CRC32 of the ROM contents.
+// Uses readByte; FILE_SIZE_SUPPORT must equal the host's
+// FILE_SIZE_SUPPORT for the comparison to be meaningful.
+uint32_t computeRomCrc32() {
+  uint32_t crc = 0xFFFFFFFFUL;
+  const uint32_t romSize = 128UL * 1024UL;
+  for (uint32_t addr = 0; addr < romSize; addr++) {
+    crc = crc32_update(crc, readByte(addr));
+  }
+  return crc ^ 0xFFFFFFFFUL;
+}
 
-  Serial.print("Chunk ");
-  Serial.print(chunk);
-  Serial.print(" verifying   | Address: 0x");
-  Serial.print(addr, HEX);
-  Serial.println("...");
-  
-  for (int i = 0; i < CHUNK_SIZE; i++) {
-    uint32_t targetAddr = (uint32_t)i + (uint32_t)addr;
+// Parse the hex argument from "ARDUINO_VERIFY_REQUEST <hex>" then verify.
+// Replies strVerifyOK on match; on mismatch falls through to strError + halt.
+void verifyRomCrc32(uint32_t expectedCrc) {
+  Serial.print("Verifying ROM CRC32 (expected=0x");
+  Serial.print(expectedCrc, HEX);
+  Serial.println(") ...");
+  unsigned long t0 = millis();
+  uint32_t actualCrc = computeRomCrc32();
+  unsigned long t1 = millis();
+  // Reuse the read+compare timing slots to record verify cost in summary.
+  t_read_total_ms += (t1 - t0);
 
-    if (read_buffer[i] != buffer[i]) {
+  Serial.print("CRC32 actual=0x");
+  Serial.print(actualCrc, HEX);
+  Serial.print(", expected=0x");
+  Serial.println(expectedCrc, HEX);
 
-      Serial.print("Data compare failed at 0x");
-      Serial.print(targetAddr, HEX);
-      Serial.print(", Read : 0x");
-      Serial.print(read_buffer[i], HEX);
-      Serial.print(", Program : 0x");
-      Serial.println(buffer[i], HEX);
-      
-      while (!Serial);
-      Serial.println(strError);
-      while (1) {}
-    }
+  if (actualCrc == expectedCrc) {
+    Serial.println(strVerifyOK);
+  } else {
+    while (!Serial);
+    Serial.println(strError);
+    while (1) {}
   }
 }
 
@@ -310,11 +317,25 @@ void loop() {
       }
     }
   } else {
-    // Post-data phase: scan for ARDUINO_TRANSFER_DONE_SIGNAL.
+    // Post-data phase: accept either
+    //   "ARDUINO_VERIFY_REQUEST <crc32_hex>"  — run CRC32 sweep, reply OK/ERROR
+    //   "ARDUINO_TRANSFER_DONE_SIGNAL"         — finalise immediately
     if (Serial.available() > 0) {
       lastRecvTime = millis();
       String input = Serial.readStringUntil('\n');
       input.trim();
+
+      if (input.startsWith(strVerifyRequest)) {
+        // Expect "<sentinel> <hex>"; split on the space.
+        int sp = input.indexOf(' ');
+        uint32_t expectedCrc = 0;
+        if (sp > 0 && (uint32_t)sp < (uint32_t)input.length() - 1) {
+          expectedCrc = (uint32_t) strtoul(input.c_str() + sp + 1, NULL, 16);
+        }
+        verifyRomCrc32(expectedCrc);
+        return;
+      }
+
       if (input == strTransferDone) {
         finishTransfer();
         return;

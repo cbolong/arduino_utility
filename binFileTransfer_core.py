@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import zlib
 from typing import Callable
 
 import serial
@@ -21,6 +22,8 @@ MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
 MCU_READY_TO_START = "ARDUINO_READY_TO_RECEIVED_DATA"
 MCU_RECEIVED_LINE_RESPONSE = "ARDUINO_RECEIVED_LINE_DONE"
+MCU_VERIFY_REQUEST = "ARDUINO_VERIFY_REQUEST"   # host sends "<sentinel> <hex>"
+MCU_VERIFY_OK = "ARDUINO_VERIFY_OK"
 MCU_TRANSFER_DONE_SIGNAL = "ARDUINO_TRANSFER_DONE_SIGNAL"
 MCU_TRANSFER_COMPLETED = "ARDUINO_DATA_COMPLETED"
 MCU_ERROR = "ARDUINO_ERROR"
@@ -141,6 +144,21 @@ def program_firmware(
                 f"File transfer completed. Total {chunk_count:2d} chunks.",
                 "ok",
             )
+
+            # Ask the MCU to verify by computing CRC32 over the full ROM and
+            # comparing against the host's CRC32 of the (padded) firmware
+            # bytes. Replaces the previous per-chunk readback+compare path.
+            crc = zlib.crc32(file_data) & 0xFFFFFFFF
+            verify_msg = f"{MCU_VERIFY_REQUEST} {crc:08X}"
+            log(f"handshake send     : {verify_msg}", "info")
+            ser.write(f"{verify_msg}\n".encode("UTF-8"))
+
+            # CRC32 sweep over 128 KB at ~10 µs/byte ≈ 1.3 s on the MCU,
+            # so allow generous margin on top of handshake_timeout_s.
+            if not _wait_for_line(
+                ser, MCU_VERIFY_OK, log, max(handshake_timeout_s, 30.0)
+            ):
+                return False
 
             # Tell the MCU explicitly that the binary stream is done so it
             # doesn't have to wait the full RECEIVED_DATA_TIMEOUT (~10s) of
