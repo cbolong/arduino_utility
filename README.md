@@ -181,6 +181,20 @@ CRC32 是 IEEE 802.3 polynomial `0xEDB88320`，跟 Python `zlib.crc32` 相容。
 
 如果新版 PC 工具配上舊版 `.ino`，舊 MCU 不認得 `ARDUINO_VERIFY_REQUEST` / `ARDUINO_TRANSFER_DONE_SIGNAL`，會在 30 秒 PC handshake timeout 內失敗——這個 commit 後跨版本不再支援，請兩邊一起更新。
 
+### GPIO 設定模式（GUI「GPIO 設定」tab 用）
+
+MCU 在送出 `ARDUINO_ERASE_READY` 之後、收到 `ARDUINO_ERASE_TRIGGER` 之前，會持續等待單腳 GPIO 指令；只要還沒進入燒錄流程，host 可以反覆發 GPIO 指令做接線除錯。一旦發了 `ARDUINO_ERASE_TRIGGER`，MCU 直接進入 erase + 燒錄流程，下次想用 GPIO 必須 reset Due。
+
+| 方向 | 訊息 | 意義 |
+|------|------|------|
+| PC → MCU | `GPIO_SET <pin> <OUTPUT\|INPUT> [HIGH\|LOW]` | 設定指定 Due pin 的 mode；mode=OUTPUT 時可同時帶 HIGH/LOW 值 |
+| MCU → PC | `GPIO_OK` | 設定成功 |
+| PC → MCU | `GPIO_READ <pin>` | 讀取指定 pin 的當前值（會先強制 INPUT mode）|
+| MCU → PC | `GPIO_VALUE <pin> <0\|1>` | 該 pin 的當前數位值 |
+| MCU → PC | `GPIO_ERROR <reason>` | 格式錯誤、未知 mode/value 等；例：`GPIO_ERROR bad_mode` |
+
+⚠️ 直接拿 GPIO_SET 去改 CE#/OE#/WE#/A0–A18/DQ0–DQ7 會破壞 IDLE 匯流排狀態，之後燒錄行為未定義。reset Due 才能回到乾淨狀態。GPIO 模式適合「LED 跑馬燈測試」、「pin map 接線驗證」這類用途。
+
 對應字串常數：
 - `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strVerifyRequest` / `strVerifyOK` / `strTransferDone` / `strTransferCompleted` / `strError`
 - `.py`：`MCU_ERASE_READY` / `MCU_ERASE_TRIGGER` / `MCU_READY_TO_START` / `MCU_RECEIVED_LINE_RESPONSE` / `MCU_VERIFY_REQUEST` / `MCU_VERIFY_OK` / `MCU_TRANSFER_DONE_SIGNAL` / `MCU_TRANSFER_COMPLETED` / `MCU_ERROR`，集中在 `binFileTransfer_core.py`

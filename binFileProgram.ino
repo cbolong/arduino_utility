@@ -211,6 +211,80 @@ void programChunkData(uint32_t chunk) {
   }
 }
 
+// ----------------------------------------------------------------------------
+// GPIO test commands — single-pin manual debug, used by the GUI's "GPIO 設定"
+// tab. These are accepted while the MCU is sitting in setup()'s pre-erase
+// wait loop. Once the host sends ARDUINO_ERASE_TRIGGER the MCU drops into
+// the chip-erase + flash-program flow and stops accepting GPIO commands
+// until the next reset.
+//
+// Wire format (newline-terminated):
+//   GPIO_SET <pin> <OUTPUT|INPUT> [HIGH|LOW]   -> reply "GPIO_OK"  or "GPIO_ERROR <why>"
+//   GPIO_READ <pin>                            -> reply "GPIO_VALUE <pin> <0|1>"
+//                                                 or "GPIO_ERROR <why>"
+//
+// Caveats: setting CE_PIN / OE_PIN / WE_PIN / address pins / data pins via
+// these commands disturbs the IDLE bus state assumed by the flash flow.
+// Reset the Due before attempting a flash again.
+// ----------------------------------------------------------------------------
+
+void handleGpioSet(const String& cmd) {
+  // "GPIO_SET <pin> <mode> [value]"
+  int p1 = cmd.indexOf(' ');
+  int p2 = cmd.indexOf(' ', p1 + 1);
+  if (p1 < 0 || p2 < 0) {
+    Serial.println("GPIO_ERROR bad_format");
+    return;
+  }
+  int p3 = cmd.indexOf(' ', p2 + 1);
+
+  int pin = cmd.substring(p1 + 1, p2).toInt();
+  String modeStr = (p3 > 0) ? cmd.substring(p2 + 1, p3) : cmd.substring(p2 + 1);
+  String valueStr = (p3 > 0) ? cmd.substring(p3 + 1) : String("");
+
+  int mode;
+  if (modeStr == "OUTPUT") {
+    mode = OUTPUT;
+  } else if (modeStr == "INPUT") {
+    mode = INPUT;
+  } else {
+    Serial.println("GPIO_ERROR bad_mode");
+    return;
+  }
+
+  pinMode(pin, mode);
+  if (mode == OUTPUT && valueStr.length() > 0) {
+    int value;
+    if (valueStr == "HIGH") {
+      value = HIGH;
+    } else if (valueStr == "LOW") {
+      value = LOW;
+    } else {
+      Serial.println("GPIO_ERROR bad_value");
+      return;
+    }
+    digitalWrite(pin, value);
+  }
+  Serial.println("GPIO_OK");
+}
+
+void handleGpioRead(const String& cmd) {
+  // "GPIO_READ <pin>"
+  int p1 = cmd.indexOf(' ');
+  if (p1 < 0) {
+    Serial.println("GPIO_ERROR bad_format");
+    return;
+  }
+  int pin = cmd.substring(p1 + 1).toInt();
+  pinMode(pin, INPUT);
+  int value = digitalRead(pin);
+  Serial.print("GPIO_VALUE ");
+  Serial.print(pin);
+  Serial.print(" ");
+  Serial.println(value);  // 0 or 1
+}
+
+
 // IEEE 802.3 CRC32 (poly 0xEDB88320, refin/refout, init/xorout 0xFFFFFFFF).
 // Bitwise form — small code, plenty fast for our 128 KB sweep
 // (~150 ms on Cortex-M3 @ 84 MHz).
@@ -283,15 +357,22 @@ void setup() {
   while (!Serial);
   Serial.println(strEraseReady);
 
-  // Wait for strEraseTrigger received
+  // Wait for either strEraseTrigger (start the flash flow) or a GPIO_*
+  // command (single-pin set/read). GPIO commands keep the wait open;
+  // strEraseTrigger breaks out and proceeds to chip erase + program.
   while (true) {
     if (Serial.available() > 0) {
-      String input = Serial.readString();
+      String input = Serial.readStringUntil('\n');
       input.trim();
 
       if (input == strEraseTrigger) {
-        break; // 跳出迴圈，繼續往 loop 走
+        break;  // 跳出迴圈，繼續往 loop 走
+      } else if (input.startsWith("GPIO_SET ")) {
+        handleGpioSet(input);
+      } else if (input.startsWith("GPIO_READ ")) {
+        handleGpioRead(input);
       }
+      // Unknown lines silently ignored.
     }
   }
 

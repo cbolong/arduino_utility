@@ -179,3 +179,132 @@ def program_firmware(
     except Exception as e:
         log(f"Error: {e}", "err")
         return False
+
+
+# ---------------------------------------------------------------------------
+# GPIO debug commands — single-pin set/read for the GUI's "GPIO 設定" tab.
+# Each call opens a fresh serial connection, waits for the MCU's
+# ARDUINO_ERASE_READY (the MCU's idle state after boot), sends one GPIO_*
+# command, reads the reply, and closes. The Due auto-resets on every open
+# so back-to-back operations include the ~2 s setup() delay.
+# ---------------------------------------------------------------------------
+
+GPIO_OK = "GPIO_OK"
+GPIO_VALUE_PREFIX = "GPIO_VALUE"
+GPIO_ERROR_PREFIX = "GPIO_ERROR"
+
+
+def _read_line(
+    ser: serial.Serial, log: LogCallback, timeout_s: float
+) -> str | None:
+    """Read one line (stripped) within timeout. Returns None on timeout.
+    Echoes any non-empty intermediate MCU lines via log so the user sees
+    boot chatter (Vendor ID, etc.) just like the flash flow."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode(errors="ignore").strip()
+            if line:
+                return line
+        if time.monotonic() > deadline:
+            log(f"Timeout after {timeout_s:.1f}s waiting for MCU reply", "err")
+            return None
+        time.sleep(0.01)
+
+
+def _open_and_wait_idle(
+    port: str | None, log: LogCallback, handshake_timeout_s: float
+) -> serial.Serial | None:
+    """Open the Due, wait until it emits ARDUINO_ERASE_READY (i.e. the MCU
+    is sitting in its pre-erase idle loop), and return the open serial.
+    Returns None on failure (caller still owns nothing)."""
+    if port is None:
+        port = _find_arduino_port()
+        if port is None:
+            log("Arduino Device not found.", "err")
+            return None
+    log(f"Arduino Found : {port}.", "ok")
+    try:
+        ser = serial.Serial(port, BAUD, timeout=0.1)
+    except serial.SerialException as e:
+        log(f"Serial open error: {e}", "err")
+        return None
+    if not _wait_for_line(ser, MCU_ERASE_READY, log, handshake_timeout_s):
+        ser.close()
+        return None
+    return ser
+
+
+def gpio_set(
+    pin: int,
+    mode: str,
+    value: str | None,
+    log: LogCallback,
+    *,
+    port: str | None = None,
+    handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+) -> bool:
+    """Set the given Due pin's mode (and optionally value, if mode is OUTPUT).
+
+    mode: "OUTPUT" or "INPUT"
+    value: "HIGH" / "LOW" / None (None means "don't drive a value")
+    Returns True if the MCU acknowledged with GPIO_OK, False on any error.
+    """
+    if mode not in ("OUTPUT", "INPUT"):
+        log(f"Invalid mode: {mode}", "err")
+        return False
+    if value is not None and value not in ("HIGH", "LOW"):
+        log(f"Invalid value: {value}", "err")
+        return False
+
+    ser = _open_and_wait_idle(port, log, handshake_timeout_s)
+    if ser is None:
+        return False
+    try:
+        cmd = f"GPIO_SET {pin} {mode}"
+        if value is not None:
+            cmd += f" {value}"
+        log(f"send: {cmd}", "info")
+        ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        reply = _read_line(ser, log, 5.0)
+        if reply == GPIO_OK:
+            log(f"recv: {reply}", "ok")
+            return True
+        log(f"recv: {reply or '(no reply)'}", "err")
+        return False
+    finally:
+        ser.close()
+
+
+def gpio_read(
+    pin: int,
+    log: LogCallback,
+    *,
+    port: str | None = None,
+    handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+) -> str | None:
+    """Read the given Due pin's current digital value.
+
+    Returns "HIGH" or "LOW" on success, or None on any error.
+    """
+    ser = _open_and_wait_idle(port, log, handshake_timeout_s)
+    if ser is None:
+        return None
+    try:
+        cmd = f"GPIO_READ {pin}"
+        log(f"send: {cmd}", "info")
+        ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        reply = _read_line(ser, log, 5.0)
+        if reply and reply.startswith(GPIO_VALUE_PREFIX):
+            # Format: "GPIO_VALUE <pin> <0|1>"
+            parts = reply.split()
+            if len(parts) == 3 and parts[2] in ("0", "1"):
+                level = "HIGH" if parts[2] == "1" else "LOW"
+                log(f"recv: {reply} -> {level}", "ok")
+                return level
+        log(f"recv: {reply or '(no reply)'}", "err")
+        return None
+    finally:
+        ser.close()
