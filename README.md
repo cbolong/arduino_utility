@@ -265,11 +265,12 @@ FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
 
 ### 自動 release 規則
 
-每個觸發成功的 build 會自動建一個 **prerelease**：
+每個觸發成功的 build 會自動建一個 release，並標成 **Latest**（最新的會搶到 Latest 徽章，自動置頂於 Releases 頁面）：
 - Tag 格式：`build-YYYYMMDD-HHMMSS-<7位commit sha>`
 - Release 名稱：`Auto build build-YYYYMMDD-HHMMSS-<sha>`
 - 內文：commit SHA + commit message
 - Asset：`SST39FlashProgrammer.exe`
+- `make_latest: true` → 每次新 build 自動取代上一次的 Latest 標記
 
 PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免上游升版突然壞掉。
 

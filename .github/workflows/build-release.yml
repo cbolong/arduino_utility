@@ -56,7 +56,8 @@ jobs:
 
             Commit message:
             ${{ github.event.head_commit.message }}
-          prerelease: true
+          prerelease: false
+          make_latest: "true"
           files: dist/SST39FlashProgrammer.exe
 
       - name: Prune old auto-build EXE assets, keep latest 4
