@@ -78,24 +78,35 @@ jobs:
             --version-file build/version.txt \
             binFileTransferGui.py
 
-      - name: Compute build tag
+      - name: Compute build tag and commit title
         id: tag
         shell: bash
+        env:
+          FULL_MSG: ${{ github.event.head_commit.message }}
         run: |
           ts=$(date -u +%Y%m%d-%H%M%S)
           short_sha=${GITHUB_SHA:0:7}
           echo "tag=build-${ts}-${short_sha}" >> "$GITHUB_OUTPUT"
+
+          # Extract just the first line (subject) of the commit message,
+          # falling back to the short SHA for events without head_commit
+          # (e.g. workflow_dispatch).
+          title=$(printf '%s' "$FULL_MSG" | head -n1)
+          if [ -z "$title" ]; then
+            title="manual build $short_sha"
+          fi
+          {
+            echo "title<<EOF"
+            echo "$title"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create release with EXE
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Auto build ${{ steps.tag.outputs.tag }}"
-          body: |
-            Auto-built EXE for commit ${{ github.sha }}.
-
-            Commit message:
-            ${{ github.event.head_commit.message }}
+          body: ${{ steps.tag.outputs.title }}
           prerelease: false
           make_latest: "true"
           files: dist/SST39FlashProgrammer.exe
