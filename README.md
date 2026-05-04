@@ -9,12 +9,18 @@ PC 端用 Python 透過 USB Serial 把 `firmware.bin` 傳給 Arduino，Arduino �
 
 ```
 arduino_utility/
-├── binFileProgram.ino   # Arduino 端燒錄程式（燒入 Arduino Due）
-├── binFileTransfer.py   # PC 端傳輸/握手腳本
-├── firmware.bin         # 要燒錄的二進位檔（自行放置，與 .py 同目錄）
+├── binFileProgram.ino       # Arduino 端燒錄程式（燒入 Arduino Due）
+├── binFileTransfer_core.py  # 共用核心：握手協定 + 傳輸主流程
+├── binFileTransfer.py       # CLI 入口（argparse 包 core）
+├── binFileTransferGui.py    # Tkinter GUI 入口（包 core）
+├── requirements.txt         # PC 端 Python 相依（pyserial）
+├── firmware.bin             # 要燒錄的二進位檔（自行放置，與 .py 同目錄；已被 .gitignore 排除）
+├── .github/workflows/build-release.yml  # Release 觸發的 Windows EXE build
 └── spec/
-    └── SST39LF010-...-DS20005023.pdf  # Microchip SST39LF/VF010/020/040 Datasheet
+    └── SST39LF010-...-DS20005023.pdf    # Microchip SST39LF/VF010/020/040 Datasheet
 ```
+
+> 三個 `binFileTransfer*.py` 的關係：CLI 與 GUI 都只是薄殼，所有握手邏輯、port 偵測、timeout 控制都在 `binFileTransfer_core.program_firmware()` 裡。改協定時只動 core，兩個前端會同步生效。
 
 ---
 
@@ -71,12 +77,14 @@ arduino_utility/
 
 ## 4. PC 端環境需求
 
-- Python 3.8+
-- 套件：`pyserial`
+- Python 3.8+（程式內已加 `from __future__ import annotations`，舊版 Python 可用）
+- 套件：用 `requirements.txt` 安裝
   ```bash
-  pip install pyserial
+  pip install -r requirements.txt
   ```
+  目前只有 `pyserial>=3.5`。`tkinter` 是 Python 標準庫，GUI 不額外裝。
 - Arduino IDE（用來燒 `binFileProgram.ino` 進 Arduino Due）
+- *（可選）*想自己打 Windows EXE：`pip install pyinstaller==6.11.1`
 
 ---
 
@@ -93,16 +101,46 @@ arduino_utility/
 - 檔案 ≤ 128 KB，超過會被腳本拒絕
 - 不足 128 KB 會自動用 `0x00` padding 到 128 KB 整片寫入
 
-### Step 3：執行 Python 上傳
+### Step 3：執行上傳
+
+#### 3a. CLI（指令列）
 ```bash
+# 自動偵測 Arduino Due Programming Port (VID 0x2341, PID 0x003D)
 python binFileTransfer.py
+
+# 自動偵測失敗時手動指定 port（Windows / Linux / macOS 範例）
+python binFileTransfer.py --port COM19
+python binFileTransfer.py --port /dev/ttyACM0
+python binFileTransfer.py --port /dev/cu.usbmodem1411
+
+# 也能換個別位置的 firmware 與調整 handshake 逾時
+python binFileTransfer.py --file ./builds/v1.2.bin --timeout 60
 ```
 
-預設 `AUTO_DETECT = 1`，會自動找 VID = `0x2341`、PID = `0x003D` 的 Arduino Due Programming Port。
-若自動偵測失敗，把 `binFileTransfer.py` 內的 `AUTO_DETECT` 改成 `0`，並把 `PORT` 設成正確的 COM port（例如 `"COM19"` 或 `"/dev/ttyACM0"`）。
+完整參數：
+| 參數 | 預設 | 說明 |
+|------|------|------|
+| `--port` | （自動偵測）| 手動指定 serial port，跳過 VID/PID 比對 |
+| `--timeout` | `30.0` | 每段握手的等待秒數，超過會 log 並跳出（避免無限 hang）|
+| `--file` | `./firmware.bin` | 換掉預設要燒的檔案路徑 |
+| `--help` | — | 顯示說明 |
+
+#### 3b. GUI（雙擊版本）
+```bash
+python binFileTransferGui.py
+```
+或從 GitHub Releases 下載 `SST39FlashProgrammer.exe`（Windows 單檔執行）。
+
+GUI 操作：
+1. 按 **Browse...** 選 firmware
+2. （可選）在 **Port (optional)** 欄位填 COM port，留白就自動偵測
+3. 按 **Start Programming**，下方 log 區會顯示握手 / chunk / verify 訊息
+4. 完成後 status 會顯示 Success（綠）或 Error（紅）
+
+> 燒錄進行中按視窗右上 X 會跳「Busy」對話框拒絕關閉，避免燒到一半被切斷；要強制離開請從 Task Manager。
 
 ### Step 4：觀察輸出
-正常流程 console 會看到：
+CLI 正常流程 console 會看到：
 ```
 >>>  Arduino Found : COMxx
 >>>  handshake received : ARDUINO_ERASE_READY
@@ -115,6 +153,8 @@ MCU: CHIP ERASE SUCCESSFUL!
 ```
 
 中途任何錯誤 MCU 都會送 `ARDUINO_ERROR` 然後死循環，需要 reset Arduino 重來。
+若 PC 端 30 秒內沒收到預期回應（MCU 死掉、未燒錄、字串對不上），會 log
+`Timeout after 30.0s waiting for: ...` 然後 exit 非 0（CLI）或顯示 Error（GUI）。
 
 ---
 
@@ -135,9 +175,9 @@ UART：**115200 8N1**，chunk size = **4096 bytes**。
 
 對應字串常數：
 - `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strTransferCompleted` / `strError`
-- `.py`：`MCU_ERASE_READY` 等同名變數
+- `.py`：`MCU_ERASE_READY` 等同名變數，集中在 `binFileTransfer_core.py`
 
-> 改字串時 **兩邊一定要一起改**，否則會卡在 handshake `while(true)`。
+> 改字串時 **兩邊一定要一起改**，否則 PC 端會等到 `handshake_timeout_s`（預設 30 秒）超時並退出，MCU 端則卡在 `while(true)`。
 
 ---
 
@@ -194,26 +234,40 @@ Datasheet 標稱 Chip Erase typ. 70 ms。`.ino` 目前用 `delay(100)` 後做 10
 #define RECEIVED_DATA_TIMEOUT 10000   // ms，最後一段過 10s 就視為結束
 ```
 
-`binFileTransfer.py`：
+`binFileTransfer_core.py`（CLI 與 GUI 共用）：
 ```python
-AUTO_DETECT       = 1
-PORT              = "COM19"
-BAUD              = 115200
-CHUNK_SIZE        = 4096
-FILE_SIZE_SUPPORT = 128 * 1024
-FILE_NAME         = "firmware.bin"
-TARGET_VID        = 0x2341    # Arduino
-TARGET_PIDS       = 0x003D    # Due Programming Port
+BAUD                        = 115200
+CHUNK_SIZE                  = 4096
+FILE_SIZE_SUPPORT           = 128 * 1024
+TARGET_VID                  = 0x2341     # Arduino
+TARGET_PID                  = 0x003D     # Due Programming Port
+DEFAULT_HANDSHAKE_TIMEOUT_S = 30.0
 ```
 
-兩邊的 `BAUD` 與 `CHUNK_SIZE` **必須一致**。
+> Port 與 timeout **不再寫死在原始碼**。CLI 用 `--port` / `--timeout` 指定；GUI 用畫面上的 Port 欄位。原本的 `AUTO_DETECT = 0/1` 已移除。
+
+`binFileTransfer.py`（CLI）：
+```python
+FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
+```
+
+兩邊（`.ino` 與 `.py`）的 `BAUD` 與 `CHUNK_SIZE` **必須一致**；6 個握手字串也必須一致。
 
 ---
 
-## 10. 待辦 / 可改進
+## 10. CI / Release
+
+`.github/workflows/build-release.yml` 會在以下情況跑 PyInstaller 打 Windows EXE：
+- GitHub Release **published** 時（自動）
+- 從 Actions 頁面手動 `workflow_dispatch`
+
+PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免日後上游 release 突然壞掉而沒人發現。Release 時會把 `SST39FlashProgrammer.exe` 自動掛到對應 Release assets。
+
+## 11. 待辦 / 可改進
 
 - [ ] 加入 Sector Erase 支援，做局部更新
 - [ ] 用 Toggle Bit / Data# Polling 取代固定 delay，提升相容性
 - [ ] 支援 SST39xF020 / SST39xF040（接更多位址線、調整 ID 表與容量）
 - [ ] 加 CRC / SHA256 末端校驗，目前是逐 byte read-back 比對（已能抓到大多數錯誤但較慢）
-- [ ] Python 端目前用 `Press Enter to Exit...` 阻塞，可考慮加 `--no-pause` flag 給 CI 用
+- [ ] CLI 加 `--no-pause` flag 給 CI 用（目前結束會 `input("Press Enter to Exit...")`）
+- [ ] GUI 加 Cancel 按鈕，能在程式跑到一半中止（目前只能等 timeout）

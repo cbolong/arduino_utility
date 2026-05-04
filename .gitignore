@@ -4,3 +4,15 @@ build/
 dist/
 *.spec
 firmware.bin
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Python virtualenvs
+.venv/
+venv/
+
+# OS
+.DS_Store
