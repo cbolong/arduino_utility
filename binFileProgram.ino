@@ -162,6 +162,11 @@ void doChipErase() {
   }
 }
 
+// Hard ceiling for Data# Polling. Datasheet Tbp max is 20 µs; 100 µs is 5×
+// margin. Anything longer means the chip genuinely failed to program — we
+// emit ARDUINO_ERROR and halt so the host doesn't get false "OK".
+#define PROGRAM_POLL_TIMEOUT_US 100
+
 void programChunkData(uint32_t chunk) {
   uint32_t addr = (chunk - 1) * CHUNK_SIZE;
 
@@ -181,11 +186,29 @@ void programChunkData(uint32_t chunk) {
     writeByte(0x5555, 0xA0); // Cycle 3 (Program Command)
     writeByte(targetAddr, targetData); // Cycle 4 (Address & Data)
 
-    // Wait for Programming to complete (Tbp: Max 20us)
-    delayMicroseconds(30); 
-  }
+    // Data# Polling (datasheet section 4 / Figure 7-15): while the chip is
+    // still programming, reading targetAddr returns ~DQ7 (the inverse of
+    // the value being written); once programming completes the read
+    // matches targetData. Exit the wait the moment the chip is ready
+    // instead of always sleeping the worst-case 30 µs.
+    uint32_t pollStart = micros();
+    while ((uint32_t)(micros() - pollStart) < PROGRAM_POLL_TIMEOUT_US) {
+      if (readByte(targetAddr) == targetData) {
+        goto programmed;
+      }
+    }
 
-  // Serial.println("--- SST39SF010A PROGRAM : Done ---");
+    // Hit the ceiling — programming actually failed.
+    Serial.print("Byte program timeout at 0x");
+    Serial.print(targetAddr, HEX);
+    Serial.print(", expected 0x");
+    Serial.println(targetData, HEX);
+    while (!Serial);
+    Serial.println(strError);
+    while (1) {}
+
+    programmed: ;
+  }
 }
 
 // IEEE 802.3 CRC32 (poly 0xEDB88320, refin/refout, init/xorout 0xFFFFFFFF).
@@ -396,11 +419,16 @@ void setAddress(uint32_t addr) {
   }
 }
 
-// Set Data Pins to Input or Output mode
+// Set Data Pins to Input or Output mode.
+// Cache the current mode so back-to-back calls (common during Data# Polling)
+// don't repeatedly re-execute pinMode for every data pin.
+int currentDataMode = -1;
 void setDataMode(int mode) {
+  if (mode == currentDataMode) return;
   for (int i = 0; i < dataPinsCount; i++) {
     pinMode(dataPins[i], mode);
   }
+  currentDataMode = mode;
 }
 
 // Program 1 Byte Data to ROM
