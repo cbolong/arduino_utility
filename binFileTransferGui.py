@@ -49,53 +49,10 @@ FLASH_WE_PIN = 25
 LED_PIN = 13   # on-board LED, also Arduino's LED_BUILTIN
 
 
-# Pin layout for the GPIO tab. Every Due GPIO grouped by role; flash-related
-# pins keep their semantic labels (A0, DQ0, CE# ...) so users recognise them
-# at a glance. Each entry: (display_label, due_pin_number).
-GPIO_PIN_GROUPS: list[tuple[str, list[tuple[str, int]]]] = [
-    ("Flash — Address bus (A0–A18)", [
-        ("A0  (D44)", 44), ("A1  (D42)", 42), ("A2  (D40)", 40),
-        ("A3  (D38)", 38), ("A4  (D36)", 36), ("A5  (D34)", 34),
-        ("A6  (D32)", 32), ("A7  (D30)", 30), ("A8  (D33)", 33),
-        ("A9  (D35)", 35), ("A10 (D41)", 41), ("A11 (D37)", 37),
-        ("A12 (D28)", 28), ("A13 (D31)", 31), ("A14 (D29)", 29),
-        ("A15 (D26)", 26), ("A16 (D24)", 24), ("A17 (D27)", 27),
-        ("A18 (D22)", 22),
-    ]),
-    ("Flash — Data bus (DQ0–DQ7)", [
-        ("DQ0 (D46)", 46), ("DQ1 (D48)", 48), ("DQ2 (D50)", 50),
-        ("DQ3 (D53)", 53), ("DQ4 (D51)", 51), ("DQ5 (D49)", 49),
-        ("DQ6 (D47)", 47), ("DQ7 (D45)", 45),
-    ]),
-    ("Flash — Control", [
-        ("CE# (D43)", 43), ("OE# (D39)", 39), ("WE# (D25)", 25),
-    ]),
-    ("On-board", [
-        ("LED (D13)", 13),
-    ]),
-    ("Digital pins — others", [
-        # D0..D53 minus the 30 flash pins minus LED (13).
-        ("D0",  0), ("D1",  1), ("D2",  2), ("D3",  3), ("D4",  4),
-        ("D5",  5), ("D6",  6), ("D7",  7), ("D8",  8), ("D9",  9),
-        ("D10", 10), ("D11", 11), ("D12", 12),
-        ("D14", 14), ("D15", 15), ("D16", 16), ("D17", 17),
-        ("D18", 18), ("D19", 19), ("D20", 20), ("D21", 21),
-        ("D23", 23), ("D52", 52),
-    ]),
-    ("Analog pins (A0–A11 = D54–D65)", [
-        ("A0  (D54)", 54), ("A1  (D55)", 55), ("A2  (D56)", 56),
-        ("A3  (D57)", 57), ("A4  (D58)", 58), ("A5  (D59)", 59),
-        ("A6  (D60)", 60), ("A7  (D61)", 61), ("A8  (D62)", 62),
-        ("A9  (D63)", 63), ("A10 (D64)", 64), ("A11 (D65)", 65),
-    ]),
-]
-
-
-def _all_gpio_pins() -> list[tuple[str, int]]:
-    out: list[tuple[str, int]] = []
-    for _section, items in GPIO_PIN_GROUPS:
-        out.extend(items)
-    return out
+# Pin layout for the GPIO tab. Flat list of every controllable Due GPIO,
+# numeric order. D0–D53 are the digital pins; D54–D65 are A0–A11.
+# Each entry: (display_label, due_pin_number).
+GPIO_PINS: list[tuple[str, int]] = [(f"D{n}", n) for n in range(0, 66)]
 
 
 class _LoggedTab:
@@ -527,17 +484,10 @@ class GpioTab(_LoggedTab):
         canvas.bind("<Enter>", _bind_wheel)
         canvas.bind("<Leave>", _unbind_wheel)
 
-        # Build section headers + pin rows.
-        for section_label, items in GPIO_PIN_GROUPS:
-            header = ttk.Label(
-                inner, text=f"── {section_label} ──",
-                foreground="#444444", font=("TkDefaultFont", 9, "bold"),
-            )
-            header.pack(anchor="w", pady=(8, 4), padx=(2, 0))
-            for label, pin in items:
-                row = _PinRow(inner, label, pin, on_set=self._on_pin_set)
-                row.frame.pack(fill=tk.X, anchor="w", padx=(8, 0))
-                self._pin_rows[pin] = row
+        for label, pin in GPIO_PINS:
+            row = _PinRow(inner, label, pin, on_set=self._on_pin_set)
+            row.frame.pack(fill=tk.X, anchor="w", padx=(8, 0))
+            self._pin_rows[pin] = row
 
     def _build_log_area(self) -> None:
         # Compact log (3-row visible height) — operations are fast so a big
