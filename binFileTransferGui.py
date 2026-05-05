@@ -370,6 +370,9 @@ class GpioTab(_LoggedTab):
         self._busy = False
         self._auto_refresh_after_id: str | None = None
         self._pin_rows: dict[int, _PinRow] = {}
+        # Set on disconnect so an in-flight Read All loop bails out between
+        # pins instead of running all 66 × 5 s timeouts to completion.
+        self._abort_event = threading.Event()
         super().__init__(parent, app)
         # Persistent worker thread that drains _cmd_queue forever.
         self._worker_thread = threading.Thread(target=self._cmd_loop, daemon=True)
@@ -569,6 +572,7 @@ class GpioTab(_LoggedTab):
             return
 
         self._session = session
+        self._abort_event.clear()
         self._set_conn_status("Connected", "#1f7a1f")
         self._disconnect_btn.config(state=tk.NORMAL)
         self._read_all_btn.config(state=tk.NORMAL)
@@ -576,8 +580,6 @@ class GpioTab(_LoggedTab):
         for row in self._pin_rows.values():
             row.set_enabled(True)
         self.app.set_status("GPIO Connected", "#1f7a1f")
-        # Initial read so the Read column isn't a wall of "??".
-        self._on_read_all()
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -595,6 +597,15 @@ class GpioTab(_LoggedTab):
                 pass
             self._auto_refresh_after_id = None
         self._auto_refresh_var.set(False)
+        # Signal any in-flight Read All loop to bail between pins, and drop
+        # any commands still queued behind it so we don't sit through 66 ×
+        # serial timeouts before the close runs.
+        self._abort_event.set()
+        try:
+            while True:
+                self._cmd_queue.get_nowait()
+        except queue.Empty:
+            pass
         # Disable everything that needs the session.
         self._disconnect_btn.config(state=tk.DISABLED)
         self._read_all_btn.config(state=tk.DISABLED)
@@ -663,6 +674,8 @@ class GpioTab(_LoggedTab):
 
         def cmd():
             for pin, _row in self._pin_rows.items():
+                if self._abort_event.is_set():
+                    break
                 v = self._session.read_pin(pin) if self._session is not None else None
                 if v is not None:
                     self.app.root.after(
