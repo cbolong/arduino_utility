@@ -8,50 +8,89 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A two-piece utility that programs SST39xF010/020/040-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet for the target part is in `spec/`.
+A utility that programs SST39xF010-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet is in `spec/`.
 
-- `binFileProgram.ino` — sketch that runs on the Due. Drives 19 address pins, 8 data pins, and CE/OE/WE to talk to the flash.
-- `binFileTransfer.py` — host-side script that auto-detects the Due, opens its USB serial port, and streams `firmware.bin` over to the sketch in 4 KB chunks.
+- `binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol for wiring verification before the user commits to a flash session.
+- `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, and `GpioSession` live here. The two front-ends are thin shells.
+- `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`).
+- `binFileTransferGui.py` — Tkinter GUI front-end. Two tabs: `燒錄 ROM` (flash) and `GPIO 設定` (manual pin poker, persistent connection).
 
-There is no build system, no test suite, and no package manifest. Workflow is: edit → upload sketch via Arduino IDE → run the Python script.
+`README.md` is the authoritative end-user doc (Chinese). When a question is about *user-facing behaviour* — wiring tables, CLI flags, troubleshooting — read it. When it's about *internal coupling* between the sketch and host, this file is faster.
 
-## Running
+## Commands
 
 ```bash
-# Host side. Requires pyserial. Place firmware.bin next to the script.
+# Install host deps
+pip install -r requirements.txt        # pyserial only; tkinter is stdlib
+
+# Run CLI (auto-detects Due Programming Port via VID 0x2341 / PID 0x003D)
 python binFileTransfer.py
+python binFileTransfer.py --port COM19 --file ./builds/v1.bin --timeout 60
+
+# Run GUI
+python binFileTransferGui.py
 ```
 
-The sketch is uploaded with the Arduino IDE (board: Arduino Due, **Programming Port** — the script auto-detects VID `0x2341` / PID `0x003D`, which is the Due's programming port, not the native USB port).
+The sketch is uploaded with the Arduino IDE: board **Arduino Due (Programming Port)** — auto-detection only matches the programming port, not the native USB port.
 
-## Architecture: the handshake protocol
+There is no test suite. Verification is hardware-in-the-loop: flash a known `firmware.bin`, watch the CRC32 match.
 
-The two files are tightly coupled by a string-based serial protocol at 115200 baud. **Both sides must change together.** The full sequence:
+## Architecture: protocol coupling
 
-1. Sketch boots → reads SST software ID → emits `ARDUINO_ERASE_READY`.
+`binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **two** string-based serial protocols at 115200 8N1. Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
+
+### Flash flow (8 strings, primary path)
+
+1. Sketch boots → reads SST software ID (vendor `0xBF`, device `0xB5` SF010 / `0xD5` LF010 — anything else halts in `while(1)`) → emits `ARDUINO_ERASE_READY`.
 2. Host sends `ARDUINO_ERASE_TRIGGER`.
-3. Sketch performs full chip erase + verifies first 1 KB is `0xFF` → emits `ARDUINO_READY_TO_RECEIVED_DATA`.
-4. Host pads `firmware.bin` to exactly 128 KB with `\x00`, then sends 32 × 4 KB chunks. After each chunk it waits for `ARDUINO_RECEIVED_LINE_DONE` before sending the next.
-5. For each chunk the sketch runs program → read-back → byte compare; any mismatch emits `ARDUINO_ERROR` and the sketch halts in `while(1)`.
-6. After the host stops sending, the sketch's 10 s `RECEIVED_DATA_TIMEOUT` fires and it emits `ARDUINO_DATA_COMPLETED`.
+3. Sketch chip-erases, samples first 1 KB == `0xFF`, emits `ARDUINO_READY_TO_RECEIVED_DATA`.
+4. Host pads `firmware.bin` to 128 KB, sends 32 × 4 KB chunks. After each chunk it waits for `ARDUINO_RECEIVED_LINE_DONE`.
+5. Host sends `ARDUINO_VERIFY_REQUEST <crc32_hex>` → sketch sweeps the chip with bitwise CRC32 (~1.3 s for 128 KB) → `ARDUINO_VERIFY_OK` or `ARDUINO_ERROR`. **CRC32 is the primary integrity check; the per-chunk read-back compare in the sketch's program loop is a redundant inner check.**
+6. Host sends `ARDUINO_TRANSFER_DONE_SIGNAL` → sketch prints timing report → `ARDUINO_DATA_COMPLETED`.
 
-Constants that must stay in sync between the two files: the six handshake strings, `CHUNK_SIZE` (4096), and the implied total size (`FILE_SIZE_SUPPORT` = 128 KB on the host = 32 chunks for an SST39xF010).
+The 10 s `RECEIVED_DATA_TIMEOUT` in the sketch is a **legacy fallback** for old hosts that didn't send `ARDUINO_TRANSFER_DONE_SIGNAL`. New hosts always send the explicit signal and never hit it.
+
+### GPIO flow (used by `GPIO 設定` tab and `core.GpioSession`)
+
+After `ARDUINO_ERASE_READY` and *before* `ARDUINO_ERASE_TRIGGER`, the sketch loops on:
+
+- `GPIO_SET <pin> <OUTPUT|INPUT> [HIGH|LOW]` → `GPIO_OK` or `GPIO_ERROR <why>`
+- `GPIO_READ <pin>` → `GPIO_VALUE <pin> <0|1>` (forces INPUT first)
+
+Once `ARDUINO_ERASE_TRIGGER` fires, GPIO mode is gone until the Due is reset. Poking flash pins (CE/OE/WE/Ax/DQx) via GPIO leaves the bus in an undefined state — the user has to reset before flashing.
+
+The GUI keeps a persistent `GpioSession` open behind the GPIO tab; the CLI doesn't expose GPIO. When the user clicks Start Programming with a GPIO session open, the flash tab calls `gpio_tab.disconnect_for_flash()` to release the port.
+
+### Constants that must stay in sync
+
+| Constant | `.ino` | `binFileTransfer_core.py` |
+|---|---|---|
+| Baud | `UART_BAUDRATE` | `BAUD` |
+| Chunk size | `CHUNK_SIZE` (4096) | `CHUNK_SIZE` |
+| Total size | `EXPECTED_CHUNKS` × `CHUNK_SIZE` | `FILE_SIZE_SUPPORT` |
+| Handshake strings | `strEraseReady` … `strError` (9 of them, incl. `strVerifyRequest` / `strTransferDone`) | `MCU_ERASE_READY` … `MCU_ERROR` |
+| GPIO strings | inline string literals in `handleGpioSet/Read` | inline literals in `GpioSession` |
+
+If you change a string, grep both files. The CLI sets `FILE_NAME = "firmware.bin"` as the only host-side default the core itself doesn't know.
 
 ## Hardware wiring assumptions baked into the sketch
 
-`binFileProgram.ino` hard-codes the Due pin map:
-
-- `addrPins[]` — 19 pins for A0–A18 (note A8/A9 etc. are **not** in numeric pin order; the array order *is* the address bit order, index 0 = A0).
-- `dataPins[]` — 8 pins for D0–D7, again in bit order.
+- `addrPins[]` — 19 entries; **array index = address bit**, not numeric pin order. Index 0 is A0, regardless of which Due pin number lives there.
+- `dataPins[]` — 8 entries, same convention (index 0 = DQ0).
 - `CE_PIN=43`, `OE_PIN=39`, `WE_PIN=25`.
+- Idle bus: `CE=LOW, OE=HIGH, WE=HIGH`. CE stays low for the entire session; only OE/WE toggle per byte.
+- Due IO is **3.3 V**. SST39LF/VF010 require 3.0–3.6 V Vdd. Don't swap to a 5 V Mega without level shifters.
 
-Idle state is `CE=LOW, OE=HIGH, WE=HIGH`. CE is held low for the whole session — only OE and WE are toggled per byte. If you change wiring, only the arrays need to change; the rest of the code indexes through them.
-
-The supported device IDs are also hard-coded (`vendorID 0xBF`, `deviceID_SST39SF010 0xB5`, `deviceID_SST39LF010 0xD5`). Any other ID halts the sketch at boot.
+If wiring changes, only the two arrays move. The bit-banging code indexes through them.
 
 ## Things that look like bugs but aren't (or are, and matter)
 
-- **`Serial.readString()` in `setup()`** depends on the default 1 s serial timeout to terminate. Don't "fix" it to `readStringUntil('\n')` without also changing how the host sends `ARDUINO_ERASE_TRIGGER` (currently sent with `\n`, which works but isn't what gates the read).
-- **End-of-transfer detection is timeout-based**, not protocol-based. The host finishes sending and the sketch waits 10 s of silence before declaring `ARDUINO_DATA_COMPLETED`. Shortening `RECEIVED_DATA_TIMEOUT` will break slow transfers; lengthening it just makes the user wait.
-- The host always pads to 128 KB and sends exactly 32 chunks. The sketch does not know the original file size — it programs all 128 KB. Larger flash variants (020/040) would need both sides updated.
-- `verifyReadData()` in the sketch is defined but unused (commented call in `loop()`); leave it unless the user asks to wire it up.
+- **`Serial.readString()` in `setup()`** depends on the default 1 s serial timeout to terminate. Don't "fix" it to `readStringUntil('\n')` without also changing the host.
+- **`RECEIVED_DATA_TIMEOUT` (10 s)** is a fallback, not the primary terminator. The current host sends `ARDUINO_TRANSFER_DONE_SIGNAL` to end transfer immediately. Touching the timeout only matters if you also remove the explicit signal.
+- **Host always pads to 128 KB.** The sketch programs the full chip; original file size is unrecoverable. SST39xF020/040 needs both sides updated (more address pins, larger size, ID table).
+- **`verifyReadData()` is dead code.** It's defined but never called — superseded by the CRC32 sweep. Leave it alone unless asked to delete.
+- **GUI GPIO tab does not auto-Read on connect.** The Read column starts as `??` until the user clicks `Read All`. An in-flight Read All is interruptible: `_begin_disconnect` sets `_abort_event` and flushes `_cmd_queue`, so Disconnect bails after at most one pending pin's serial timeout instead of 66.
+
+## CI / release
+
+`.github/workflows/build-release.yml` builds `SST39FlashProgrammer.exe` (PyInstaller, Python 3.12, Windows runner) on every push to `main` that touches non-doc files, and on `workflow_dispatch`. Each build creates an `Auto build build-<ts>-<sha>` release marked Latest; the prune step keeps EXE assets only on the 4 newest auto-builds (older release notes/tags survive). Manually-tagged semver releases (`v0.1.0`-style) are untouched by the prune.
