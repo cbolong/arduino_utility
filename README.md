@@ -160,7 +160,9 @@ MCU: CHIP ERASE SUCCESSFUL!
 
 ## 6. 通訊協定（PC ⇄ MCU 握手）
 
-UART：**500000 8N1**，chunk size = **4096 bytes**。
+UART：**115200 8N1**，chunk size = **4096 bytes**。
+
+> 註：原本想升到 500000 加速 UART 傳輸，但發現某些 Due 板（特別是副廠）的 ATmega16U2 firmware 在 500000 下會送出亂碼讓 host 一直 timeout。所以改回 115200 保守值。如果你的板子 16U2 跑 500000 OK，可以同步把 `.ino` 的 `UART_BAUDRATE` 跟 `binFileTransfer_core.py` 的 `BAUD` 兩邊都改回 500000。其他加速優化（CRC32 一次驗證、Data# Polling、拿掉 10s timeout、拿掉 cosmetic delay）跟 baud 無關，全部保留。
 
 | 階段 | 方向 | 訊息字串 | 意義 |
 |------|------|----------|------|
@@ -258,7 +260,7 @@ Datasheet 標稱 Chip Erase typ. 70 ms。`.ino` 目前用 `delay(100)` 後做 10
 
 `binFileProgram.ino`：
 ```c
-#define UART_BAUDRATE         500000
+#define UART_BAUDRATE         115200
 #define CHUNK_SIZE            4096
 #define EXPECTED_CHUNKS       32      // 128 KB / CHUNK_SIZE
 #define RECEIVED_DATA_TIMEOUT 10000   // ms，僅作為舊版 host 的 fallback
@@ -267,7 +269,7 @@ Datasheet 標稱 Chip Erase typ. 70 ms。`.ino` 目前用 `delay(100)` 後做 10
 
 `binFileTransfer_core.py`（CLI 與 GUI 共用）：
 ```python
-BAUD                        = 500000
+BAUD                        = 115200
 CHUNK_SIZE                  = 4096
 FILE_SIZE_SUPPORT           = 128 * 1024
 TARGET_VID                  = 0x2341     # Arduino

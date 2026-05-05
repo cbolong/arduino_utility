@@ -1,12 +1,22 @@
 
 // USER define
-#define UART_BAUDRATE 500000
+#define UART_BAUDRATE 115200
 #define CHUNK_SIZE 4096
 #define EXPECTED_CHUNKS 32                // 128 KB / CHUNK_SIZE
 
 #define RECEIVED_DATA_TIMEOUT 10000       // 10 sec, kept only as fallback
                                           // (host now sends an explicit
                                           // ARDUINO_TRANSFER_DONE_SIGNAL)
+
+// Note on UART baud: started at 500000 to cut transfer time but the
+// ATmega16U2 firmware on some Arduino Due boards (clones in particular)
+// does not generate a clean 500000 baud UART even though the SAM3X side
+// can — output ends up garbled in Serial Monitor and the host's
+// _wait_for_line times out waiting for ARDUINO_ERASE_READY. 115200 is the
+// known-stable rate. If your specific board handles 500000 cleanly you
+// can bump this back here AND in binFileTransfer_core.py:BAUD; the rest
+// of the speed wins (CRC32 verify, Data# Polling, no 10 s timeout, no
+// cosmetic LED delay) are independent of baud.
 
 
 

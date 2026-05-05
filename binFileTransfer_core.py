@@ -9,7 +9,11 @@ import serial
 import serial.tools.list_ports
 
 
-BAUD = 500000
+# 500000 turned out unstable on the user's specific 16U2 firmware (output
+# arrived garbled, host kept timing out waiting for ARDUINO_ERASE_READY),
+# so we're back to the safe 115200. Must match UART_BAUDRATE in
+# binFileProgram.ino exactly. See the note in the .ino for context.
+BAUD = 115200
 CHUNK_SIZE = 4096
 FILE_SIZE_SUPPORT = 128 * 1024
 
