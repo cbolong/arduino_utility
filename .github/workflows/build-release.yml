@@ -69,10 +69,13 @@ jobs:
       - name: Build EXE with PyInstaller
         shell: bash
         run: |
-          # --onedir (instead of --onefile) so end-users don't pay the
-          # 5-10s temp-extraction cost on every launch. Folder gets zipped
-          # in the next step for distribution.
-          pyinstaller --noconfirm --onedir --windowed --clean \
+          # --onefile chosen for distribution simplicity (single .exe, no
+          # surrounding folder). Trade-off: cold-start unpacks runtime to
+          # %TEMP% on every launch (~5-10 s). The startup-side optimisations
+          # in binFileTransferGui.py (lazy imports, background port scan,
+          # lazy GPIO panel) still apply once the bootloader hands control
+          # to Python.
+          pyinstaller --noconfirm --onefile --windowed --clean \
             --name SST39FlashProgrammer \
             --collect-submodules serial \
             --hidden-import serial.tools.list_ports_windows \
@@ -80,14 +83,6 @@ jobs:
             --icon assets/icon.ico \
             --version-file build/version.txt \
             binFileTransferGui.py
-
-      - name: Zip onedir output for release
-        shell: pwsh
-        run: |
-          Compress-Archive `
-            -Path dist/SST39FlashProgrammer `
-            -DestinationPath dist/SST39FlashProgrammer.zip `
-            -Force
 
       - name: Compute build tag and commit title
         id: tag
@@ -112,7 +107,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create release with zipped EXE bundle
+      - name: Create release with EXE
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
@@ -120,9 +115,9 @@ jobs:
           body: ${{ steps.tag.outputs.title }}
           prerelease: false
           make_latest: "true"
-          files: dist/SST39FlashProgrammer.zip
+          files: dist/SST39FlashProgrammer.exe
 
-      - name: Prune old auto-build zip assets, keep latest 4
+      - name: Prune old auto-build assets, keep latest 4
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -133,10 +128,11 @@ jobs:
                   sort_by(.publishedAt) | reverse | .[4:] | .[].tagName' \
           | while read -r tag; do
               [ -z "$tag" ] && continue
-              echo "Pruning zip asset from $tag"
-              # Cover both the new zip name and the legacy single-EXE name
-              # so older auto-builds get cleaned up consistently.
+              echo "Pruning auto-build assets from $tag"
+              # Match both the current .exe name and the short-lived .zip
+              # bundle from the onedir experiment so any leftover assets
+              # also get cleaned up.
               gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-                --json assets --jq '.assets[] | select(.name=="SST39FlashProgrammer.zip" or .name=="SST39FlashProgrammer.exe") | .name' \
+                --json assets --jq '.assets[] | select(.name=="SST39FlashProgrammer.exe" or .name=="SST39FlashProgrammer.zip") | .name' \
               | xargs -r -I{} gh release delete-asset "$tag" "{}" --repo "$GITHUB_REPOSITORY" --yes
             done
