@@ -96,10 +96,13 @@ arduino_utility/
 3. Board 選 `Arduino Due (Programming Port)`，Port 選對應的 COM
 4. Upload
 
-### Step 2：準備 firmware.bin
-- 把要燒的檔案命名為 `firmware.bin`，放在 `binFileTransfer.py` 同一個資料夾
+### Step 2：準備 firmware
+- GUI 版：按 **Browse...** 可以挑任何副檔名的檔案，不限定 `.bin`（dialog 預設過濾就是 All files）
+- CLI 版：預設找 `binFileTransfer.py` 同目錄下的 `firmware.bin`；要改路徑 / 改副檔名用 `--file` 指定
 - 檔案 ≤ 128 KB，超過會被腳本拒絕
+- 0 byte 空檔會被拒絕（避免使用者誤選空檔導致整片寫 0）
 - 不足 128 KB 會自動用 `0x00` padding 到 128 KB 整片寫入
+- 內容只看 bytes，不檢查格式：選錯檔（例如挑到 .txt 或 .docx）會把錯誤資料燒進去，CRC32 還是會 OK，**但對目標系統就是垃圾 firmware**。重燒一次即可救回
 
 ### Step 3：執行上傳
 
