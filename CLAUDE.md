@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workflow rules
+
+- After finishing changes on a feature branch and pushing, **always** mark the PR ready (if draft) and merge it back into `main` automatically. Do not wait for confirmation. Default merge method: `squash`. Then delete the feature branch on the remote if possible.
+
 ## What this repo is
 
 A two-piece utility that programs SST39xF010/020/040-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet for the target part is in `spec/`.
