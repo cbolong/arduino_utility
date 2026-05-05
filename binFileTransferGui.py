@@ -6,9 +6,10 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import serial.tools.list_ports
-
-from binFileTransfer_core import GpioSession, program_firmware
+# pyserial and binFileTransfer_core are imported lazily inside the methods
+# that need them. Both pull in Win32 COM enumeration code that's slow to
+# import cold, and deferring keeps the Tk window visible within ~1 s of
+# launch instead of waiting for those imports to finish first.
 
 
 APP_TITLE = "SST39 Flash Programmer"
@@ -232,6 +233,7 @@ class FlashTab(_LoggedTab):
         firmware_path = self.firmware_path
 
         def work(log_cb):
+            from binFileTransfer_core import program_firmware
             return program_firmware(firmware_path, log_cb, port=port)
 
         if self.submit_work(work):
@@ -365,11 +367,16 @@ class GpioTab(_LoggedTab):
     def __init__(self, parent: ttk.Notebook, app: "App") -> None:
         # Initialise persistent-worker state before super().__init__ runs
         # _build_controls (which references some of these).
-        self._session: GpioSession | None = None
+        self._session: "GpioSession | None" = None
         self._cmd_queue: queue.Queue = queue.Queue()
         self._busy = False
         self._auto_refresh_after_id: str | None = None
         self._pin_rows: dict[int, _PinRow] = {}
+        # Pin panel is heavy (66 rows × ~5 widgets) and most users start on
+        # the Flash tab, so we defer construction until the GPIO tab is first
+        # shown. App._on_tab_changed triggers _ensure_pin_panel_built().
+        self._pin_panel_parent: ttk.Frame | None = None
+        self._pin_panel_built = False
         # Set on disconnect so an in-flight Read All loop bails out between
         # pins instead of running all 66 × 5 s timeouts to completion.
         self._abort_event = threading.Event()
@@ -441,8 +448,21 @@ class GpioTab(_LoggedTab):
         )
         self._clear_log_btn.pack(side=tk.LEFT)
 
-        # Row 3+: scrollable pin panel grouped by section.
-        self._build_pin_panel(parent)
+        # Row 3+: pin panel — deferred. Stored parent is used by
+        # _ensure_pin_panel_built() the first time the user selects this tab.
+        self._pin_panel_parent = parent
+
+    def _ensure_pin_panel_built(self) -> None:
+        """Lazy-build the 66-pin dashboard on first GPIO-tab activation."""
+        if self._pin_panel_built or self._pin_panel_parent is None:
+            return
+        self._pin_panel_built = True
+        self._build_pin_panel(self._pin_panel_parent)
+        # If the session was somehow opened before the panel was built (it
+        # currently can't happen via the UI, but be defensive), reflect it.
+        if self._session is not None:
+            for row in self._pin_rows.values():
+                row.set_enabled(True)
 
     def _build_pin_panel(self, parent: ttk.Frame) -> None:
         # Container with a Canvas that hosts an inner Frame; scrollable
@@ -554,6 +574,7 @@ class GpioTab(_LoggedTab):
         self.app.set_status("GPIO connecting...", "#a06400")
 
         def cmd():
+            from binFileTransfer_core import GpioSession
             session = GpioSession(self._log_callback_threadsafe, port=port)
             success = session.open()
             self.app.root.after(
@@ -740,9 +761,10 @@ class App:
         port_row = ttk.Frame(self.root, padding=(10, 10, 10, 6))
         port_row.pack(fill=tk.X)
         ttk.Label(port_row, text="Port:").pack(side=tk.LEFT)
-        self.port_var = tk.StringVar(value="")
+        self.port_var = tk.StringVar(value=AUTO_DETECT_LABEL)
         self.port_combo = ttk.Combobox(
             port_row, textvariable=self.port_var,
+            values=[AUTO_DETECT_LABEL],
             state="readonly", width=55,
         )
         self.port_combo.pack(side=tk.LEFT, padx=(6, 6))
@@ -763,6 +785,8 @@ class App:
         self.notebook.add(self.gpio_tab.frame, text="GPIO 設定")
         self.notebook.select(self.flash_tab.frame)  # default tab
         self.tabs.extend([self.flash_tab, self.gpio_tab])
+        # Defer GPIO pin panel construction until that tab is first shown.
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # Status bar at the bottom (shared across tabs).
         bottom = ttk.Frame(self.root, padding=10)
@@ -791,7 +815,11 @@ class App:
         Always starts with AUTO_DETECT_LABEL. Adds every comports() entry as
         "<device> — <description>". If a Due Programming Port (VID/PID match)
         is found, default_label points at it; otherwise default is auto-detect.
+
+        Imports pyserial lazily — on Windows comports() pulls in WMI / SetupAPI
+        enumeration, which we don't want blocking the main thread at startup.
         """
+        import serial.tools.list_ports
         values: list[str] = [AUTO_DETECT_LABEL]
         default = AUTO_DETECT_LABEL
         for p in serial.tools.list_ports.comports():
@@ -806,12 +834,54 @@ class App:
         return values, default
 
     def _refresh_ports(self) -> None:
-        """Re-scan available ports and update the dropdown."""
-        values, default = self._scan_ports()
+        """Kick off a background port scan; UI stays responsive in the meantime.
+
+        Disables the Refresh button while scanning so a user can't fire two
+        scans in parallel. The result is applied back on the Tk thread via
+        root.after(0, ...). Called once at startup and on every Refresh click.
+        """
+        try:
+            self.port_refresh_btn.config(state=tk.DISABLED)
+        except (AttributeError, tk.TclError):
+            pass
+
+        def worker() -> None:
+            try:
+                values, default = self._scan_ports()
+            except Exception as e:  # never let a scan error kill the UI
+                self.root.after(0, lambda: self._apply_port_scan_error(e))
+                return
+            self.root.after(0, lambda: self._apply_port_scan(values, default))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_port_scan(self, values: list[str], default: str) -> None:
         self.port_combo["values"] = values
         # Keep the current selection if it still exists; otherwise reset.
         if self.port_var.get() not in values:
             self.port_var.set(default)
+        # Only re-enable Refresh if we're not in a state that locked the port
+        # entry for other reasons (busy worker, GPIO connected).
+        self._maybe_unlock_refresh()
+
+    def _apply_port_scan_error(self, exc: Exception) -> None:
+        # Surface the failure but keep the dropdown usable with auto-detect.
+        if not self.port_var.get():
+            self.port_var.set(AUTO_DETECT_LABEL)
+        if not self.port_combo["values"]:
+            self.port_combo["values"] = [AUTO_DETECT_LABEL]
+        self.set_status(f"Port scan failed: {exc}", "#b00020")
+        self._maybe_unlock_refresh()
+
+    def _maybe_unlock_refresh(self) -> None:
+        if self.any_tab_busy():
+            return
+        if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
+            return
+        try:
+            self.port_refresh_btn.config(state=tk.NORMAL)
+        except tk.TclError:
+            pass
 
     def lock_port_entry(self) -> None:
         self.port_combo.config(state=tk.DISABLED)
@@ -834,6 +904,14 @@ class App:
 
     def any_tab_busy(self) -> bool:
         return any(t.is_busy() for t in self.tabs)
+
+    def _on_tab_changed(self, _event=None) -> None:
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
+            return
+        if selected == str(self.gpio_tab.frame):
+            self.gpio_tab._ensure_pin_panel_built()
 
     def _on_close(self) -> None:
         if self.any_tab_busy():

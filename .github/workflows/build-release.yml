@@ -69,7 +69,10 @@ jobs:
       - name: Build EXE with PyInstaller
         shell: bash
         run: |
-          pyinstaller --noconfirm --onefile --windowed --clean \
+          # --onedir (instead of --onefile) so end-users don't pay the
+          # 5-10s temp-extraction cost on every launch. Folder gets zipped
+          # in the next step for distribution.
+          pyinstaller --noconfirm --onedir --windowed --clean \
             --name SST39FlashProgrammer \
             --collect-submodules serial \
             --hidden-import serial.tools.list_ports_windows \
@@ -77,6 +80,14 @@ jobs:
             --icon assets/icon.ico \
             --version-file build/version.txt \
             binFileTransferGui.py
+
+      - name: Zip onedir output for release
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path dist/SST39FlashProgrammer `
+            -DestinationPath dist/SST39FlashProgrammer.zip `
+            -Force
 
       - name: Compute build tag and commit title
         id: tag
@@ -101,7 +112,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create release with EXE
+      - name: Create release with zipped EXE bundle
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
@@ -109,9 +120,9 @@ jobs:
           body: ${{ steps.tag.outputs.title }}
           prerelease: false
           make_latest: "true"
-          files: dist/SST39FlashProgrammer.exe
+          files: dist/SST39FlashProgrammer.zip
 
-      - name: Prune old auto-build EXE assets, keep latest 4
+      - name: Prune old auto-build zip assets, keep latest 4
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -122,8 +133,10 @@ jobs:
                   sort_by(.publishedAt) | reverse | .[4:] | .[].tagName' \
           | while read -r tag; do
               [ -z "$tag" ] && continue
-              echo "Pruning EXE asset from $tag"
+              echo "Pruning zip asset from $tag"
+              # Cover both the new zip name and the legacy single-EXE name
+              # so older auto-builds get cleaned up consistently.
               gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-                --json assets --jq '.assets[] | select(.name=="SST39FlashProgrammer.exe") | .name' \
+                --json assets --jq '.assets[] | select(.name=="SST39FlashProgrammer.zip" or .name=="SST39FlashProgrammer.exe") | .name' \
               | xargs -r -I{} gh release delete-asset "$tag" "{}" --repo "$GITHUB_REPOSITORY" --yes
             done
