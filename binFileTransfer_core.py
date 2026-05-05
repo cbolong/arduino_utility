@@ -95,6 +95,9 @@ def program_firmware(
         return False
 
     file_size = os.path.getsize(firmware_path)
+    if file_size == 0:
+        log(f"File is empty: {firmware_path}", "err")
+        return False
     if file_size > FILE_SIZE_SUPPORT:
         log(
             f"File size too large ({file_size // 1024} KB). "

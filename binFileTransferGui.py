@@ -197,8 +197,8 @@ class FlashTab(_LoggedTab):
 
     def _on_browse(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select firmware.bin",
-            filetypes=[("Binary firmware", "*.bin"), ("All files", "*.*")],
+            title="Select firmware file",
+            filetypes=[("All files", "*.*"), ("Binary firmware", "*.bin")],
         )
         if not path:
             return
