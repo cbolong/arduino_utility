@@ -197,7 +197,9 @@ MCU 在送出 `ARDUINO_ERASE_READY` 之後、收到 `ARDUINO_ERASE_TRIGGER` 之�
 
 ⚠️ 直接拿 GPIO_SET 去改 CE#/OE#/WE#/A0–A18/DQ0–DQ7 會破壞 IDLE 匯流排狀態，之後燒錄行為未定義。reset Due 才能回到乾淨狀態。GPIO 模式適合「LED 跑馬燈測試」、「pin map 接線驗證」這類用途。
 
-GUI 端目前用持久連線（GPIO 設定 tab 上的 [Connect] / [Disconnect] 按鈕），按一次 Connect 開 serial（等 ~2s Due reset + ARDUINO_ERASE_READY），之後每筆 GPIO_SET / GPIO_READ 只走 ~5 ms UART 來回。Read All 31 根 ≈ 200 ms。可勾選 Auto-refresh 每 X 秒自動 Read All。
+GUI 端目前用持久連線（GPIO 設定 tab 上的 [Connect] / [Disconnect] 按鈕），按一次 Connect 開 serial（等 ~2s Due reset + ARDUINO_ERASE_READY），之後每筆 GPIO_SET / GPIO_READ 只走 ~5 ms UART 來回。畫面上把 Due 的 D0–D65（54 條 digital + 12 條 analog A0–A11，共 66 條）攤成一條清單，不再依角色分組。**Connect 後不會自動讀取**，Read 欄位停在 `??` 等使用者按 [Read All]（66 根 ≈ 400 ms）。可勾選 Auto-refresh 每 X 秒自動 Read All（預設關）。
+
+按 [Disconnect] 時 GUI 會立刻送出 abort 訊號並把已排隊但還沒跑的 GPIO 指令清空，所以即使 MCU 沒回應，最壞也只會等當前那顆 pin 的單次 serial timeout，不會卡 66 × timeout。
 
 按下「燒錄 ROM」tab 的 Start Programming 時，如果 GPIO 還在 Connected，GUI 會自動 Disconnect 釋放 serial，再進入燒錄流程；燒完不會自動重連，要手動再按一次 Connect。
 
