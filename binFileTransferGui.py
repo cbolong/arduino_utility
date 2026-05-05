@@ -6,11 +6,18 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import serial.tools.list_ports
+
 from binFileTransfer_core import GpioSession, program_firmware
 
 
 APP_TITLE = "SST39 Flash Programmer"
 WINDOW_SIZE = "900x780"
+
+# Port dropdown — first option is the catch-all auto-detect.
+AUTO_DETECT_LABEL = "Auto-detect (Arduino Due Programming Port)"
+DUE_TARGET_VID = 0x2341
+DUE_TARGET_PID = 0x003D
 
 LEVEL_TAGS = {
     "info": ("log_info", "#1a1a1a"),
@@ -29,10 +36,24 @@ class _DoneSentinel:
         self.success = success
 
 
-# Pin layout for the GPIO tab. Grouped by bus role; section labels appear as
-# headers in the UI. Each pin: (display_label, due_pin_number).
+# Pins consumed by the parallel-flash bit-bang in binFileProgram.ino. Listed
+# here for cross-reference / documentation only — the GPIO panel does NOT
+# gate on these; every Due GPIO is exposed below.
+FLASH_ADDRESS_PINS = [44, 42, 40, 38, 36, 34, 32, 30, 33, 35,
+                      41, 37, 28, 31, 29, 26, 24, 27, 22]   # A0..A18
+FLASH_DATA_PINS    = [46, 48, 50, 53, 51, 49, 47, 45]       # DQ0..DQ7
+FLASH_CE_PIN = 43
+FLASH_OE_PIN = 39
+FLASH_WE_PIN = 25
+
+LED_PIN = 13   # on-board LED, also Arduino's LED_BUILTIN
+
+
+# Pin layout for the GPIO tab. Every Due GPIO grouped by role; flash-related
+# pins keep their semantic labels (A0, DQ0, CE# ...) so users recognise them
+# at a glance. Each entry: (display_label, due_pin_number).
 GPIO_PIN_GROUPS: list[tuple[str, list[tuple[str, int]]]] = [
-    ("Address bus (A0–A18)", [
+    ("Flash — Address bus (A0–A18)", [
         ("A0  (D44)", 44), ("A1  (D42)", 42), ("A2  (D40)", 40),
         ("A3  (D38)", 38), ("A4  (D36)", 36), ("A5  (D34)", 34),
         ("A6  (D32)", 32), ("A7  (D30)", 30), ("A8  (D33)", 33),
@@ -41,16 +62,31 @@ GPIO_PIN_GROUPS: list[tuple[str, list[tuple[str, int]]]] = [
         ("A15 (D26)", 26), ("A16 (D24)", 24), ("A17 (D27)", 27),
         ("A18 (D22)", 22),
     ]),
-    ("Data bus (DQ0–DQ7)", [
+    ("Flash — Data bus (DQ0–DQ7)", [
         ("DQ0 (D46)", 46), ("DQ1 (D48)", 48), ("DQ2 (D50)", 50),
         ("DQ3 (D53)", 53), ("DQ4 (D51)", 51), ("DQ5 (D49)", 49),
         ("DQ6 (D47)", 47), ("DQ7 (D45)", 45),
     ]),
-    ("Control", [
+    ("Flash — Control", [
         ("CE# (D43)", 43), ("OE# (D39)", 39), ("WE# (D25)", 25),
     ]),
     ("On-board", [
         ("LED (D13)", 13),
+    ]),
+    ("Digital pins — others", [
+        # D0..D53 minus the 30 flash pins minus LED (13).
+        ("D0",  0), ("D1",  1), ("D2",  2), ("D3",  3), ("D4",  4),
+        ("D5",  5), ("D6",  6), ("D7",  7), ("D8",  8), ("D9",  9),
+        ("D10", 10), ("D11", 11), ("D12", 12),
+        ("D14", 14), ("D15", 15), ("D16", 16), ("D17", 17),
+        ("D18", 18), ("D19", 19), ("D20", 20), ("D21", 21),
+        ("D23", 23), ("D52", 52),
+    ]),
+    ("Analog pins (A0–A11 = D54–D65)", [
+        ("A0  (D54)", 54), ("A1  (D55)", 55), ("A2  (D56)", 56),
+        ("A3  (D57)", 57), ("A4  (D58)", 58), ("A5  (D59)", 59),
+        ("A6  (D60)", 60), ("A7  (D61)", 61), ("A8  (D62)", 62),
+        ("A9  (D63)", 63), ("A10 (D64)", 64), ("A11 (D65)", 65),
     ]),
 ]
 
@@ -731,21 +767,28 @@ class App:
 
         self.tabs: list[_LoggedTab] = []
         self._build_widgets()
+        # Populate port dropdown right after widgets exist, default-selects
+        # the Due Programming Port if one is plugged in at startup.
+        self._refresh_ports()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_widgets(self) -> None:
-        # Shared port row
+        # Shared port row — dropdown auto-scanned at startup.
         port_row = ttk.Frame(self.root, padding=(10, 10, 10, 6))
         port_row.pack(fill=tk.X)
-        ttk.Label(port_row, text="Port (optional):").pack(side=tk.LEFT)
+        ttk.Label(port_row, text="Port:").pack(side=tk.LEFT)
         self.port_var = tk.StringVar(value="")
-        self.port_entry = ttk.Entry(port_row, textvariable=self.port_var, width=20)
-        self.port_entry.pack(side=tk.LEFT, padx=(6, 6))
-        ttk.Label(
-            port_row,
-            text="(留空 = 自動偵測 Arduino Due Programming Port)",
-            foreground="#666666",
-        ).pack(side=tk.LEFT)
+        self.port_combo = ttk.Combobox(
+            port_row, textvariable=self.port_var,
+            state="readonly", width=55,
+        )
+        self.port_combo.pack(side=tk.LEFT, padx=(6, 6))
+        self.port_refresh_btn = ttk.Button(
+            port_row, text="↻ Refresh", command=self._refresh_ports,
+        )
+        self.port_refresh_btn.pack(side=tk.LEFT)
+        # Initial scan happens after notebook is built so any error logs
+        # have somewhere to go (we keep this simple and silent for now).
 
         # Notebook with two tabs
         self.notebook = ttk.Notebook(self.root)
@@ -771,10 +814,45 @@ class App:
     # ---- shared helpers used by tabs --------------------------------------
 
     def get_port(self) -> str | None:
-        return self.port_var.get().strip() or None
+        """Return the user-selected port string, or None for auto-detect."""
+        label = self.port_var.get()
+        if label == AUTO_DETECT_LABEL or not label:
+            return None
+        # Dropdown labels look like "COM4 — Arduino Due (...)".
+        # Pull the device name in front of " — " separator.
+        return label.split(" — ", 1)[0]
+
+    def _scan_ports(self) -> tuple[list[str], str]:
+        """(dropdown_values, default_label).
+
+        Always starts with AUTO_DETECT_LABEL. Adds every comports() entry as
+        "<device> — <description>". If a Due Programming Port (VID/PID match)
+        is found, default_label points at it; otherwise default is auto-detect.
+        """
+        values: list[str] = [AUTO_DETECT_LABEL]
+        default = AUTO_DETECT_LABEL
+        for p in serial.tools.list_ports.comports():
+            label = f"{p.device} — {p.description or 'unknown'}"
+            values.append(label)
+            if (
+                default == AUTO_DETECT_LABEL
+                and p.vid == DUE_TARGET_VID
+                and p.pid == DUE_TARGET_PID
+            ):
+                default = label
+        return values, default
+
+    def _refresh_ports(self) -> None:
+        """Re-scan available ports and update the dropdown."""
+        values, default = self._scan_ports()
+        self.port_combo["values"] = values
+        # Keep the current selection if it still exists; otherwise reset.
+        if self.port_var.get() not in values:
+            self.port_var.set(default)
 
     def lock_port_entry(self) -> None:
-        self.port_entry.config(state=tk.DISABLED)
+        self.port_combo.config(state=tk.DISABLED)
+        self.port_refresh_btn.config(state=tk.DISABLED)
 
     def unlock_port_entry(self) -> None:
         # Stay locked if another tab is busy OR if the GPIO tab is still
@@ -784,7 +862,8 @@ class App:
             return
         if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
             return
-        self.port_entry.config(state=tk.NORMAL)
+        self.port_combo.config(state="readonly")
+        self.port_refresh_btn.config(state=tk.NORMAL)
 
     def set_status(self, text: str, color: str) -> None:
         self.status_var.set(text)

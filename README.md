@@ -133,7 +133,7 @@ python binFileTransferGui.py
 
 GUI 操作：
 1. 按 **Browse...** 選 firmware
-2. （可選）在 **Port (optional)** 欄位填 COM port，留白就自動偵測
+2. 上方 **Port** 下拉選單啟動時會自動掃描所有 serial port；認到 Arduino Due Programming Port (VID `0x2341` / PID `0x003D`) 就預設幫你選那個 COM；認不到就停在 `Auto-detect`（等同舊版的「留空」行為）。Due 啟動後才插上的話，按右邊的 **↻ Refresh** 重掃。
 3. 按 **Start Programming**，下方 log 區會顯示握手 / chunk / verify 訊息
 4. 完成後 status 會顯示 Success（綠）或 Error（紅）
 
