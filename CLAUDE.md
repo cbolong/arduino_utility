@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workflow rules
 
-- After finishing changes on a feature branch and pushing, **always** mark the PR ready (if draft) and merge it back into `main` automatically. Do not wait for confirmation. Default merge method: `squash`. Then delete the feature branch on the remote if possible.
+- Commit changes directly on `main` and push. Do not create feature branches or PRs unless the user explicitly asks for one.
 
 ## What this repo is
 
