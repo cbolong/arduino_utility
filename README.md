@@ -129,7 +129,9 @@ python binFileTransfer.py --file ./builds/v1.2.bin --timeout 60
 ```bash
 python binFileTransferGui.py
 ```
-或從 GitHub Releases 下載 `SST39FlashProgrammer.exe`（Windows 單檔執行）。
+或從 GitHub Releases 下載 `SST39FlashProgrammer.zip`（Windows）：解壓後執行資料夾內的 `SST39FlashProgrammer.exe`。
+
+> 為什麼是 zip 不是單檔 exe？單檔 onefile 每次啟動都會把整包 Python runtime 解壓到 `%TEMP%`，冷啟動 5–10 秒；改成 onedir 資料夾發佈後啟動約 0.5–1 秒，使用者體感差很多。
 
 GUI 操作：
 1. 按 **Browse...** 選 firmware
@@ -304,14 +306,14 @@ FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
 - Tag 格式：`build-YYYYMMDD-HHMMSS-<7位commit sha>`
 - Release 名稱：`Auto build build-YYYYMMDD-HHMMSS-<sha>`
 - 內文：commit SHA + commit message
-- Asset：`SST39FlashProgrammer.exe`
+- Asset：`SST39FlashProgrammer.zip`（內含 `SST39FlashProgrammer.exe` + 同層 runtime DLL/pyd 的 onedir 資料夾）
 - `make_latest: true` → 每次新 build 自動取代上一次的 Latest 標記
 
 PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免上游升版突然壞掉。
 
 ### EXE 是 self-contained 的（給接到 EXE 的人）
 
-`SST39FlashProgrammer.exe` 直接 build 在 Windows runner 上，**單檔可執行，不用裝 Python、不用裝 Visual C++ Redist、不用 pip**。Build 內含：
+`SST39FlashProgrammer.zip` 直接 build 在 Windows runner 上，**解壓即可執行 `SST39FlashProgrammer.exe`，不用裝 Python、不用裝 Visual C++ Redist、不用 pip**。資料夾要保持完整（exe 同層的 `_internal/` 含 Python runtime DLL/pyd）。Build 內含：
 - Python 3.12 直譯器
 - `tkinter` GUI runtime（標準庫，PyInstaller 自動包入）
 - `pyserial` + Windows COM port enumeration backend（用 `--collect-submodules serial` + `--hidden-import serial.tools.list_ports_windows` 強制納入，避免 PyInstaller 漏掉動態載入的子模組）
@@ -340,11 +342,11 @@ build 時 workflow 會動態產生 `version.txt` 並用 `--version-file` 嵌進 
 
 `assets/icon.ico` 是一個 256/128/64/48/32/16 多解析度的 chip-style icon，build 時用 `--icon` 嵌入。Explorer thumbnail 與 taskbar 顯示用的就是這個。要換 icon 直接覆蓋這個檔案即可（保持 multi-resolution `.ico` 格式）。
 
-### 自動 prune（保留最近 4 份 EXE）
+### 自動 prune（保留最近 4 份 build）
 
 每次 build 結束後會清理：
 - 撈出所有 `build-*` 開頭的 release，按 `publishedAt` 排序
-- 第 5 個（含）以後的 release 上的 `SST39FlashProgrammer.exe` asset 會被刪掉
+- 第 5 個（含）以後的 release 上的 `SST39FlashProgrammer.zip` asset 會被刪掉（順便也清掉舊版的 `SST39FlashProgrammer.exe`，這樣切換 onefile→onedir 之後舊資產不會永遠賴在那）
 - **Release notes、tag、source code zip 都保留**，方便回顧 commit 歷史
 - 你手動發的 semver release（例如 `v0.1.0`）**不會被碰**，因為 prefix 不符
 
