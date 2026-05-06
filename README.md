@@ -210,6 +210,41 @@ GUI 端目前用持久連線（GPIO 設定 tab 上的 [Connect] / [Disconnect] �
 
 CLI 端 `gpio_set` / `gpio_read` 仍是 one-shot（每次 open/close），給 script 用簡單；要持久連線請直接用 `from binFileTransfer_core import GpioSession`。
 
+### TDBG 波形重播模式（GUI「TDBG」tab 用）
+
+跟 GPIO 模式一樣，**只在 MCU 收到 `ARDUINO_ERASE_TRIGGER` 之前可用**；發了 `TRIGGER` 後 TDBG 跟 GPIO 都失效，要 reset Due 才能再用。
+
+用途：把 Acute 邏輯分析儀(或其他工具)擷取下來的波形 `.txt` 上傳到 Due，由 Due 在指定 GPIO 上以 cycle 等級時序重播。播放時 Due 用 Cortex-M3 的 DWT cycle counter 自行 busy-wait（84 MHz、~11.9 ns/tick），最小可重播脈寬約 32 cycles ≈ 380 ns。
+
+| 階段 | 方向 | 訊息 | 意義 |
+|------|------|------|------|
+| 1 | PC → MCU | `TDBG_LOAD <pin> <num_events> <initial_state>` | 通告 Due 接下來會送 `num_events × 5` bytes 的事件資料；`initial_state` 是 0/1，第一個 transition 之前的腳位電位 |
+| 2 | MCU → PC | `TDBG_READY` | Due 已開好 buffer，可以送 binary blob |
+| 3 | PC → MCU | （`num_events × 5` bytes raw binary）| 每個 event = `uint32 little-endian delta_cycles` + `uint8 state(0/1)`；delta 是與「上一個事件」之間的 84 MHz cycle 數，第一個事件 delta 一律 0（在 playback 起始就觸發） |
+| 4 | MCU → PC | `TDBG_LOADED <crc16_hex>` | Due 把收到的 blob 算 CRC-16/CCITT-FALSE 回傳；host 比對若不符要重送 |
+| 5 | PC → MCU | `TDBG_PLAY` 或 `TDBG_PLAY_LOOP <n>` | 啟動播放；`n=0` 表示無限循環、`n>=1` 表示重複 N 次；單純 `TDBG_PLAY` 等同 `TDBG_PLAY_LOOP 1` |
+| 6 | MCU → PC | `TDBG_PLAY_STARTED` | 播放開始 |
+| 7 | PC → MCU | `TDBG_STOP` | 中止無限 / 多次播放；只在「長間隔事件」(≥10 ms gap) 期間 Due 會去 poll Serial，所以反應延遲最壞 = 一個長間隔 |
+| 8 | MCU → PC | `TDBG_STOPPED` | 確認已停（僅在收到 STOP 才會送）|
+| 9 | MCU → PC | `TDBG_PLAY_DONE` | 播放結束（不論是跑完還是被 STOP）|
+| ✗ | MCU → PC | `TDBG_ERROR <reason>` | 各種錯誤；`bad_pin` / `bad_count` / `bad_initial` / `bad_format` / `short_read X/Y` / `not_loaded` |
+
+時序保證：
+- 直接寫 PIO `SODR/CODR` 暫存器做腳位翻轉（單 cycle store，無 `digitalWrite()` 抖動）
+- 中斷只在「等下一個 deadline + 寫腳位」這段 mask，事件之間 Serial RX、SysTick、USB CDC 全部正常運作
+- 預期 jitter ±10 cycles ≈ ±120 ns（spin-loop 開銷與指令預取）
+- 不保證跨設備時鐘對齊：Due 與分析儀晶振各自漂移，典型 ±0.01% (1 秒擷取對應 100 µs 誤差)
+
+容量限制：MCU 端 buffer = `TDBG_MAX_EVENTS × 5 = 20 KB`（`TDBG_MAX_EVENTS` 預設 `4096`）。原始擷取超過 4096 個 transition 時，host 端的 `parse_acute_txt` 會直接拒絕並提示。
+
+GUI 操作：在 **TDBG** tab，按 [Connect] 開啟 serial → [Browse...] 選 Acute 輸出的 `.txt`（時間戳預設皮秒）→ 若檔案有多 channel 則用 **Channel** 下拉選 → 從 **Pin** 下拉選一個 Due GPIO（**沒有預設值**，每次都要選；Flash 匯流排上的腳位會在標籤顯示 `(WE#)` / `(A0)` 等註記讓你警覺）→ **Iterations** 設 1 = 單次、設 0 = 無限 → [Play]。播放期間可按 [Stop] 中止。
+
+按 [Disconnect] 或燒錄 / GPIO tab 取走 port 時，TDBG 會先設定 stop event，等當前播放收尾再釋放 serial（最壞延遲 = 一個長間隔）。
+
+CLI 端目前**沒有**對應的 sub-command；要 scripting 直接 `from binFileTransfer_core import TdbgSession, parse_acute_txt`。
+
+**GUI 三 tab 的 port 仲裁**：燒錄 / GPIO / TDBG 同時間最多只有一個能持有 serial port。在 TDBG 連線狀態下按 GPIO 的 Connect 會被擋；按 Start Programming 則會自動釋放 GPIO 與 TDBG 後再進入燒錄。
+
 對應字串常數：
 - `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strVerifyRequest` / `strVerifyOK` / `strTransferDone` / `strTransferCompleted` / `strError`
 - `.py`：`MCU_ERASE_READY` / `MCU_ERASE_TRIGGER` / `MCU_READY_TO_START` / `MCU_RECEIVED_LINE_RESPONSE` / `MCU_VERIFY_REQUEST` / `MCU_VERIFY_OK` / `MCU_TRANSFER_DONE_SIGNAL` / `MCU_TRANSFER_COMPLETED` / `MCU_ERROR`，集中在 `binFileTransfer_core.py`

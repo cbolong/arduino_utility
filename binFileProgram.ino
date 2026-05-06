@@ -295,6 +295,248 @@ void handleGpioRead(const String& cmd) {
 }
 
 
+// ----------------------------------------------------------------------------
+// TDBG (timing debug) waveform playback — replays a captured waveform on a
+// chosen GPIO with cycle-accurate timing using the Cortex-M3 DWT cycle
+// counter. Like GPIO_*, only available while the MCU sits in setup()'s
+// pre-erase wait loop. Once ARDUINO_ERASE_TRIGGER fires, TDBG is gone until
+// reset.
+//
+// Wire format (newline-terminated):
+//   TDBG_LOAD <pin> <num_events> <initial_state>
+//     -> "TDBG_READY"
+//        (host then writes <num_events> * 5 raw bytes:
+//         uint32_le delta_cycles + uint8 state, repeated)
+//     -> "TDBG_LOADED <crc16_hex>"   (CRC-16/CCITT-FALSE over the blob)
+//        or "TDBG_ERROR <reason>"
+//   <initial_state> is 0 or 1, the level the pin holds before the first
+//   transition. Setting it to the same value as the first event's state
+//   means no edge fires for the first transition — that's intentional if
+//   the captured trace started mid-level.
+//   TDBG_PLAY                  -> "TDBG_PLAY_STARTED" ... "TDBG_PLAY_DONE"
+//   TDBG_PLAY_LOOP <n>         -> same; n=0 means infinite loop until STOP.
+//   TDBG_STOP                  -> drained inside long-gap windows during
+//                                 playback only; replies "TDBG_STOPPED"
+//                                 followed by "TDBG_PLAY_DONE".
+//
+// Timing budget: DWT->CYCCNT runs at the CPU clock (84 MHz on Due, ~11.9 ns
+// per tick). Minimum reliable inter-event delta is ~32 cycles (~380 ns).
+// Pin transitions use direct PIO_SODR/PIO_CODR — single-cycle store, no
+// digitalWrite() latency.
+// ----------------------------------------------------------------------------
+
+#define TDBG_MAX_EVENTS         4096
+#define TDBG_EVENT_BYTES        5            // uint32_le delta + uint8 state
+#define TDBG_LONG_GAP_CYCLES    840000UL     // ≥10 ms — open service window
+#define TDBG_LONG_GAP_BAILOUT   16800UL      // ~200 µs slack before deadline
+
+static uint8_t  tdbgBuf[TDBG_MAX_EVENTS * TDBG_EVENT_BYTES];
+static uint16_t tdbgEventCount = 0;
+static uint8_t  tdbgPin = 0;
+static Pio*     tdbgPort = NULL;
+static uint32_t tdbgMask = 0;
+static uint8_t  tdbgInitialState = 0;
+static volatile bool tdbgStopRequested = false;
+static bool tdbgDwtReady = false;
+
+static void tdbgEnableDwt() {
+  if (tdbgDwtReady) return;
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  tdbgDwtReady = true;
+}
+
+// CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflect, no xor-out.
+// Test vector: tdbgCrc16("123456789", 9) == 0x29B1.
+static uint16_t tdbgCrc16(const uint8_t* data, uint32_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint32_t i = 0; i < len; i++) {
+    crc ^= ((uint16_t)data[i] << 8);
+    for (int b = 0; b < 8; b++) {
+      if (crc & 0x8000) crc = (uint16_t)((crc << 1) ^ 0x1021);
+      else              crc = (uint16_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+void handleTdbgLoad(const String& cmd) {
+  // "TDBG_LOAD <pin> <count> <initial_state>"
+  int p1 = cmd.indexOf(' ');
+  int p2 = (p1 >= 0) ? cmd.indexOf(' ', p1 + 1) : -1;
+  int p3 = (p2 >= 0) ? cmd.indexOf(' ', p2 + 1) : -1;
+  if (p1 < 0 || p2 < 0 || p3 < 0) {
+    Serial.println("TDBG_ERROR bad_format");
+    return;
+  }
+  int pin = cmd.substring(p1 + 1, p2).toInt();
+  long count = cmd.substring(p2 + 1, p3).toInt();
+  int initialState = cmd.substring(p3 + 1).toInt();
+  if (pin < 0 || pin > 65) {
+    Serial.println("TDBG_ERROR bad_pin");
+    return;
+  }
+  if (count < 1 || count > TDBG_MAX_EVENTS) {
+    Serial.println("TDBG_ERROR bad_count");
+    return;
+  }
+  if (initialState != 0 && initialState != 1) {
+    Serial.println("TDBG_ERROR bad_initial");
+    return;
+  }
+
+  uint32_t expectedBytes = (uint32_t)count * TDBG_EVENT_BYTES;
+
+  // Cache PIO mapping early so we fail fast on bad pins.
+  Pio* port = g_APinDescription[pin].pPort;
+  uint32_t mask = g_APinDescription[pin].ulPin;
+  if (port == NULL || mask == 0) {
+    Serial.println("TDBG_ERROR no_pio");
+    return;
+  }
+
+  // 20 KB at 115200 baud takes ~1.7 s — bump the timeout above the 1 s
+  // default, restore afterwards so other handlers stay snappy.
+  unsigned long savedTimeout = Serial.getTimeout();
+  Serial.setTimeout(5000);
+
+  Serial.println("TDBG_READY");
+
+  size_t got = Serial.readBytes((char*)tdbgBuf, expectedBytes);
+  Serial.setTimeout(savedTimeout);
+
+  if (got != expectedBytes) {
+    Serial.print("TDBG_ERROR short_read ");
+    Serial.print((unsigned long)got);
+    Serial.print("/");
+    Serial.println((unsigned long)expectedBytes);
+    return;
+  }
+
+  uint16_t crc = tdbgCrc16(tdbgBuf, expectedBytes);
+
+  tdbgEventCount = (uint16_t)count;
+  tdbgPin = (uint8_t)pin;
+  tdbgPort = port;
+  tdbgMask = mask;
+  tdbgInitialState = (uint8_t)initialState;
+
+  tdbgEnableDwt();
+
+  char hexbuf[8];
+  snprintf(hexbuf, sizeof(hexbuf), "%04X", crc);
+  Serial.print("TDBG_LOADED ");
+  Serial.println(hexbuf);
+}
+
+// Drain any pending TDBG_STOP\n from Serial without blocking. Any other
+// inbound bytes during playback are discarded — the host shouldn't be
+// sending non-STOP traffic while we're playing.
+static bool tdbgPumpStop() {
+  static char lineBuf[16];
+  static uint8_t lineLen = 0;
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      lineBuf[lineLen] = 0;
+      bool match = (strcmp(lineBuf, "TDBG_STOP") == 0);
+      lineLen = 0;
+      if (match) return true;
+      continue;
+    }
+    if (lineLen < sizeof(lineBuf) - 1) {
+      lineBuf[lineLen++] = (char)c;
+    } else {
+      lineLen = 0;  // overflow, drop
+    }
+  }
+  return false;
+}
+
+// Inner playback loop. Returns true if completed normally, false if STOP
+// was observed inside a long-gap window.
+static bool tdbgPlayOnce() {
+  // Pre-set initial level via direct PIO BEFORE flipping output enable, so
+  // there's no float-LOW glitch between mode change and first write.
+  if (tdbgInitialState) tdbgPort->PIO_SODR = tdbgMask;
+  else                  tdbgPort->PIO_CODR = tdbgMask;
+  tdbgPort->PIO_PER = tdbgMask;   // PIO control (not peripheral)
+  tdbgPort->PIO_OER = tdbgMask;   // output enable
+
+  uint32_t deadline = DWT->CYCCNT;
+  const uint8_t* p = tdbgBuf;
+
+  for (uint16_t i = 0; i < tdbgEventCount; ++i) {
+    uint32_t delta;
+    memcpy(&delta, p, sizeof(delta));
+    uint8_t state = p[4];
+    p += TDBG_EVENT_BYTES;
+    deadline += delta;
+
+    // Long-gap service window: poll Serial for STOP without burning a tight
+    // spin loop. Bail out a bit before the deadline so the precise wait
+    // below has slack to absorb scheduling jitter.
+    if (delta >= TDBG_LONG_GAP_CYCLES) {
+      while ((int32_t)(deadline - DWT->CYCCNT) > (int32_t)TDBG_LONG_GAP_BAILOUT) {
+        if (tdbgPumpStop()) {
+          tdbgStopRequested = true;
+          return false;
+        }
+      }
+    }
+
+    // Tight deterministic wait — interrupts masked only here, so Serial RX
+    // / USB CDC / SysTick all keep running between transitions.
+    noInterrupts();
+    while ((int32_t)(deadline - DWT->CYCCNT) > 0) { /* spin */ }
+    if (state) tdbgPort->PIO_SODR = tdbgMask;
+    else       tdbgPort->PIO_CODR = tdbgMask;
+    interrupts();
+  }
+  return true;
+}
+
+void handleTdbgPlay(const String& cmd) {
+  if (tdbgEventCount == 0) {
+    Serial.println("TDBG_ERROR not_loaded");
+    return;
+  }
+
+  // Default 1 iteration; TDBG_PLAY_LOOP <n>, n=0 means infinite.
+  long iterations = 1;
+  bool infinite = false;
+  if (cmd.startsWith("TDBG_PLAY_LOOP")) {
+    int sp = cmd.indexOf(' ');
+    if (sp < 0) {
+      Serial.println("TDBG_ERROR bad_format");
+      return;
+    }
+    iterations = cmd.substring(sp + 1).toInt();
+    if (iterations < 0) {
+      Serial.println("TDBG_ERROR bad_count");
+      return;
+    }
+    infinite = (iterations == 0);
+  }
+
+  tdbgStopRequested = false;
+  Serial.println("TDBG_PLAY_STARTED");
+
+  for (long n = 0; infinite || n < iterations; ++n) {
+    if (!tdbgPlayOnce()) break;        // STOP observed mid-playback
+    if (tdbgStopRequested) break;
+  }
+
+  if (tdbgStopRequested) {
+    Serial.println("TDBG_STOPPED");
+  }
+  Serial.println("TDBG_PLAY_DONE");
+}
+
+
 // IEEE 802.3 CRC32 (poly 0xEDB88320, refin/refout, init/xorout 0xFFFFFFFF).
 // Bitwise form — small code, plenty fast for our 128 KB sweep
 // (~150 ms on Cortex-M3 @ 84 MHz).
@@ -381,6 +623,10 @@ void setup() {
         handleGpioSet(input);
       } else if (input.startsWith("GPIO_READ ")) {
         handleGpioRead(input);
+      } else if (input.startsWith("TDBG_LOAD ")) {
+        handleTdbgLoad(input);
+      } else if (input == "TDBG_PLAY" || input.startsWith("TDBG_PLAY_LOOP ")) {
+        handleTdbgPlay(input);
       }
       // Unknown lines silently ignored.
     }
