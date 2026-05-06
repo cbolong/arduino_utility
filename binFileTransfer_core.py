@@ -372,3 +372,368 @@ def gpio_read(
         return session.read_pin(pin)
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# TDBG (timing debug) — replays a captured logic-analyzer waveform on a Due
+# GPIO at cycle-accurate timing. Pattern is uploaded once over UART, then
+# the MCU plays it locally using DWT->CYCCNT.
+# ---------------------------------------------------------------------------
+
+DUE_CPU_HZ = 84_000_000
+TDBG_MAX_EVENTS = 4096
+TDBG_EVENT_BYTES = 5            # uint32_le delta + uint8 state
+TDBG_MIN_DELTA_CYCLES = 32      # ~380 ns @ 84 MHz — below this the spin
+                                # loop can't reliably hit the deadline.
+
+MCU_TDBG_READY = "TDBG_READY"
+MCU_TDBG_LOADED_PREFIX = "TDBG_LOADED"
+MCU_TDBG_PLAY_STARTED = "TDBG_PLAY_STARTED"
+MCU_TDBG_PLAY_DONE = "TDBG_PLAY_DONE"
+MCU_TDBG_STOPPED = "TDBG_STOPPED"
+MCU_TDBG_ERROR_PREFIX = "TDBG_ERROR"
+
+
+def tdbg_crc16(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect, no xor-out).
+
+    Test vector: tdbg_crc16(b"123456789") == 0x29B1.
+    """
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+# Self-test: imported once on first module load. Keeps host/MCU CRC in lock-
+# step — if someone "optimises" the polynomial, the import fails loudly.
+assert tdbg_crc16(b"123456789") == 0x29B1, "tdbg_crc16 self-test failed"
+
+
+def parse_acute_txt(
+    text: str, channel: int = 0, unit_ps: int = 1
+) -> tuple[int, list[tuple[int, int]]]:
+    """Parse an Acute logic-analyzer text export.
+
+    Format expected (header + CSV rows):
+        Timestamp,CH-00[,CH-01,...]
+        -40000,1
+        0,0
+        76800,1
+        ...
+
+    `channel` selects which CH-XX column to take (0 = first). `unit_ps` is
+    the raw timestamp unit in picoseconds — Acute's default export is in
+    picoseconds so the default of 1 is correct.
+
+    Returns (initial_state, [(delta_cycles, new_state), ...]) where:
+      * initial_state is taken from the first row (the pre-trigger sample)
+      * the first event has delta=0 (transitions fire immediately at
+        playback start) — playback's t=0 is anchored to the first
+        transition row, not the pre-trigger row.
+      * subsequent deltas are inter-transition cycle counts.
+
+    Raises ValueError on malformed input or sub-minimum gaps.
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("empty input")
+
+    header_cols = [c.strip() for c in lines[0].split(",")]
+    chan_indices = [
+        i for i, c in enumerate(header_cols)
+        if c.upper().startswith("CH")
+    ]
+    if not chan_indices:
+        raise ValueError("no CH-* columns in header")
+    if channel < 0 or channel >= len(chan_indices):
+        raise ValueError(
+            f"channel {channel} out of range; file has {len(chan_indices)}"
+        )
+    target_idx = chan_indices[channel]
+
+    rows: list[tuple[int, int]] = []
+    for lineno, raw in enumerate(lines[1:], start=2):
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) <= target_idx:
+            raise ValueError(f"line {lineno}: missing column {target_idx}")
+        try:
+            ts = int(parts[0])
+        except ValueError:
+            # Allow scientific / float timestamps too.
+            ts = int(float(parts[0]))
+        try:
+            state = int(parts[target_idx])
+        except ValueError:
+            raise ValueError(f"line {lineno}: state not 0/1: {parts[target_idx]!r}")
+        if state not in (0, 1):
+            raise ValueError(f"line {lineno}: state {state} not 0/1")
+        rows.append((ts, state))
+
+    if len(rows) < 2:
+        raise ValueError("need at least one transition row after the initial state")
+
+    initial_state = rows[0][1]
+    base_ts = rows[1][0]    # anchor playback t=0 at the first transition
+
+    events: list[tuple[int, int]] = []
+    prev_cycles = 0
+    for i in range(1, len(rows)):
+        ts_ps = (rows[i][0] - base_ts) * unit_ps
+        cycles_abs = round(ts_ps * DUE_CPU_HZ / 1e12)
+        delta = cycles_abs - prev_cycles
+        if i > 1 and delta < TDBG_MIN_DELTA_CYCLES:
+            raise ValueError(
+                f"line {i + 1}: delta {delta} cycles < min {TDBG_MIN_DELTA_CYCLES} "
+                f"(too fast for playback engine)"
+            )
+        if delta < 0:
+            raise ValueError(
+                f"line {i + 1}: timestamps not monotonic (delta={delta})"
+            )
+        if delta > 0xFFFFFFFF:
+            raise ValueError(
+                f"line {i + 1}: delta {delta} exceeds uint32 — split with extra "
+                f"no-op transitions or shorten the gap"
+            )
+        events.append((delta, rows[i][1]))
+        prev_cycles = cycles_abs
+
+    if len(events) > TDBG_MAX_EVENTS:
+        raise ValueError(
+            f"{len(events)} events > {TDBG_MAX_EVENTS} max — capture too long"
+        )
+
+    return initial_state, events
+
+
+def tdbg_pack_events(events: list[tuple[int, int]]) -> bytes:
+    """Serialise (delta, state) pairs into the wire format the MCU expects."""
+    import struct
+    out = bytearray()
+    for delta, state in events:
+        out += struct.pack("<IB", delta & 0xFFFFFFFF, state & 0x01)
+    return bytes(out)
+
+
+class TdbgSession:
+    """Persistent TDBG session — same lifecycle pattern as GpioSession.
+
+    Workflow:
+        s = TdbgSession(log, port=...)
+        s.open()
+        s.load(pin=13, initial_state=1, events=events)
+        s.play(iterations=1)        # blocks until MCU replies TDBG_PLAY_DONE
+        # ... or for loop mode:
+        s.play(iterations=0)        # async fire-and-forget; sets _playing=True
+        s.stop()                    # request stop; waits for TDBG_STOPPED
+        s.close()
+
+    Not thread-safe; serialise calls on a single worker thread (GUI does).
+    """
+
+    def __init__(
+        self,
+        log: LogCallback,
+        *,
+        port: str | None = None,
+        handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+    ) -> None:
+        self._log = log
+        self._port = port
+        self._handshake_timeout_s = handshake_timeout_s
+        self._ser: serial.Serial | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._ser is not None
+
+    def open(self) -> bool:
+        if self.is_open:
+            return True
+        ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
+        if ser is None:
+            return False
+        self._ser = ser
+        return True
+
+    def close(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def load(
+        self,
+        pin: int,
+        initial_state: int,
+        events: list[tuple[int, int]],
+    ) -> bool:
+        if not self.is_open:
+            self._log("TDBG session not open.", "err")
+            return False
+        if not (0 <= pin <= 65):
+            self._log(f"Invalid pin: {pin}", "err")
+            return False
+        if initial_state not in (0, 1):
+            self._log(f"Invalid initial state: {initial_state}", "err")
+            return False
+        if not events or len(events) > TDBG_MAX_EVENTS:
+            self._log(
+                f"Event count out of range: {len(events)} (1..{TDBG_MAX_EVENTS})",
+                "err",
+            )
+            return False
+
+        blob = tdbg_pack_events(events)
+        expected_crc = tdbg_crc16(blob)
+
+        cmd = f"TDBG_LOAD {pin} {len(events)} {initial_state}"
+        self._log(f"send: {cmd}", "info")
+        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        ready = _read_line(self._ser, self._log, 5.0)
+        if ready != MCU_TDBG_READY:
+            self._log(f"recv: {ready or '(no reply)'} (expected TDBG_READY)", "err")
+            return False
+        self._log(f"recv: {ready}", "ok")
+
+        # Generous timeout — 20 KB at 115200 takes ~1.7 s, MCU then replies.
+        self._ser.write(blob)
+        self._ser.flush()
+        self._log(f"sent {len(blob)} bytes of waveform data", "info")
+
+        reply = _read_line(self._ser, self._log, 10.0)
+        if not reply:
+            self._log("no reply after blob", "err")
+            return False
+        if reply.startswith(MCU_TDBG_ERROR_PREFIX):
+            self._log(f"recv: {reply}", "err")
+            return False
+        if not reply.startswith(MCU_TDBG_LOADED_PREFIX):
+            self._log(f"recv: {reply} (expected TDBG_LOADED)", "err")
+            return False
+        try:
+            mcu_crc = int(reply.split()[1], 16)
+        except (IndexError, ValueError):
+            self._log(f"malformed TDBG_LOADED reply: {reply!r}", "err")
+            return False
+        if mcu_crc != expected_crc:
+            self._log(
+                f"CRC mismatch: host=0x{expected_crc:04X} mcu=0x{mcu_crc:04X}",
+                "err",
+            )
+            return False
+        self._log(f"recv: {reply} (CRC OK)", "ok")
+        return True
+
+    def play(
+        self,
+        iterations: int = 1,
+        total_duration_s: float = 0.0,
+        stop_event: "threading.Event | None" = None,
+    ) -> bool:
+        """Run playback and block until TDBG_PLAY_DONE.
+
+        iterations=1 → single shot; >1 → finite loop; 0 → infinite (use only
+        with stop_event so this can actually return).
+
+        `total_duration_s` is a per-iteration estimate used to size the
+        completion timeout; pass 0 for default.
+
+        `stop_event` (optional threading.Event) — if set during the wait,
+        the session writes TDBG_STOP and continues to drain replies until
+        TDBG_PLAY_DONE arrives.
+        """
+        if not self.is_open:
+            self._log("TDBG session not open.", "err")
+            return False
+        if iterations < 0:
+            self._log(f"iterations must be >= 0, got {iterations}", "err")
+            return False
+        if iterations == 0 and stop_event is None:
+            self._log("infinite loop without stop_event would never return", "err")
+            return False
+
+        if iterations == 1:
+            cmd = "TDBG_PLAY"
+        else:
+            cmd = f"TDBG_PLAY_LOOP {iterations}"
+        self._log(f"send: {cmd}", "info")
+        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        if not self._await_play_started():
+            return False
+
+        if iterations == 0:
+            # Infinite — just keep the read pump alive until stop arrives.
+            timeout = float("inf")
+        else:
+            timeout = max(10.0, total_duration_s * iterations + 5.0)
+        return self._await_play_done(timeout, stop_event=stop_event)
+
+    def _await_play_started(self) -> bool:
+        reply = _read_line(self._ser, self._log, 5.0)
+        if reply == MCU_TDBG_PLAY_STARTED:
+            self._log(f"recv: {reply}", "ok")
+            return True
+        if reply and reply.startswith(MCU_TDBG_ERROR_PREFIX):
+            self._log(f"recv: {reply}", "err")
+        else:
+            self._log(f"recv: {reply or '(no reply)'} (expected TDBG_PLAY_STARTED)", "err")
+        return False
+
+    def _await_play_done(
+        self,
+        timeout_s: float,
+        stop_event: "threading.Event | None" = None,
+    ) -> bool:
+        import math
+        # Use monotonic + relative deadline so timeout=inf works cleanly.
+        if math.isinf(timeout_s):
+            deadline = float("inf")
+        else:
+            deadline = time.monotonic() + timeout_s
+
+        sent_stop = False
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                self._log(
+                    f"timeout waiting for TDBG_PLAY_DONE after {timeout_s:.1f}s",
+                    "err",
+                )
+                return False
+
+            # If caller asked us to stop, send STOP once and keep draining.
+            if stop_event is not None and stop_event.is_set() and not sent_stop:
+                self._log("send: TDBG_STOP", "info")
+                try:
+                    self._ser.write(b"TDBG_STOP\n")
+                except Exception as e:
+                    self._log(f"failed to send TDBG_STOP: {e}", "err")
+                sent_stop = True
+
+            # Bound per-iteration wait so we revisit stop_event promptly.
+            slice_s = min(0.25, deadline - now) if not math.isinf(deadline) else 0.25
+            line = _read_line(self._ser, self._log, slice_s)
+            if line is None:
+                continue
+            if line == MCU_TDBG_PLAY_DONE:
+                self._log(f"recv: {line}", "ok")
+                return True
+            if line == MCU_TDBG_STOPPED:
+                self._log(f"recv: {line}", "ok")
+                continue
+            if line.startswith(MCU_TDBG_ERROR_PREFIX):
+                self._log(f"recv: {line}", "err")
+                return False
+            # Surface anything else as info (debug chatter from MCU).
+            self._log(f"MCU: {line}", "info")

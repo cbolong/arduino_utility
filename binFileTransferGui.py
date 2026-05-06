@@ -216,17 +216,10 @@ class FlashTab(_LoggedTab):
         self.start_btn.config(state=tk.DISABLED)
         self.browse_btn.config(state=tk.DISABLED)
 
-        # If the GPIO tab is holding the serial port, close it first then
-        # proceed with flashing. The GpioTab does the disconnect on its
-        # worker thread and calls our continuation when done.
-        if self.app.gpio_tab.is_connected():
-            self._append_log(
-                "GPIO session is active — auto-disconnecting before flash.",
-                "info",
-            )
-            self.app.gpio_tab.disconnect_for_flash(on_done=self._do_start)
-            return
-        self._do_start()
+        # If any other tab holds the serial port, close it first then proceed
+        # with flashing. The release_port_then(callback) call chains through
+        # GPIO and TDBG tabs sequentially.
+        self.app.release_port_then(except_tab=self, on_done=self._do_start)
 
     def _do_start(self) -> None:
         port = self.app.get_port()
@@ -561,6 +554,12 @@ class GpioTab(_LoggedTab):
     def _on_connect(self) -> None:
         if self._session is not None:
             return
+        if self.app.any_other_tab_holding_port(self):
+            messagebox.showinfo(
+                "Busy",
+                "Another tab is holding the serial port. Disconnect it first.",
+            )
+            return
         if self.app.any_tab_busy():
             messagebox.showinfo(
                 "Busy",
@@ -647,9 +646,9 @@ class GpioTab(_LoggedTab):
         self.app.unlock_port_entry()
         self.app.set_status("GPIO Disconnected", "#666666")
 
-    def disconnect_for_flash(self, on_done) -> None:
+    def disconnect_for_other(self, on_done) -> None:
         """Close the GPIO session (if open) then call on_done() on the Tk
-        thread. Used by FlashTab so the flash flow can take over the serial
+        thread. Used by FlashTab / TdbgTab so they can take over the serial
         port without the user manually clicking Disconnect first."""
         if self._session is None:
             on_done()
@@ -741,6 +740,438 @@ class GpioTab(_LoggedTab):
 
 
 # ---------------------------------------------------------------------------
+# TDBG tab — load a captured waveform from an Acute logic-analyzer .txt
+# export and replay it on a chosen Due GPIO with cycle-accurate timing.
+# ---------------------------------------------------------------------------
+
+# Annotate flash-bus pins so the user knows which selections will disturb
+# the parallel-flash idle state. Selection is still allowed.
+def _tdbg_pin_annotation(pin: int) -> str:
+    if pin in FLASH_ADDRESS_PINS:
+        return f" (A{FLASH_ADDRESS_PINS.index(pin)})"
+    if pin in FLASH_DATA_PINS:
+        return f" (DQ{FLASH_DATA_PINS.index(pin)})"
+    if pin == FLASH_CE_PIN:
+        return " (CE#)"
+    if pin == FLASH_OE_PIN:
+        return " (OE#)"
+    if pin == FLASH_WE_PIN:
+        return " (WE#)"
+    if pin == LED_PIN:
+        return " (LED)"
+    return ""
+
+
+TDBG_PIN_LABELS = [f"D{n}{_tdbg_pin_annotation(n)}" for n in range(0, 66)]
+
+
+class TdbgTab(_LoggedTab):
+    def __init__(self, parent: ttk.Notebook, app: "App") -> None:
+        # Pattern state — populated by Browse parsing.
+        self._pattern_path: str | None = None
+        self._pattern_text: str = ""
+        self._initial_state: int | None = None
+        self._events: list[tuple[int, int]] = []
+        self._channel_count: int = 0
+        self._channel_index: int = 0
+
+        # Persistent worker thread — same pattern as GpioTab.
+        self._session = None
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._busy = False
+        self._stop_event = threading.Event()
+        self._playing = False  # True between Play click and PLAY_DONE
+        super().__init__(parent, app)
+        self._worker_thread = threading.Thread(target=self._cmd_loop, daemon=True)
+        self._worker_thread.start()
+
+    # ---- _LoggedTab overrides ---------------------------------------------
+
+    def is_busy(self) -> bool:
+        return self._busy
+
+    def submit_work(self, target_callable) -> bool:
+        raise RuntimeError("TdbgTab uses _cmd_queue, not submit_work")
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        # Row 1: Connection status + Connect / Disconnect
+        conn_row = ttk.Frame(parent)
+        conn_row.pack(fill=tk.X)
+        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
+        self._conn_status_var = tk.StringVar(value="Disconnected")
+        self._conn_status_label = ttk.Label(
+            conn_row, textvariable=self._conn_status_var, foreground="#b00020"
+        )
+        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
+        self._connect_btn = ttk.Button(
+            conn_row, text="Connect", command=self._on_connect
+        )
+        self._connect_btn.pack(side=tk.LEFT)
+        self._disconnect_btn = ttk.Button(
+            conn_row, text="Disconnect",
+            command=self._on_disconnect, state=tk.DISABLED,
+        )
+        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Row 2: pattern file + browse + channel
+        file_row = ttk.Frame(parent)
+        file_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(file_row, text="Pattern:").pack(side=tk.LEFT)
+        self._pattern_var = tk.StringVar(value="(no file selected)")
+        ttk.Label(
+            file_row, textvariable=self._pattern_var, width=50, anchor="w"
+        ).pack(side=tk.LEFT, padx=(6, 6))
+        self._browse_btn = ttk.Button(
+            file_row, text="Browse...", command=self._on_browse
+        )
+        self._browse_btn.pack(side=tk.LEFT)
+        ttk.Label(file_row, text="  Channel:").pack(side=tk.LEFT, padx=(12, 0))
+        self._channel_var = tk.StringVar(value="CH-00")
+        self._channel_combo = ttk.Combobox(
+            file_row, textvariable=self._channel_var,
+            values=["CH-00"], state="disabled", width=8,
+        )
+        self._channel_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self._channel_combo.bind("<<ComboboxSelected>>", self._on_channel_changed)
+
+        # Row 3: parsed-pattern status
+        info_row = ttk.Frame(parent)
+        info_row.pack(fill=tk.X, pady=(4, 0))
+        self._info_var = tk.StringVar(value="No pattern loaded.")
+        ttk.Label(
+            info_row, textvariable=self._info_var, foreground="#666666"
+        ).pack(side=tk.LEFT)
+
+        # Row 4: pin + iterations + play / stop / clear
+        play_row = ttk.Frame(parent)
+        play_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(play_row, text="Pin:").pack(side=tk.LEFT)
+        self._pin_var = tk.StringVar(value="")
+        self._pin_combo = ttk.Combobox(
+            play_row, textvariable=self._pin_var,
+            values=TDBG_PIN_LABELS, state="disabled", width=14,
+        )
+        self._pin_combo.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(play_row, text="Iterations:").pack(side=tk.LEFT)
+        self._iter_var = tk.StringVar(value="1")
+        self._iter_spin = ttk.Spinbox(
+            play_row, from_=0, to=100000, increment=1,
+            textvariable=self._iter_var, width=7,
+        )
+        self._iter_spin.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(
+            play_row, text="(0 = infinite)", foreground="#666666"
+        ).pack(side=tk.LEFT)
+        self._play_btn = ttk.Button(
+            play_row, text="Play", command=self._on_play, state=tk.DISABLED,
+        )
+        self._play_btn.pack(side=tk.LEFT, padx=(12, 0))
+        self._stop_btn = ttk.Button(
+            play_row, text="Stop", command=self._on_stop, state=tk.DISABLED,
+        )
+        self._stop_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._clear_log_btn = ttk.Button(
+            play_row, text="Clear Log", command=self._clear_log
+        )
+        self._clear_log_btn.pack(side=tk.LEFT, padx=(12, 0))
+
+    # ---- queue / worker ---------------------------------------------------
+
+    def _enqueue(self, cmd) -> None:
+        self._cmd_queue.put(cmd)
+
+    def _cmd_loop(self) -> None:
+        while True:
+            cmd = self._cmd_queue.get()
+            if cmd is None:
+                break
+            self._busy = True
+            try:
+                cmd()
+            except Exception as e:
+                self._log_callback_threadsafe(f"TDBG cmd error: {e}", "err")
+            finally:
+                self._busy = False
+
+    # ---- connection -------------------------------------------------------
+
+    def is_connected(self) -> bool:
+        return self._session is not None
+
+    def _set_conn_status(self, text: str, color: str) -> None:
+        self._conn_status_var.set(text)
+        self._conn_status_label.config(foreground=color)
+
+    def _on_connect(self) -> None:
+        if self._session is not None:
+            return
+        if self.app.any_other_tab_holding_port(self):
+            messagebox.showinfo(
+                "Busy",
+                "Another tab is holding the serial port. Disconnect it first.",
+            )
+            return
+        if self.app.any_tab_busy():
+            messagebox.showinfo(
+                "Busy",
+                "Another tab has an operation in progress. Please wait.",
+            )
+            return
+        port = self.app.get_port()
+        self._set_conn_status("Connecting...", "#a06400")
+        self._connect_btn.config(state=tk.DISABLED)
+        self.app.lock_port_entry()
+        self.app.set_status("TDBG connecting...", "#a06400")
+
+        def cmd():
+            from binFileTransfer_core import TdbgSession
+            session = TdbgSession(self._log_callback_threadsafe, port=port)
+            success = session.open()
+            self.app.root.after(
+                0,
+                lambda: self._on_connect_done(session if success else None),
+            )
+
+        self._enqueue(cmd)
+
+    def _on_connect_done(self, session) -> None:
+        if session is None:
+            self._set_conn_status("Disconnected", "#b00020")
+            self._connect_btn.config(state=tk.NORMAL)
+            self.app.unlock_port_entry()
+            self.app.set_status("TDBG connect failed", "#b00020")
+            return
+        self._session = session
+        self._set_conn_status("Connected", "#1f7a1f")
+        self._disconnect_btn.config(state=tk.NORMAL)
+        self._pin_combo.config(state="readonly")
+        self._refresh_play_button_state()
+        self.app.set_status("TDBG Connected", "#1f7a1f")
+
+    def _on_disconnect(self) -> None:
+        if self._session is None:
+            return
+        self._begin_disconnect()
+        self._enqueue(self._do_close_session)
+
+    def _begin_disconnect(self) -> None:
+        # If a play is in flight, request stop first; the worker will then
+        # close the session once the play has wound down.
+        self._stop_event.set()
+        self._disconnect_btn.config(state=tk.DISABLED)
+        self._play_btn.config(state=tk.DISABLED)
+        self._stop_btn.config(state=tk.DISABLED)
+        self._pin_combo.config(state="disabled")
+        self._set_conn_status("Disconnecting...", "#a06400")
+
+    def _do_close_session(self) -> None:
+        if self._session is not None:
+            self._session.close()
+        self.app.root.after(0, self._on_disconnect_done)
+
+    def _on_disconnect_done(self) -> None:
+        self._session = None
+        self._stop_event.clear()
+        self._set_conn_status("Disconnected", "#b00020")
+        self._connect_btn.config(state=tk.NORMAL)
+        self._refresh_play_button_state()
+        self.app.unlock_port_entry()
+        self.app.set_status("TDBG Disconnected", "#666666")
+
+    def disconnect_for_other(self, on_done) -> None:
+        """Close the TDBG session (if open) then call on_done() on Tk thread.
+        Used by FlashTab and GpioTab when they need to take the port."""
+        if self._session is None:
+            on_done()
+            return
+        self._begin_disconnect()
+
+        def cmd():
+            self._do_close_session()
+            self.app.root.after(0, on_done)
+
+        self._enqueue(cmd)
+
+    # ---- pattern loading --------------------------------------------------
+
+    def _on_browse(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Acute waveform export",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            self._append_log(f"failed to read {path}: {e}", "err")
+            return
+        self._pattern_path = path
+        self._pattern_text = text
+        self._pattern_var.set(_shorten(path))
+        self._channel_index = 0
+        self._reparse_and_refresh()
+
+    def _on_channel_changed(self, _event=None) -> None:
+        try:
+            self._channel_index = int(self._channel_var.get().split("-")[1])
+        except (IndexError, ValueError):
+            self._channel_index = 0
+        self._reparse_and_refresh()
+
+    def _reparse_and_refresh(self) -> None:
+        from binFileTransfer_core import parse_acute_txt, DUE_CPU_HZ
+
+        # Detect channel count from the header so we can populate the combo.
+        try:
+            header = self._pattern_text.splitlines()[0]
+            ch_cols = [c.strip() for c in header.split(",") if c.strip().upper().startswith("CH")]
+            self._channel_count = len(ch_cols)
+        except Exception:
+            self._channel_count = 0
+
+        if self._channel_count > 1:
+            labels = [f"CH-{i:02d}" for i in range(self._channel_count)]
+            self._channel_combo.config(values=labels, state="readonly")
+            if self._channel_index >= self._channel_count:
+                self._channel_index = 0
+            self._channel_var.set(labels[self._channel_index])
+        else:
+            self._channel_combo.config(state="disabled")
+            self._channel_var.set("CH-00")
+            self._channel_index = 0
+
+        try:
+            initial, events = parse_acute_txt(
+                self._pattern_text, channel=self._channel_index
+            )
+        except ValueError as e:
+            self._initial_state = None
+            self._events = []
+            self._info_var.set(f"Parse error: {e}")
+            self._append_log(f"parse error: {e}", "err")
+            self._refresh_play_button_state()
+            return
+
+        self._initial_state = initial
+        self._events = events
+        total_cycles = sum(d for d, _ in events)
+        duration_s = total_cycles / DUE_CPU_HZ
+        self._info_var.set(
+            f"{len(events)} events, {duration_s * 1000:.3f} ms, "
+            f"initial={'HIGH' if initial else 'LOW'}, ch={self._channel_index}"
+        )
+        self._append_log(
+            f"parsed: {len(events)} events, {duration_s * 1000:.3f} ms, "
+            f"initial={'HIGH' if initial else 'LOW'}", "ok",
+        )
+        self._refresh_play_button_state()
+
+    def _refresh_play_button_state(self) -> None:
+        # Allow Play to enable as soon as a session is open and a pattern
+        # has been parsed; the pin selection is validated when Play is
+        # clicked (so the user gets a clear "select a pin" prompt).
+        ready = (
+            self._session is not None
+            and bool(self._events)
+            and self._initial_state is not None
+        )
+        self._play_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+
+    # ---- play / stop ------------------------------------------------------
+
+    def _selected_pin(self) -> int | None:
+        label = self._pin_var.get()
+        if not label:
+            return None
+        # Labels look like "D13 (LED)" or "D14"
+        try:
+            return int(label.split(" ", 1)[0].lstrip("D"))
+        except ValueError:
+            return None
+
+    def _on_play(self) -> None:
+        if self._session is None or not self._events or self._initial_state is None:
+            return
+        pin = self._selected_pin()
+        if pin is None:
+            messagebox.showinfo("Pin", "Select an output pin first.")
+            return
+        try:
+            iterations = int(self._iter_var.get())
+        except ValueError:
+            messagebox.showinfo(
+                "Iterations", "Iterations must be an integer (0 = infinite)."
+            )
+            return
+        if iterations < 0:
+            messagebox.showinfo(
+                "Iterations", "Iterations must be >= 0 (0 = infinite)."
+            )
+            return
+
+        # Snapshot to closure so subsequent UI edits don't race the worker.
+        events = list(self._events)
+        initial = self._initial_state
+        from binFileTransfer_core import DUE_CPU_HZ
+        total_cycles = sum(d for d, _ in events)
+        duration_s = total_cycles / DUE_CPU_HZ
+
+        self._stop_event.clear()
+        self._playing = True
+        self._play_btn.config(state=tk.DISABLED)
+        self._stop_btn.config(state=tk.NORMAL)
+        self._browse_btn.config(state=tk.DISABLED)
+        self._pin_combo.config(state="disabled")
+        self._channel_combo.config(state="disabled")
+        self._disconnect_btn.config(state=tk.DISABLED)
+
+        def cmd():
+            sess = self._session
+            if sess is None:
+                return
+            ok = sess.load(pin=pin, initial_state=initial, events=events)
+            if not ok:
+                self.app.root.after(0, lambda: self._on_play_done(False))
+                return
+            ok = sess.play(
+                iterations=iterations,
+                total_duration_s=duration_s,
+                stop_event=self._stop_event,
+            )
+            self.app.root.after(0, lambda: self._on_play_done(ok))
+
+        self._enqueue(cmd)
+        self.app.set_status("TDBG playing...", "#a06400")
+
+    def _on_play_done(self, success: bool) -> None:
+        self._playing = False
+        self._stop_event.clear()
+        self._stop_btn.config(state=tk.DISABLED)
+        # Restore controls only if we're still connected (Disconnect during
+        # play already tore them down).
+        if self._session is not None:
+            self._browse_btn.config(state=tk.NORMAL)
+            self._pin_combo.config(state="readonly")
+            if self._channel_count > 1:
+                self._channel_combo.config(state="readonly")
+            self._disconnect_btn.config(state=tk.NORMAL)
+            self._refresh_play_button_state()
+        self.app.set_status(
+            "TDBG done" if success else "TDBG error",
+            "#1f7a1f" if success else "#b00020",
+        )
+
+    def _on_stop(self) -> None:
+        if not self._playing:
+            return
+        self._stop_event.set()
+        self._stop_btn.config(state=tk.DISABLED)
+        self.app.set_status("TDBG stopping...", "#a06400")
+
+
+# ---------------------------------------------------------------------------
 # App: top-level container with shared port entry, notebook, status bar.
 # ---------------------------------------------------------------------------
 class App:
@@ -781,10 +1212,12 @@ class App:
 
         self.flash_tab = FlashTab(self.notebook, self)
         self.gpio_tab = GpioTab(self.notebook, self)
+        self.tdbg_tab = TdbgTab(self.notebook, self)
         self.notebook.add(self.flash_tab.frame, text="燒錄 ROM")
         self.notebook.add(self.gpio_tab.frame, text="GPIO 設定")
+        self.notebook.add(self.tdbg_tab.frame, text="TDBG")
         self.notebook.select(self.flash_tab.frame)  # default tab
-        self.tabs.extend([self.flash_tab, self.gpio_tab])
+        self.tabs.extend([self.flash_tab, self.gpio_tab, self.tdbg_tab])
         # Defer GPIO pin panel construction until that tab is first shown.
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -878,6 +1311,8 @@ class App:
             return
         if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
             return
+        if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
+            return
         try:
             self.port_refresh_btn.config(state=tk.NORMAL)
         except tk.TclError:
@@ -888,12 +1323,14 @@ class App:
         self.port_refresh_btn.config(state=tk.DISABLED)
 
     def unlock_port_entry(self) -> None:
-        # Stay locked if another tab is busy OR if the GPIO tab is still
-        # holding the serial connection open (would conflict with any other
-        # use until disconnected).
+        # Stay locked if another tab is busy OR if any persistent-session
+        # tab (GPIO / TDBG) is still holding the serial connection open
+        # (would conflict with any other use until disconnected).
         if self.any_tab_busy():
             return
         if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
+            return
+        if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
             return
         self.port_combo.config(state="readonly")
         self.port_refresh_btn.config(state=tk.NORMAL)
@@ -904,6 +1341,34 @@ class App:
 
     def any_tab_busy(self) -> bool:
         return any(t.is_busy() for t in self.tabs)
+
+    def any_other_tab_holding_port(self, requesting_tab: "_LoggedTab") -> bool:
+        """True if another tab currently has the serial port open. Used by
+        GpioTab / TdbgTab connect to refuse if a sibling already holds it."""
+        if requesting_tab is not self.gpio_tab and self.gpio_tab.is_connected():
+            return True
+        if requesting_tab is not self.tdbg_tab and self.tdbg_tab.is_connected():
+            return True
+        return False
+
+    def release_port_then(self, except_tab, on_done) -> None:
+        """Sequentially close any persistent-session tab (GPIO, TDBG) that
+        currently holds the port, then invoke on_done() on the Tk thread.
+        FlashTab uses this before starting a flash flow."""
+        # Build a chain of releases that ends with on_done().
+        steps = []
+        if except_tab is not self.gpio_tab and self.gpio_tab.is_connected():
+            steps.append(self.gpio_tab.disconnect_for_other)
+        if except_tab is not self.tdbg_tab and self.tdbg_tab.is_connected():
+            steps.append(self.tdbg_tab.disconnect_for_other)
+
+        def chain(idx: int):
+            if idx >= len(steps):
+                on_done()
+                return
+            steps[idx](on_done=lambda: chain(idx + 1))
+
+        chain(0)
 
     def _on_tab_changed(self, _event=None) -> None:
         try:
@@ -921,12 +1386,17 @@ class App:
                 "before closing.",
             )
             return
-        # If GPIO tab still holds the serial port open, close it cleanly so
-        # the OS releases the COM port. The session.close() is fast (no Due
-        # round-trip), safe to do synchronously here.
+        # If GPIO / TDBG tabs still hold the serial port open, close them
+        # cleanly so the OS releases the COM port. session.close() is fast
+        # (no Due round-trip), safe to do synchronously here.
         if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
             try:
                 self.gpio_tab._do_close_session()
+            except Exception:
+                pass
+        if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
+            try:
+                self.tdbg_tab._do_close_session()
             except Exception:
                 pass
         self.root.destroy()

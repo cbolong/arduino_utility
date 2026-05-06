@@ -10,10 +10,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A utility that programs SST39xF010-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet is in `spec/`.
 
-- `binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol for wiring verification before the user commits to a flash session.
-- `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, and `GpioSession` live here. The two front-ends are thin shells.
-- `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`).
-- `binFileTransferGui.py` — Tkinter GUI front-end. Two tabs: `燒錄 ROM` (flash) and `GPIO 設定` (manual pin poker, persistent connection).
+- `binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol for wiring verification, and a TDBG waveform-replay protocol that loads a captured pattern into RAM and plays it on a chosen pin via DWT cycle-counter timing.
+- `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, `GpioSession`, `TdbgSession`, and `parse_acute_txt` live here. The two front-ends are thin shells.
+- `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`). No TDBG sub-command yet; `TdbgSession` is library-only.
+- `binFileTransferGui.py` — Tkinter GUI front-end. Three tabs: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker, persistent connection), and `TDBG` (waveform replay).
 
 `README.md` is the authoritative end-user doc (Chinese). When a question is about *user-facing behaviour* — wiring tables, CLI flags, troubleshooting — read it. When it's about *internal coupling* between the sketch and host, this file is faster.
 
@@ -37,7 +37,7 @@ There is no test suite. Verification is hardware-in-the-loop: flash a known `fir
 
 ## Architecture: protocol coupling
 
-`binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **two** string-based serial protocols at 115200 8N1. Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
+`binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **three** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
 
 ### Flash flow (8 strings, primary path)
 
@@ -59,7 +59,23 @@ After `ARDUINO_ERASE_READY` and *before* `ARDUINO_ERASE_TRIGGER`, the sketch loo
 
 Once `ARDUINO_ERASE_TRIGGER` fires, GPIO mode is gone until the Due is reset. Poking flash pins (CE/OE/WE/Ax/DQx) via GPIO leaves the bus in an undefined state — the user has to reset before flashing.
 
-The GUI keeps a persistent `GpioSession` open behind the GPIO tab; the CLI doesn't expose GPIO. When the user clicks Start Programming with a GPIO session open, the flash tab calls `gpio_tab.disconnect_for_flash()` to release the port.
+The GUI keeps a persistent `GpioSession` open behind the GPIO tab; the CLI doesn't expose GPIO. When the user clicks Start Programming with a GPIO or TDBG session open, FlashTab calls `App.release_port_then(except_tab=self, on_done=...)` which sequentially calls `gpio_tab.disconnect_for_other()` and `tdbg_tab.disconnect_for_other()` before starting the flash flow.
+
+### TDBG flow (used by `TDBG` tab and `core.TdbgSession`)
+
+Same gating as GPIO — only available between `ARDUINO_ERASE_READY` and `ARDUINO_ERASE_TRIGGER`. Wire format:
+
+- `TDBG_LOAD <pin> <num_events> <initial_state>` → `TDBG_READY` → host writes `num_events × 5` raw bytes (`<I` delta_cycles + `B` state per event) → MCU replies `TDBG_LOADED <crc16_hex>` (CRC-16/CCITT-FALSE) or `TDBG_ERROR <reason>`
+- `TDBG_PLAY` or `TDBG_PLAY_LOOP <n>` (n=0 = infinite) → `TDBG_PLAY_STARTED` → playback → `TDBG_PLAY_DONE`
+- `TDBG_STOP` (during playback) → drained inside long-gap windows only → `TDBG_STOPPED` followed by `TDBG_PLAY_DONE`
+
+Playback engine sits in `tdbgPlayOnce()`. Three implementation details that look like they could be simplified but can't:
+
+1. **`noInterrupts()` is per-event, not whole-playback.** Spin-and-write is masked, but between events Serial RX / SysTick / USB CDC keep running so STOP can be received in long-gap windows.
+2. **Direct PIO `SODR/CODR`, not `digitalWrite()`.** Single-cycle store, deterministic to within ±1 CPU cycle (~12 ns). `digitalWrite()` adds ~100 ns variable latency.
+3. **`deadline += delta` accumulates**, never `deadline = now + delta`. This absorbs ISR jitter without long-term drift; the `int32_t (deadline - DWT->CYCCNT) > 0` comparison handles 32-bit CYCCNT wrap-around (~51 s at 84 MHz).
+
+Buffer is `TDBG_MAX_EVENTS × 5 = 20480 bytes` of static RAM. `Serial.setTimeout(5000)` is bumped during the load read because 20 KB at 115200 baud takes ~1.7 s — exceeds the default 1 s and would otherwise short-read.
 
 ### Constants that must stay in sync
 
@@ -70,6 +86,10 @@ The GUI keeps a persistent `GpioSession` open behind the GPIO tab; the CLI doesn
 | Total size | `EXPECTED_CHUNKS` × `CHUNK_SIZE` | `FILE_SIZE_SUPPORT` |
 | Handshake strings | `strEraseReady` … `strError` (9 of them, incl. `strVerifyRequest` / `strTransferDone`) | `MCU_ERASE_READY` … `MCU_ERROR` |
 | GPIO strings | inline string literals in `handleGpioSet/Read` | inline literals in `GpioSession` |
+| TDBG strings | inline literals in `handleTdbgLoad/Play` | `MCU_TDBG_*` constants in `TdbgSession` |
+| TDBG buffer cap | `TDBG_MAX_EVENTS` (4096) | `TDBG_MAX_EVENTS` |
+| TDBG event format | `tdbgBuf` packs `uint32_le delta + uint8 state` | `tdbg_pack_events()` uses `struct.pack('<IB', ...)` |
+| CRC poly for TDBG | `tdbgCrc16` (CCITT-FALSE) | `tdbg_crc16` (asserted on import) |
 
 If you change a string, grep both files. The CLI sets `FILE_NAME = "firmware.bin"` as the only host-side default the core itself doesn't know.
 
@@ -90,6 +110,9 @@ If wiring changes, only the two arrays move. The bit-banging code indexes throug
 - **Host always pads to 128 KB.** The sketch programs the full chip; original file size is unrecoverable. SST39xF020/040 needs both sides updated (more address pins, larger size, ID table).
 - **`verifyReadData()` is dead code.** It's defined but never called — superseded by the CRC32 sweep. Leave it alone unless asked to delete.
 - **GUI GPIO tab does not auto-Read on connect.** The Read column starts as `??` until the user clicks `Read All`. An in-flight Read All is interruptible: `_begin_disconnect` sets `_abort_event` and flushes `_cmd_queue`, so Disconnect bails after at most one pending pin's serial timeout instead of 66.
+- **TDBG `noInterrupts()` masks per event, not the whole playback.** Looks aggressive but is necessary so STOP is reachable mid-loop. See "TDBG flow" above for the three reasons the inner loop is shaped this way.
+- **TDBG_LOAD takes `initial_state` as a separate arg, not implicit from event 0.** The captured trace's first row is the pre-trigger sample (often equal to event 0's state, but not always — if the trace starts mid-level, the first event has the same state as initial, intentionally producing a no-op transition that establishes timing anchor without an edge).
+- **Pin selection in the TDBG tab has no default.** User must pick each session — flash-bus pins are annotated `(WE#)` / `(A0)` / `(DQ3)` etc. but not blocked. Driving a flash-bus pin via TDBG corrupts the bus, same caveat as GPIO mode.
 
 ## CI / release
 
