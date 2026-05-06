@@ -1127,12 +1127,65 @@ def _ensure_builtin_parsed() -> tuple[int, list[tuple[int, int]]]:
     return _BUILTIN_INITIAL_STATE, _BUILTIN_EVENTS
 
 
+# Threshold for splitting events into "clusters" for the preview window.
+# Anything bigger than this is treated as an inter-burst idle gap (the
+# user's pattern has ~670 ms gaps between three 52 µs bursts). 10 ms in
+# CPU cycles at 84 MHz.
+_TDBG_CLUSTER_GAP_CYCLES = 840_000
+
+
+def _split_into_clusters(
+    initial_state: int,
+    events: list[tuple[int, int]],
+    gap_threshold: int = _TDBG_CLUSTER_GAP_CYCLES,
+) -> list[tuple[int, int, list[tuple[int, int]]]]:
+    """Split a flat event list at any delta exceeding `gap_threshold`.
+
+    Returns: [(cluster_start_cycles, cluster_initial_state, cluster_events), ...]
+    where cluster_events have the first event's delta reset to 0 (so each
+    cluster's playback timeline starts at t=0 of that cluster). Joining the
+    clusters back via their start-cycles offsets recovers the original timing.
+    """
+    clusters: list[tuple[int, int, list[tuple[int, int]]]] = []
+    current_initial = initial_state
+    current: list[tuple[int, int]] = []
+    overall = 0
+    cluster_start = 0
+
+    for delta, state in events:
+        if current and delta > gap_threshold:
+            clusters.append((cluster_start, current_initial, current))
+            current_initial = current[-1][1]
+            cluster_start = overall + delta
+            current = [(0, state)]
+        else:
+            current.append((delta, state))
+        overall += delta
+
+    if current:
+        clusters.append((cluster_start, current_initial, current))
+    return clusters
+
+
+def _format_duration_ns(ns: float) -> str:
+    """Pretty-print a duration in ns for waveform labels."""
+    if ns < 1000:
+        return f"{int(round(ns))} ns"
+    if ns < 1_000_000:
+        return f"{ns / 1000:.2f} µs"   # µs
+    if ns < 1_000_000_000:
+        return f"{ns / 1_000_000:.3f} ms"
+    return f"{ns / 1_000_000_000:.3f} s"
+
+
 class TdbgTab(_LoggedTab):
     def __init__(self, parent: ttk.Notebook, app: "App") -> None:
         # Persistent worker thread — same pattern as GpioTab.
         self._session = None
         self._cmd_queue: queue.Queue = queue.Queue()
         self._busy = False
+        # Modal waveform-preview window; only one at a time.
+        self._preview_window: tk.Toplevel | None = None
         super().__init__(parent, app)
         self._worker_thread = threading.Thread(target=self._cmd_loop, daemon=True)
         self._worker_thread.start()
@@ -1165,24 +1218,38 @@ class TdbgTab(_LoggedTab):
         )
         self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        # Row 2: Pin + Send + Clear Log
-        send_row = ttk.Frame(parent)
-        send_row.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(send_row, text="Pin:").pack(side=tk.LEFT)
+        # Row 2: Pin + Clear Log
+        pin_row = ttk.Frame(parent)
+        pin_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(pin_row, text="Pin:").pack(side=tk.LEFT)
         self._pin_var = tk.StringVar(value="")
         self._pin_combo = ttk.Combobox(
-            send_row, textvariable=self._pin_var,
+            pin_row, textvariable=self._pin_var,
             values=TDBG_PIN_LABELS, state="disabled", width=14,
         )
         self._pin_combo.pack(side=tk.LEFT, padx=(6, 12))
+        self._clear_log_btn = ttk.Button(
+            pin_row, text="Clear Log", command=self._clear_log
+        )
+        self._clear_log_btn.pack(side=tk.LEFT)
+
+        # Row 3: pattern entry — name, mini waveform thumbnail, Send button.
+        # Clicking the thumbnail opens a modal preview window.
+        pattern_row = ttk.Frame(parent)
+        pattern_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(pattern_row, text="TDBG 密碼1").pack(side=tk.LEFT)
+        self._preview_canvas = tk.Canvas(
+            pattern_row, width=80, height=22,
+            background="#1a1a1a", relief="raised", borderwidth=1,
+            highlightthickness=0, cursor="hand2",
+        )
+        self._preview_canvas.pack(side=tk.LEFT, padx=(8, 8))
+        self._preview_canvas.bind("<Button-1>", self._open_preview)
+        self._draw_thumbnail()
         self._send_btn = ttk.Button(
-            send_row, text="Send", command=self._on_send, state=tk.DISABLED,
+            pattern_row, text="Send", command=self._on_send, state=tk.DISABLED,
         )
         self._send_btn.pack(side=tk.LEFT)
-        self._clear_log_btn = ttk.Button(
-            send_row, text="Clear Log", command=self._clear_log
-        )
-        self._clear_log_btn.pack(side=tk.LEFT, padx=(12, 0))
 
     # ---- queue / worker ---------------------------------------------------
 
@@ -1347,6 +1414,245 @@ class TdbgTab(_LoggedTab):
             "TDBG done" if success else "TDBG error",
             "#1f7a1f" if success else "#b00020",
         )
+
+    # ---- mini thumbnail + preview popup -----------------------------------
+
+    def _draw_thumbnail(self) -> None:
+        """Render the first ~12 transitions on the row-3 mini canvas. The
+        canvas is the click target that opens the full preview popup."""
+        canvas = self._preview_canvas
+        canvas.delete("all")
+        try:
+            init, events = _ensure_builtin_parsed()
+        except ValueError:
+            canvas.create_text(
+                40, 11, text="(parse err)", fill="#b00020",
+                font=("Consolas", 7),
+            )
+            return
+
+        # Compress the first cluster into the 80x22 box. We don't bother
+        # being faithful to absolute timing here — equal spacing gives a
+        # cleaner "this is a digital waveform" cue than a true-to-scale
+        # render that would compress the labels into one orange smear.
+        n_show = min(14, len(events))
+        if n_show < 2:
+            return
+        sub = events[:n_show]
+
+        margin_x = 3
+        margin_y = 2
+        w = int(canvas.cget("width"))
+        h = int(canvas.cget("height"))
+        usable_w = w - 2 * margin_x
+        y_high = margin_y + 2
+        y_low = h - margin_y - 2
+
+        step = usable_w / n_show
+        x = margin_x
+        state = init
+        prev_y = y_high if state else y_low
+
+        for i, (_, new_state) in enumerate(sub):
+            new_x = margin_x + (i + 1) * step
+            new_y = y_high if new_state else y_low
+            # horizontal segment at prev_y up to the edge
+            canvas.create_line(x, prev_y, new_x, prev_y, fill="#ff9933", width=1)
+            # vertical edge
+            canvas.create_line(new_x, prev_y, new_x, new_y, fill="#ff9933", width=1)
+            x = new_x
+            prev_y = new_y
+
+    def _open_preview(self, _event=None) -> None:
+        if self._preview_window is not None and self._preview_window.winfo_exists():
+            self._preview_window.lift()
+            return
+        try:
+            init, events = _ensure_builtin_parsed()
+        except ValueError as e:
+            messagebox.showerror("Pattern", f"Parse error: {e}")
+            return
+
+        from binFileTransfer_core import DUE_CPU_HZ
+        clusters = _split_into_clusters(init, events)
+        total_cycles = sum(d for d, _ in events)
+        duration_ns = total_cycles / DUE_CPU_HZ * 1e9
+
+        win = tk.Toplevel(self.app.root)
+        win.title("TDBG 密碼1 — Waveform Preview")
+        win.geometry("1100x420")
+        win.transient(self.app.root)
+        # Modal: while the preview is open, the main window is grabbed so
+        # the user can't accidentally close it or fire conflicting actions.
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_preview())
+        self._preview_window = win
+
+        summary = (
+            f"{len(events)} transitions · "
+            f"total active duration {_format_duration_ns(duration_ns)} · "
+            f"initial = {'HIGH' if init else 'LOW'} · "
+            f"split into {len(clusters)} cluster(s) at gaps ≥ 10 ms"
+        )
+        ttk.Label(win, text=summary, padding=(10, 8)).pack(fill=tk.X)
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+
+        for idx, (start_cycles, c_init, c_events) in enumerate(clusters):
+            frame = ttk.Frame(nb)
+            c_total_ns = sum(d for d, _ in c_events) / DUE_CPU_HZ * 1e9
+            tab_label = (
+                f"Cluster {idx + 1} "
+                f"({len(c_events)} edges, {_format_duration_ns(c_total_ns)})"
+            )
+            nb.add(frame, text=tab_label)
+            start_ns = start_cycles / DUE_CPU_HZ * 1e9
+            self._build_cluster_canvas(frame, c_init, c_events, start_ns)
+
+        ttk.Button(
+            win, text="Close", command=self._close_preview
+        ).pack(pady=(0, 8))
+
+    def _close_preview(self) -> None:
+        win = self._preview_window
+        self._preview_window = None
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    def _build_cluster_canvas(
+        self,
+        parent: ttk.Frame,
+        initial_state: int,
+        events: list[tuple[int, int]],
+        start_ns: float,
+    ) -> None:
+        """Draw one cluster on a horizontally-scrollable Canvas."""
+        from binFileTransfer_core import DUE_CPU_HZ
+
+        # Header showing where in the original capture this cluster sits.
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X, padx=4, pady=(4, 0))
+        ttk.Label(
+            header,
+            text=f"Cluster starts at t = {_format_duration_ns(start_ns)} of playback",
+            foreground="#666666",
+        ).pack(side=tk.LEFT)
+
+        # Geometry — pick a per-ns scale that makes the shortest pulse
+        # roughly readable (~40 px wide for the user's 380 ns minimum).
+        PIX_PER_NS = 0.10
+        HEIGHT = 240
+        Y_HIGH = 80
+        Y_LOW = 170
+        LEFT_PAD = 40
+        RIGHT_PAD = 40
+        LABEL_Y_TOP = Y_HIGH - 22       # pulse-width labels above
+        AXIS_Y = Y_LOW + 38             # absolute timestamps below
+
+        cum_cycles = [0]
+        for delta, _ in events:
+            cum_cycles.append(cum_cycles[-1] + delta)
+        total_ns = cum_cycles[-1] / DUE_CPU_HZ * 1e9
+        canvas_w = max(800, int(LEFT_PAD + total_ns * PIX_PER_NS + RIGHT_PAD))
+
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        canvas = tk.Canvas(
+            wrap, height=HEIGHT, background="#1a1a1a",
+            scrollregion=(0, 0, canvas_w, HEIGHT),
+            highlightthickness=0,
+        )
+        hsb = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(xscrollcommand=hsb.set)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Mouse-wheel = horizontal scroll while pointer is over canvas.
+        def _on_wheel(event):
+            canvas.xview_scroll(int(-event.delta / 120), "units")
+
+        def _bind(_e=None):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", lambda e: canvas.xview_scroll(-1, "units"))
+            canvas.bind_all("<Button-5>", lambda e: canvas.xview_scroll(1, "units"))
+
+        def _unbind(_e=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind)
+        canvas.bind("<Leave>", _unbind)
+
+        # Y-axis labels.
+        canvas.create_text(
+            LEFT_PAD - 6, Y_HIGH, text="HIGH",
+            fill="#aaaaaa", anchor="e", font=("Consolas", 9),
+        )
+        canvas.create_text(
+            LEFT_PAD - 6, Y_LOW, text="LOW",
+            fill="#aaaaaa", anchor="e", font=("Consolas", 9),
+        )
+
+        # Walk the events drawing one segment + vertical edge each.
+        state = initial_state
+        prev_x = LEFT_PAD
+        prev_y = Y_HIGH if state else Y_LOW
+
+        for i, (delta, new_state) in enumerate(events):
+            seg_ns = delta / DUE_CPU_HZ * 1e9
+            x = LEFT_PAD + (cum_cycles[i + 1] / DUE_CPU_HZ * 1e9) * PIX_PER_NS
+            # Horizontal segment from prev_x to x at prev_y.
+            if x > prev_x:
+                canvas.create_line(
+                    prev_x, prev_y, x, prev_y, fill="#ff9933", width=2,
+                )
+            # Pulse-width label centred above the segment (skip the i=0
+            # zero-width "anchor" segment).
+            if seg_ns > 0 and x - prev_x >= 12:
+                canvas.create_text(
+                    (prev_x + x) / 2, LABEL_Y_TOP,
+                    text=_format_duration_ns(seg_ns),
+                    fill="#ffe680", font=("Consolas", 8),
+                )
+            # Vertical edge.
+            new_y = Y_HIGH if new_state else Y_LOW
+            canvas.create_line(
+                x, prev_y, x, new_y, fill="#ff9933", width=2,
+            )
+            prev_x, prev_y = x, new_y
+            state = new_state
+
+        # Tail run — extend the final state out to the right edge.
+        tail_x = canvas_w - RIGHT_PAD
+        if prev_x < tail_x:
+            canvas.create_line(
+                prev_x, prev_y, tail_x, prev_y, fill="#ff9933", width=2,
+            )
+
+        # Time axis ticks at the canvas bottom — every 5 µs of cluster time.
+        tick_step_ns = 5000.0
+        tick_count = int(total_ns / tick_step_ns) + 1
+        for k in range(tick_count + 1):
+            tick_ns = k * tick_step_ns
+            tx = LEFT_PAD + tick_ns * PIX_PER_NS
+            canvas.create_line(
+                tx, AXIS_Y, tx, AXIS_Y + 4, fill="#666666",
+            )
+            canvas.create_text(
+                tx, AXIS_Y + 14,
+                text=_format_duration_ns(tick_ns),
+                fill="#888888", font=("Consolas", 8),
+            )
 
 
 # ---------------------------------------------------------------------------
