@@ -740,8 +740,9 @@ class GpioTab(_LoggedTab):
 
 
 # ---------------------------------------------------------------------------
-# TDBG tab — load a captured waveform from an Acute logic-analyzer .txt
-# export and replay it on a chosen Due GPIO with cycle-accurate timing.
+# TDBG tab — replays a single hard-coded waveform on a chosen Due GPIO with
+# cycle-accurate timing. The pattern is embedded in this module (see
+# _TDBG_BUILTIN_TXT below) and parsed lazily on first Send.
 # ---------------------------------------------------------------------------
 
 # Annotate flash-bus pins so the user knows which selections will disturb
@@ -765,22 +766,373 @@ def _tdbg_pin_annotation(pin: int) -> str:
 TDBG_PIN_LABELS = [f"D{n}{_tdbg_pin_annotation(n)}" for n in range(0, 66)]
 
 
+# Built-in waveform — captured by the user from their target system. Playback
+# is 1340 ms total (3 transition clusters separated by ~670 ms gaps), 336
+# transitions, minimum pulse width 381 ns. To replace, paste a new Acute
+# .txt export below; parse runs at first Send so a malformed pattern shows
+# up as a log error rather than blocking GUI startup.
+_TDBG_BUILTIN_TXT = """\
+Timestamp,CH-00
+-40000,1
+583175170000,0
+583175555000,1
+583175970000,0
+583176355000,1
+583176765000,0
+583177155000,1
+583177570000,0
+583177950000,1
+583178365000,0
+583178755000,1
+583179170000,0
+583179555000,1
+583179970000,0
+583180360000,1
+583180775000,0
+583181155000,1
+583181570000,0
+583181955000,1
+583182370000,0
+583182755000,1
+583183170000,0
+583183555000,1
+583183970000,0
+583184360000,1
+583184770000,0
+583185155000,1
+583185570000,0
+583185960000,1
+583186375000,0
+583186760000,1
+583187175000,0
+583187560000,1
+583187975000,0
+583188365000,1
+583188775000,0
+583189160000,1
+583189570000,0
+583189960000,1
+583190375000,0
+583190760000,1
+583191175000,0
+583191555000,1
+583191970000,0
+583192360000,1
+583192775000,0
+583193160000,1
+583193570000,0
+583193955000,1
+583194370000,0
+583194755000,1
+583195170000,0
+583195555000,1
+583195965000,0
+583196355000,1
+583196765000,0
+583197150000,1
+583197565000,0
+583197955000,1
+583198370000,0
+583198755000,1
+583199170000,0
+583199560000,1
+583199975000,0
+583200360000,1
+583200770000,0
+583201545000,1
+583202360000,0
+583202745000,1
+583203555000,0
+583203945000,1
+583204360000,0
+583204750000,1
+583205560000,0
+583205945000,1
+583206360000,0
+583206750000,1
+583207560000,0
+583207950000,1
+583208360000,0
+583208745000,1
+583209960000,0
+583210345000,1
+583211160000,0
+583211545000,1
+583211960000,0
+583212345000,1
+583213555000,0
+583213945000,1
+583214360000,0
+583214745000,1
+583215960000,0
+583216345000,1
+583217155000,0
+583217545000,1
+583217960000,0
+583218345000,1
+583219160000,0
+583219545000,1
+583219960000,0
+583220350000,1
+583221165000,0
+583221550000,1
+583221960000,0
+583222345000,1
+583223160000,0
+583223550000,1
+583225160000,0
+583225545000,1
+583225960000,0
+583226345000,1
+583227155000,0
+583227545000,1
+1253458640000,0
+1253459025000,1
+1253459435000,0
+1253459820000,1
+1253460235000,0
+1253460625000,1
+1253461035000,0
+1253461425000,1
+1253461840000,0
+1253462225000,1
+1253462640000,0
+1253463025000,1
+1253463435000,0
+1253463820000,1
+1253464235000,0
+1253464620000,1
+1253465035000,0
+1253465425000,1
+1253465835000,0
+1253466220000,1
+1253466635000,0
+1253467020000,1
+1253467430000,0
+1253467820000,1
+1253468235000,0
+1253468620000,1
+1253469030000,0
+1253469420000,1
+1253469835000,0
+1253470220000,1
+1253470635000,0
+1253471020000,1
+1253471430000,0
+1253471820000,1
+1253472235000,0
+1253472625000,1
+1253473035000,0
+1253473420000,1
+1253473835000,0
+1253474225000,1
+1253474640000,0
+1253475025000,1
+1253475440000,0
+1253475825000,1
+1253476240000,0
+1253476625000,1
+1253477040000,0
+1253477425000,1
+1253477840000,0
+1253478225000,1
+1253478640000,0
+1253479025000,1
+1253479435000,0
+1253479825000,1
+1253480240000,0
+1253480625000,1
+1253481040000,0
+1253481425000,1
+1253481840000,0
+1253482225000,1
+1253482640000,0
+1253483025000,1
+1253483440000,0
+1253483830000,1
+1253484245000,0
+1253485020000,1
+1253485830000,0
+1253486220000,1
+1253487030000,0
+1253487415000,1
+1253487830000,0
+1253488215000,1
+1253489025000,0
+1253489415000,1
+1253489830000,0
+1253490220000,1
+1253491030000,0
+1253491420000,1
+1253491835000,0
+1253492220000,1
+1253493435000,0
+1253493825000,1
+1253494635000,0
+1253495020000,1
+1253495435000,0
+1253495825000,1
+1253497035000,0
+1253497425000,1
+1253497840000,0
+1253498225000,1
+1253499440000,0
+1253499825000,1
+1253500640000,0
+1253501025000,1
+1253501435000,0
+1253501825000,1
+1253502640000,0
+1253503025000,1
+1253503440000,0
+1253503830000,1
+1253504640000,0
+1253505025000,1
+1253505440000,0
+1253505830000,1
+1253506640000,0
+1253507025000,1
+1253508640000,0
+1253509030000,1
+1253509440000,0
+1253509825000,1
+1253510640000,0
+1253511030000,1
+1923775290000,0
+1923775680000,1
+1923776090000,0
+1923776480000,1
+1923776895000,0
+1923777285000,1
+1923777695000,0
+1923778085000,1
+1923778500000,0
+1923778885000,1
+1923779300000,0
+1923779685000,1
+1923780095000,0
+1923780485000,1
+1923780900000,0
+1923781285000,1
+1923781700000,0
+1923782085000,1
+1923782495000,0
+1923782885000,1
+1923783300000,0
+1923783685000,1
+1923784100000,0
+1923784490000,1
+1923784895000,0
+1923785285000,1
+1923785700000,0
+1923786085000,1
+1923786500000,0
+1923786885000,1
+1923787295000,0
+1923787685000,1
+1923788100000,0
+1923788485000,1
+1923788900000,0
+1923789285000,1
+1923789695000,0
+1923790085000,1
+1923790500000,0
+1923790890000,1
+1923791300000,0
+1923791685000,1
+1923792100000,0
+1923792490000,1
+1923792900000,0
+1923793290000,1
+1923793700000,0
+1923794090000,1
+1923794505000,0
+1923794890000,1
+1923795305000,0
+1923795690000,1
+1923796105000,0
+1923796495000,1
+1923796905000,0
+1923797290000,1
+1923797705000,0
+1923798095000,1
+1923798510000,0
+1923798895000,1
+1923799305000,0
+1923799695000,1
+1923800110000,0
+1923800495000,1
+1923800910000,0
+1923801685000,1
+1923802500000,0
+1923802885000,1
+1923803700000,0
+1923804085000,1
+1923804500000,0
+1923804885000,1
+1923805695000,0
+1923806080000,1
+1923806495000,0
+1923806885000,1
+1923807700000,0
+1923808090000,1
+1923808500000,0
+1923808885000,1
+1923810105000,0
+1923810490000,1
+1923811300000,0
+1923811690000,1
+1923812100000,0
+1923812490000,1
+1923813705000,0
+1923814090000,1
+1923814500000,0
+1923814885000,1
+1923816100000,0
+1923816490000,1
+1923817305000,0
+1923817685000,1
+1923818100000,0
+1923818490000,1
+1923819300000,0
+1923819690000,1
+1923820105000,0
+1923820490000,1
+1923821300000,0
+1923821685000,1
+1923822100000,0
+1923822485000,1
+1923823300000,0
+1923823690000,1
+1923825305000,0
+1923825690000,1
+1923826105000,0
+1923826490000,1
+1923827305000,0
+1923827695000,1
+"""
+
+# Cached parse result. Lazy-populated on first _on_send to keep cold-start
+# unaffected by the pattern parse (and the core.py / pyserial import it
+# pulls in).
+_BUILTIN_INITIAL_STATE: int | None = None
+_BUILTIN_EVENTS: list[tuple[int, int]] | None = None
+
+
+def _ensure_builtin_parsed() -> tuple[int, list[tuple[int, int]]]:
+    global _BUILTIN_INITIAL_STATE, _BUILTIN_EVENTS
+    if _BUILTIN_EVENTS is None:
+        from binFileTransfer_core import parse_acute_txt
+        _BUILTIN_INITIAL_STATE, _BUILTIN_EVENTS = parse_acute_txt(_TDBG_BUILTIN_TXT)
+    return _BUILTIN_INITIAL_STATE, _BUILTIN_EVENTS
+
+
 class TdbgTab(_LoggedTab):
     def __init__(self, parent: ttk.Notebook, app: "App") -> None:
-        # Pattern state — populated by Browse parsing.
-        self._pattern_path: str | None = None
-        self._pattern_text: str = ""
-        self._initial_state: int | None = None
-        self._events: list[tuple[int, int]] = []
-        self._channel_count: int = 0
-        self._channel_index: int = 0
-
         # Persistent worker thread — same pattern as GpioTab.
         self._session = None
         self._cmd_queue: queue.Queue = queue.Queue()
         self._busy = False
-        self._stop_event = threading.Event()
-        self._playing = False  # True between Play click and PLAY_DONE
         super().__init__(parent, app)
         self._worker_thread = threading.Thread(target=self._cmd_loop, daemon=True)
         self._worker_thread.start()
@@ -813,65 +1165,22 @@ class TdbgTab(_LoggedTab):
         )
         self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        # Row 2: pattern file + browse + channel
-        file_row = ttk.Frame(parent)
-        file_row.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(file_row, text="Pattern:").pack(side=tk.LEFT)
-        self._pattern_var = tk.StringVar(value="(no file selected)")
-        ttk.Label(
-            file_row, textvariable=self._pattern_var, width=50, anchor="w"
-        ).pack(side=tk.LEFT, padx=(6, 6))
-        self._browse_btn = ttk.Button(
-            file_row, text="Browse...", command=self._on_browse
-        )
-        self._browse_btn.pack(side=tk.LEFT)
-        ttk.Label(file_row, text="  Channel:").pack(side=tk.LEFT, padx=(12, 0))
-        self._channel_var = tk.StringVar(value="CH-00")
-        self._channel_combo = ttk.Combobox(
-            file_row, textvariable=self._channel_var,
-            values=["CH-00"], state="disabled", width=8,
-        )
-        self._channel_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self._channel_combo.bind("<<ComboboxSelected>>", self._on_channel_changed)
-
-        # Row 3: parsed-pattern status
-        info_row = ttk.Frame(parent)
-        info_row.pack(fill=tk.X, pady=(4, 0))
-        self._info_var = tk.StringVar(value="No pattern loaded.")
-        ttk.Label(
-            info_row, textvariable=self._info_var, foreground="#666666"
-        ).pack(side=tk.LEFT)
-
-        # Row 4: pin + iterations + play / stop / clear
-        play_row = ttk.Frame(parent)
-        play_row.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(play_row, text="Pin:").pack(side=tk.LEFT)
+        # Row 2: Pin + Send + Clear Log
+        send_row = ttk.Frame(parent)
+        send_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(send_row, text="Pin:").pack(side=tk.LEFT)
         self._pin_var = tk.StringVar(value="")
         self._pin_combo = ttk.Combobox(
-            play_row, textvariable=self._pin_var,
+            send_row, textvariable=self._pin_var,
             values=TDBG_PIN_LABELS, state="disabled", width=14,
         )
         self._pin_combo.pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Label(play_row, text="Iterations:").pack(side=tk.LEFT)
-        self._iter_var = tk.StringVar(value="1")
-        self._iter_spin = ttk.Spinbox(
-            play_row, from_=0, to=100000, increment=1,
-            textvariable=self._iter_var, width=7,
+        self._send_btn = ttk.Button(
+            send_row, text="Send", command=self._on_send, state=tk.DISABLED,
         )
-        self._iter_spin.pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Label(
-            play_row, text="(0 = infinite)", foreground="#666666"
-        ).pack(side=tk.LEFT)
-        self._play_btn = ttk.Button(
-            play_row, text="Play", command=self._on_play, state=tk.DISABLED,
-        )
-        self._play_btn.pack(side=tk.LEFT, padx=(12, 0))
-        self._stop_btn = ttk.Button(
-            play_row, text="Stop", command=self._on_stop, state=tk.DISABLED,
-        )
-        self._stop_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._send_btn.pack(side=tk.LEFT)
         self._clear_log_btn = ttk.Button(
-            play_row, text="Clear Log", command=self._clear_log
+            send_row, text="Clear Log", command=self._clear_log
         )
         self._clear_log_btn.pack(side=tk.LEFT, padx=(12, 0))
 
@@ -945,7 +1254,7 @@ class TdbgTab(_LoggedTab):
         self._set_conn_status("Connected", "#1f7a1f")
         self._disconnect_btn.config(state=tk.NORMAL)
         self._pin_combo.config(state="readonly")
-        self._refresh_play_button_state()
+        self._send_btn.config(state=tk.NORMAL)
         self.app.set_status("TDBG Connected", "#1f7a1f")
 
     def _on_disconnect(self) -> None:
@@ -955,12 +1264,8 @@ class TdbgTab(_LoggedTab):
         self._enqueue(self._do_close_session)
 
     def _begin_disconnect(self) -> None:
-        # If a play is in flight, request stop first; the worker will then
-        # close the session once the play has wound down.
-        self._stop_event.set()
         self._disconnect_btn.config(state=tk.DISABLED)
-        self._play_btn.config(state=tk.DISABLED)
-        self._stop_btn.config(state=tk.DISABLED)
+        self._send_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._set_conn_status("Disconnecting...", "#a06400")
 
@@ -971,10 +1276,8 @@ class TdbgTab(_LoggedTab):
 
     def _on_disconnect_done(self) -> None:
         self._session = None
-        self._stop_event.clear()
         self._set_conn_status("Disconnected", "#b00020")
         self._connect_btn.config(state=tk.NORMAL)
-        self._refresh_play_button_state()
         self.app.unlock_port_entry()
         self.app.set_status("TDBG Disconnected", "#666666")
 
@@ -992,94 +1295,7 @@ class TdbgTab(_LoggedTab):
 
         self._enqueue(cmd)
 
-    # ---- pattern loading --------------------------------------------------
-
-    def _on_browse(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select Acute waveform export",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except OSError as e:
-            self._append_log(f"failed to read {path}: {e}", "err")
-            return
-        self._pattern_path = path
-        self._pattern_text = text
-        self._pattern_var.set(_shorten(path))
-        self._channel_index = 0
-        self._reparse_and_refresh()
-
-    def _on_channel_changed(self, _event=None) -> None:
-        try:
-            self._channel_index = int(self._channel_var.get().split("-")[1])
-        except (IndexError, ValueError):
-            self._channel_index = 0
-        self._reparse_and_refresh()
-
-    def _reparse_and_refresh(self) -> None:
-        from binFileTransfer_core import parse_acute_txt, DUE_CPU_HZ
-
-        # Detect channel count from the header so we can populate the combo.
-        try:
-            header = self._pattern_text.splitlines()[0]
-            ch_cols = [c.strip() for c in header.split(",") if c.strip().upper().startswith("CH")]
-            self._channel_count = len(ch_cols)
-        except Exception:
-            self._channel_count = 0
-
-        if self._channel_count > 1:
-            labels = [f"CH-{i:02d}" for i in range(self._channel_count)]
-            self._channel_combo.config(values=labels, state="readonly")
-            if self._channel_index >= self._channel_count:
-                self._channel_index = 0
-            self._channel_var.set(labels[self._channel_index])
-        else:
-            self._channel_combo.config(state="disabled")
-            self._channel_var.set("CH-00")
-            self._channel_index = 0
-
-        try:
-            initial, events = parse_acute_txt(
-                self._pattern_text, channel=self._channel_index
-            )
-        except ValueError as e:
-            self._initial_state = None
-            self._events = []
-            self._info_var.set(f"Parse error: {e}")
-            self._append_log(f"parse error: {e}", "err")
-            self._refresh_play_button_state()
-            return
-
-        self._initial_state = initial
-        self._events = events
-        total_cycles = sum(d for d, _ in events)
-        duration_s = total_cycles / DUE_CPU_HZ
-        self._info_var.set(
-            f"{len(events)} events, {duration_s * 1000:.3f} ms, "
-            f"initial={'HIGH' if initial else 'LOW'}, ch={self._channel_index}"
-        )
-        self._append_log(
-            f"parsed: {len(events)} events, {duration_s * 1000:.3f} ms, "
-            f"initial={'HIGH' if initial else 'LOW'}", "ok",
-        )
-        self._refresh_play_button_state()
-
-    def _refresh_play_button_state(self) -> None:
-        # Allow Play to enable as soon as a session is open and a pattern
-        # has been parsed; the pin selection is validated when Play is
-        # clicked (so the user gets a clear "select a pin" prompt).
-        ready = (
-            self._session is not None
-            and bool(self._events)
-            and self._initial_state is not None
-        )
-        self._play_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
-
-    # ---- play / stop ------------------------------------------------------
+    # ---- send -------------------------------------------------------------
 
     def _selected_pin(self) -> int | None:
         label = self._pin_var.get()
@@ -1091,84 +1307,46 @@ class TdbgTab(_LoggedTab):
         except ValueError:
             return None
 
-    def _on_play(self) -> None:
-        if self._session is None or not self._events or self._initial_state is None:
+    def _on_send(self) -> None:
+        if self._session is None:
             return
         pin = self._selected_pin()
         if pin is None:
             messagebox.showinfo("Pin", "Select an output pin first.")
             return
         try:
-            iterations = int(self._iter_var.get())
-        except ValueError:
-            messagebox.showinfo(
-                "Iterations", "Iterations must be an integer (0 = infinite)."
-            )
+            initial, events = _ensure_builtin_parsed()
+        except ValueError as e:
+            self._append_log(f"builtin pattern parse error: {e}", "err")
             return
-        if iterations < 0:
-            messagebox.showinfo(
-                "Iterations", "Iterations must be >= 0 (0 = infinite)."
-            )
-            return
-
-        # Snapshot to closure so subsequent UI edits don't race the worker.
-        events = list(self._events)
-        initial = self._initial_state
         from binFileTransfer_core import DUE_CPU_HZ
-        total_cycles = sum(d for d, _ in events)
-        duration_s = total_cycles / DUE_CPU_HZ
+        duration_s = sum(d for d, _ in events) / DUE_CPU_HZ
 
-        self._stop_event.clear()
-        self._playing = True
-        self._play_btn.config(state=tk.DISABLED)
-        self._stop_btn.config(state=tk.NORMAL)
-        self._browse_btn.config(state=tk.DISABLED)
+        self._send_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
-        self._channel_combo.config(state="disabled")
         self._disconnect_btn.config(state=tk.DISABLED)
+        self.app.set_status("TDBG playing...", "#a06400")
 
         def cmd():
             sess = self._session
             if sess is None:
                 return
             ok = sess.load(pin=pin, initial_state=initial, events=events)
-            if not ok:
-                self.app.root.after(0, lambda: self._on_play_done(False))
-                return
-            ok = sess.play(
-                iterations=iterations,
-                total_duration_s=duration_s,
-                stop_event=self._stop_event,
-            )
-            self.app.root.after(0, lambda: self._on_play_done(ok))
+            if ok:
+                ok = sess.play(iterations=1, total_duration_s=duration_s)
+            self.app.root.after(0, lambda: self._on_send_done(ok))
 
         self._enqueue(cmd)
-        self.app.set_status("TDBG playing...", "#a06400")
 
-    def _on_play_done(self, success: bool) -> None:
-        self._playing = False
-        self._stop_event.clear()
-        self._stop_btn.config(state=tk.DISABLED)
-        # Restore controls only if we're still connected (Disconnect during
-        # play already tore them down).
+    def _on_send_done(self, success: bool) -> None:
         if self._session is not None:
-            self._browse_btn.config(state=tk.NORMAL)
+            self._send_btn.config(state=tk.NORMAL)
             self._pin_combo.config(state="readonly")
-            if self._channel_count > 1:
-                self._channel_combo.config(state="readonly")
             self._disconnect_btn.config(state=tk.NORMAL)
-            self._refresh_play_button_state()
         self.app.set_status(
             "TDBG done" if success else "TDBG error",
             "#1f7a1f" if success else "#b00020",
         )
-
-    def _on_stop(self) -> None:
-        if not self._playing:
-            return
-        self._stop_event.set()
-        self._stop_btn.config(state=tk.DISABLED)
-        self.app.set_status("TDBG stopping...", "#a06400")
 
 
 # ---------------------------------------------------------------------------

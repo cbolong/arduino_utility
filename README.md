@@ -237,11 +237,11 @@ CLI 端 `gpio_set` / `gpio_read` 仍是 one-shot（每次 open/close），給 sc
 
 容量限制：MCU 端 buffer = `TDBG_MAX_EVENTS × 5 = 20 KB`（`TDBG_MAX_EVENTS` 預設 `4096`）。原始擷取超過 4096 個 transition 時，host 端的 `parse_acute_txt` 會直接拒絕並提示。
 
-GUI 操作：在 **TDBG** tab，按 [Connect] 開啟 serial → [Browse...] 選 Acute 輸出的 `.txt`（時間戳預設皮秒）→ 若檔案有多 channel 則用 **Channel** 下拉選 → 從 **Pin** 下拉選一個 Due GPIO（**沒有預設值**，每次都要選；Flash 匯流排上的腳位會在標籤顯示 `(WE#)` / `(A0)` 等註記讓你警覺）→ **Iterations** 設 1 = 單次、設 0 = 無限 → [Play]。播放期間可按 [Stop] 中止。
+GUI 操作：在 **TDBG** tab，按 [Connect] 開啟 serial → 從 **Pin** 下拉選一個 Due GPIO（**沒有預設值**，每次都要選；Flash 匯流排上的腳位會在標籤顯示 `(WE#)` / `(A0)` 等註記讓你警覺）→ 按 [Send]。波形是寫死在 `binFileTransferGui.py` 的 `_TDBG_BUILTIN_TXT` 常數裡（單一 hard-coded pattern，沒有檔案選擇器、沒有 channel 下拉、沒有迭代次數）；按一次 Send 播一次,結束後可再按。
 
-按 [Disconnect] 或燒錄 / GPIO tab 取走 port 時，TDBG 會先設定 stop event，等當前播放收尾再釋放 serial（最壞延遲 = 一個長間隔）。
+要換波形：把新的 Acute `.txt` 內容貼進 `_TDBG_BUILTIN_TXT` 三引號字串裡即可，第一次 Send 時才會 parse,壞掉的內容會在 log 裡顯示 parse error。
 
-CLI 端目前**沒有**對應的 sub-command；要 scripting 直接 `from binFileTransfer_core import TdbgSession, parse_acute_txt`。
+CLI 端目前**沒有**對應的 sub-command；要 scripting 或載入任意波形,直接 `from binFileTransfer_core import TdbgSession, parse_acute_txt`(library 端仍支援多 channel、迭代、stop event)。
 
 **GUI 三 tab 的 port 仲裁**：燒錄 / GPIO / TDBG 同時間最多只有一個能持有 serial port。在 TDBG 連線狀態下按 GPIO 的 Connect 會被擋；按 Start Programming 則會自動釋放 GPIO 與 TDBG 後再進入燒錄。
 
