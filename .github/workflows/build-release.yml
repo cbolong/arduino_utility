@@ -81,6 +81,7 @@ jobs:
             --hidden-import serial.tools.list_ports_windows \
             --noupx \
             --icon assets/icon.ico \
+            --add-data "assets/icon.ico;assets" \
             --version-file build/version.txt \
             binFileTransferGui.py
 

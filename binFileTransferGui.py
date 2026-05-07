@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -10,6 +11,52 @@ from tkinter import filedialog, messagebox, ttk
 # that need them. Both pull in Win32 COM enumeration code that's slow to
 # import cold, and deferring keeps the Tk window visible within ~1 s of
 # launch instead of waiting for those imports to finish first.
+
+
+def _resource_path(rel: str) -> str:
+    """Resolve a path relative to either the script dir (dev) or
+    PyInstaller's _MEIPASS extraction dir (built EXE)."""
+    base = getattr(sys, "_MEIPASS",
+                   os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+class _Tooltip:
+    """Lightweight hover tooltip — shows `text` in a borderless Toplevel
+    near the cursor when the pointer enters `widget`, hides on leave.
+    No external deps."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self._widget = widget
+        self._text = text
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+
+    def _show(self, _event=None) -> None:
+        if self._tip is not None:
+            return
+        x = self._widget.winfo_rootx() + self._widget.winfo_width() + 6
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() // 2 - 8
+        tw = tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            tw, text=self._text,
+            background="#ffffe0", foreground="#1a1a1a",
+            relief="solid", borderwidth=1, padx=6, pady=2,
+            font=("TkDefaultFont", 9),
+        ).pack()
+        self._tip = tw
+
+    def _hide(self, _event=None) -> None:
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
 
 
 APP_TITLE = "SST39 Flash Programmer"
@@ -1233,23 +1280,30 @@ class TdbgTab(_LoggedTab):
         )
         self._clear_log_btn.pack(side=tk.LEFT)
 
-        # Row 3: pattern entry — name, mini waveform thumbnail, Send button.
-        # Clicking the thumbnail opens a modal preview window.
-        pattern_row = ttk.Frame(parent)
-        pattern_row.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(pattern_row, text="TDBG 密碼1").pack(side=tk.LEFT)
+        # Row 3: pattern card — bordered box with title on top and a body
+        # row below holding the (square) waveform thumbnail and the Send
+        # button. The thumbnail is the click target for the preview popup.
+        card = ttk.Frame(parent, relief="groove", borderwidth=1, padding=8)
+        card.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(
+            card, text="TDBG 密碼1",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w")
+        card_body = ttk.Frame(card)
+        card_body.pack(fill=tk.X, pady=(6, 0))
         self._preview_canvas = tk.Canvas(
-            pattern_row, width=80, height=22,
+            card_body, width=32, height=32,
             background="#1a1a1a", relief="raised", borderwidth=1,
             highlightthickness=0, cursor="hand2",
         )
-        self._preview_canvas.pack(side=tk.LEFT, padx=(8, 8))
+        self._preview_canvas.pack(side=tk.LEFT)
         self._preview_canvas.bind("<Button-1>", self._open_preview)
+        _Tooltip(self._preview_canvas, "顯示波形")
         self._draw_thumbnail()
         self._send_btn = ttk.Button(
-            pattern_row, text="Send", command=self._on_send, state=tk.DISABLED,
+            card_body, text="Send", command=self._on_send, state=tk.DISABLED,
         )
-        self._send_btn.pack(side=tk.LEFT)
+        self._send_btn.pack(side=tk.LEFT, padx=(8, 0))
 
     # ---- queue / worker ---------------------------------------------------
 
@@ -1418,35 +1472,33 @@ class TdbgTab(_LoggedTab):
     # ---- mini thumbnail + preview popup -----------------------------------
 
     def _draw_thumbnail(self) -> None:
-        """Render the first ~12 transitions on the row-3 mini canvas. The
-        canvas is the click target that opens the full preview popup."""
+        """Render a small square-wave shape on the row-3 32x32 canvas. The
+        canvas is the click target that opens the full preview popup —
+        timing accuracy isn't important, the alternating shape just says
+        "this is a digital waveform"."""
         canvas = self._preview_canvas
         canvas.delete("all")
         try:
             init, events = _ensure_builtin_parsed()
         except ValueError:
             canvas.create_text(
-                40, 11, text="(parse err)", fill="#b00020",
-                font=("Consolas", 7),
+                16, 16, text="!", fill="#b00020",
+                font=("TkDefaultFont", 12, "bold"),
             )
             return
 
-        # Compress the first cluster into the 80x22 box. We don't bother
-        # being faithful to absolute timing here — equal spacing gives a
-        # cleaner "this is a digital waveform" cue than a true-to-scale
-        # render that would compress the labels into one orange smear.
-        n_show = min(14, len(events))
+        n_show = min(6, len(events))
         if n_show < 2:
             return
         sub = events[:n_show]
 
-        margin_x = 3
-        margin_y = 2
+        margin_x = 2
+        margin_y = 3
         w = int(canvas.cget("width"))
         h = int(canvas.cget("height"))
         usable_w = w - 2 * margin_x
-        y_high = margin_y + 2
-        y_low = h - margin_y - 2
+        y_high = margin_y + 1
+        y_low = h - margin_y - 1
 
         step = usable_w / n_show
         x = margin_x
@@ -1456,9 +1508,7 @@ class TdbgTab(_LoggedTab):
         for i, (_, new_state) in enumerate(sub):
             new_x = margin_x + (i + 1) * step
             new_y = y_high if new_state else y_low
-            # horizontal segment at prev_y up to the edge
             canvas.create_line(x, prev_y, new_x, prev_y, fill="#ff9933", width=1)
-            # vertical edge
             canvas.create_line(new_x, prev_y, new_x, new_y, fill="#ff9933", width=1)
             x = new_x
             prev_y = new_y
@@ -1663,6 +1713,13 @@ class App:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry(WINDOW_SIZE)
+        try:
+            self.root.iconbitmap(_resource_path("assets/icon.ico"))
+        except tk.TclError:
+            # Linux Tk's iconbitmap doesn't accept .ico; ignore silently
+            # so dev-mode runs on Linux still work. The shipped EXE is
+            # Windows-only, so this branch only triggers in dev.
+            pass
 
         self.tabs: list[_LoggedTab] = []
         self._build_widgets()
