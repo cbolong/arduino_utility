@@ -42,10 +42,11 @@ class _Tooltip:
         tw = tk.Toplevel(self._widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{x}+{y}")
+        # macOS-style dark tooltip — light grey on charcoal, no border.
         tk.Label(
             tw, text=self._text,
-            background="#ffffe0", foreground="#1a1a1a",
-            relief="solid", borderwidth=1, padx=6, pady=2,
+            background="#2c2c2e", foreground="#ffffff",
+            borderwidth=0, padx=8, pady=3,
             font=("TkDefaultFont", 9),
         ).pack()
         self._tip = tw
@@ -67,12 +68,33 @@ AUTO_DETECT_LABEL = "Auto-detect (Arduino Due Programming Port)"
 DUE_TARGET_VID = 0x2341
 DUE_TARGET_PID = 0x003D
 
+# macOS-inspired palette. Single source of truth — every status colour and
+# every Notebook-tab style references entries from here. The dark-canvas /
+# orange-waveform combination used by the TDBG and RECORD preview popups is
+# intentionally kept (logic-analyzer style, separate visual layer).
+_COLORS = {
+    "window_bg":      "#ffffff",
+    "surface_2":      "#f5f5f7",
+    "surface_hover":  "#ebebed",
+    "text_primary":   "#1d1d1f",
+    "text_secondary": "#6e6e73",
+    "text_disabled":  "#c7c7cc",
+    "accent":         "#007aff",
+    "success":        "#34c759",
+    "danger":         "#ff3b30",
+    "warning":        "#ff9500",
+    "separator":      "#d2d2d7",
+    "canvas_bg":      "#1a1a1a",
+    "wave_orange":    "#ff9933",
+    "wave_label":     "#ffe680",
+}
+
 LEVEL_TAGS = {
-    "info": ("log_info", "#1a1a1a"),
-    "ok": ("log_ok", "#1f7a1f"),
-    "warn": ("log_warn", "#a06400"),
-    "err": ("log_err", "#b00020"),
-    "wait": ("log_wait", "#666666"),
+    "info": ("log_info", _COLORS["text_primary"]),
+    "ok":   ("log_ok",   _COLORS["success"]),
+    "warn": ("log_warn", _COLORS["warning"]),
+    "err":  ("log_err",  _COLORS["danger"]),
+    "wait": ("log_wait", _COLORS["text_secondary"]),
 }
 
 
@@ -175,7 +197,7 @@ class _LoggedTab:
         self.app.root.after(50, self._drain_log_queue)
 
     def _append_log(self, message: str, level: str) -> None:
-        tag = LEVEL_TAGS.get(level, ("log_info", "#1a1a1a"))[0]
+        tag = LEVEL_TAGS.get(level, ("log_info", _COLORS["text_primary"]))[0]
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, message + "\n", tag)
         self.log_text.see(tk.END)
@@ -277,7 +299,7 @@ class FlashTab(_LoggedTab):
             return program_firmware(firmware_path, log_cb, port=port)
 
         if self.submit_work(work):
-            self.app.set_status("Programming...", "#a06400")
+            self.app.set_status("Programming...", _COLORS["warning"])
             self.app.lock_port_entry()
         else:
             # Worker refused (already busy). Re-enable buttons so user can retry.
@@ -290,9 +312,9 @@ class FlashTab(_LoggedTab):
                 f"{os.path.basename(self.firmware_path or '')} Program Successful.",
                 "ok",
             )
-            self.app.set_status("Success", "#1f7a1f")
+            self.app.set_status("Success", _COLORS["success"])
         else:
-            self.app.set_status("Error", "#b00020")
+            self.app.set_status("Error", _COLORS["danger"])
         self.start_btn.config(state=tk.NORMAL)
         self.browse_btn.config(state=tk.NORMAL)
         self.app.unlock_port_entry()
@@ -351,7 +373,7 @@ class _PinRow:
         self.read_var = tk.StringVar(value="??")
         self.read_label = ttk.Label(
             self.frame, textvariable=self.read_var,
-            width=6, foreground="#666666", anchor="w",
+            width=6, foreground=_COLORS["text_secondary"], anchor="w",
         )
         self.read_label.grid(row=0, column=5, padx=(4, 0))
 
@@ -397,7 +419,7 @@ class _PinRow:
         """Update the right-most "Read:" cell. Coloured for readability."""
         self.read_var.set(value)
         self.read_label.config(
-            foreground="#1f7a1f" if value == "HIGH" else "#1a1a1a"
+            foreground=_COLORS["success"] if value == "HIGH" else _COLORS["text_primary"]
         )
 
 
@@ -445,7 +467,7 @@ class GpioTab(_LoggedTab):
         ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
         self._conn_status_var = tk.StringVar(value="Disconnected")
         self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground="#b00020"
+            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger"]
         )
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
@@ -614,10 +636,10 @@ class GpioTab(_LoggedTab):
             )
             return
         port = self.app.get_port()
-        self._set_conn_status("Connecting...", "#a06400")
+        self._set_conn_status("Connecting...", _COLORS["warning"])
         self._connect_btn.config(state=tk.DISABLED)
         self.app.lock_port_entry()
-        self.app.set_status("GPIO connecting...", "#a06400")
+        self.app.set_status("GPIO connecting...", _COLORS["warning"])
 
         def cmd():
             from binFileTransfer_core import GpioSession
@@ -632,21 +654,21 @@ class GpioTab(_LoggedTab):
 
     def _on_connect_done(self, session: GpioSession | None) -> None:
         if session is None:
-            self._set_conn_status("Disconnected", "#b00020")
+            self._set_conn_status("Disconnected", _COLORS["danger"])
             self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            self.app.set_status("GPIO connect failed", "#b00020")
+            self.app.set_status("GPIO connect failed", _COLORS["danger"])
             return
 
         self._session = session
         self._abort_event.clear()
-        self._set_conn_status("Connected", "#1f7a1f")
+        self._set_conn_status("Connected", _COLORS["success"])
         self._disconnect_btn.config(state=tk.NORMAL)
         self._read_all_btn.config(state=tk.NORMAL)
         self._auto_refresh_check.config(state=tk.NORMAL)
         for row in self._pin_rows.values():
             row.set_enabled(True)
-        self.app.set_status("GPIO Connected", "#1f7a1f")
+        self.app.set_status("GPIO Connected", _COLORS["success"])
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -679,7 +701,7 @@ class GpioTab(_LoggedTab):
         self._auto_refresh_check.config(state=tk.DISABLED)
         for row in self._pin_rows.values():
             row.set_enabled(False)
-        self._set_conn_status("Disconnecting...", "#a06400")
+        self._set_conn_status("Disconnecting...", _COLORS["warning"])
 
     def _do_close_session(self) -> None:
         if self._session is not None:
@@ -688,10 +710,10 @@ class GpioTab(_LoggedTab):
 
     def _on_disconnect_done(self) -> None:
         self._session = None
-        self._set_conn_status("Disconnected", "#b00020")
+        self._set_conn_status("Disconnected", _COLORS["danger"])
         self._connect_btn.config(state=tk.NORMAL)
         self.app.unlock_port_entry()
-        self.app.set_status("GPIO Disconnected", "#666666")
+        self.app.set_status("GPIO Disconnected", _COLORS["text_secondary"])
 
     def disconnect_for_other(self, on_done) -> None:
         """Close the GPIO session (if open) then call on_done() on the Tk
@@ -1252,7 +1274,7 @@ class TdbgTab(_LoggedTab):
         ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
         self._conn_status_var = tk.StringVar(value="Disconnected")
         self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground="#b00020"
+            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger"]
         )
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
@@ -1290,7 +1312,7 @@ class TdbgTab(_LoggedTab):
         ).pack(side=tk.LEFT)
         self._preview_canvas = tk.Canvas(
             card, width=20, height=20,
-            background="#1a1a1a", relief="raised", borderwidth=1,
+            background=_COLORS["canvas_bg"], relief="raised", borderwidth=1,
             highlightthickness=0, cursor="hand2",
         )
         self._preview_canvas.pack(side=tk.LEFT, padx=(10, 8))
@@ -1345,10 +1367,10 @@ class TdbgTab(_LoggedTab):
             )
             return
         port = self.app.get_port()
-        self._set_conn_status("Connecting...", "#a06400")
+        self._set_conn_status("Connecting...", _COLORS["warning"])
         self._connect_btn.config(state=tk.DISABLED)
         self.app.lock_port_entry()
-        self.app.set_status("TDBG connecting...", "#a06400")
+        self.app.set_status("TDBG connecting...", _COLORS["warning"])
 
         def cmd():
             from binFileTransfer_core import TdbgSession
@@ -1363,17 +1385,17 @@ class TdbgTab(_LoggedTab):
 
     def _on_connect_done(self, session) -> None:
         if session is None:
-            self._set_conn_status("Disconnected", "#b00020")
+            self._set_conn_status("Disconnected", _COLORS["danger"])
             self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            self.app.set_status("TDBG connect failed", "#b00020")
+            self.app.set_status("TDBG connect failed", _COLORS["danger"])
             return
         self._session = session
-        self._set_conn_status("Connected", "#1f7a1f")
+        self._set_conn_status("Connected", _COLORS["success"])
         self._disconnect_btn.config(state=tk.NORMAL)
         self._pin_combo.config(state="readonly")
         self._send_btn.config(state=tk.NORMAL)
-        self.app.set_status("TDBG Connected", "#1f7a1f")
+        self.app.set_status("TDBG Connected", _COLORS["success"])
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -1385,7 +1407,7 @@ class TdbgTab(_LoggedTab):
         self._disconnect_btn.config(state=tk.DISABLED)
         self._send_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
-        self._set_conn_status("Disconnecting...", "#a06400")
+        self._set_conn_status("Disconnecting...", _COLORS["warning"])
 
     def _do_close_session(self) -> None:
         if self._session is not None:
@@ -1394,10 +1416,10 @@ class TdbgTab(_LoggedTab):
 
     def _on_disconnect_done(self) -> None:
         self._session = None
-        self._set_conn_status("Disconnected", "#b00020")
+        self._set_conn_status("Disconnected", _COLORS["danger"])
         self._connect_btn.config(state=tk.NORMAL)
         self.app.unlock_port_entry()
-        self.app.set_status("TDBG Disconnected", "#666666")
+        self.app.set_status("TDBG Disconnected", _COLORS["text_secondary"])
 
     def disconnect_for_other(self, on_done) -> None:
         """Close the TDBG session (if open) then call on_done() on Tk thread.
@@ -1443,7 +1465,7 @@ class TdbgTab(_LoggedTab):
         self._send_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._disconnect_btn.config(state=tk.DISABLED)
-        self.app.set_status("TDBG playing...", "#a06400")
+        self.app.set_status("TDBG playing...", _COLORS["warning"])
 
         def cmd():
             sess = self._session
@@ -1463,7 +1485,7 @@ class TdbgTab(_LoggedTab):
             self._disconnect_btn.config(state=tk.NORMAL)
         self.app.set_status(
             "TDBG done" if success else "TDBG error",
-            "#1f7a1f" if success else "#b00020",
+            _COLORS["success"] if success else _COLORS["danger"],
         )
 
     # ---- mini thumbnail + preview popup -----------------------------------
@@ -1479,7 +1501,7 @@ class TdbgTab(_LoggedTab):
             init, events = _ensure_builtin_parsed()
         except ValueError:
             canvas.create_text(
-                10, 10, text="!", fill="#b00020",
+                10, 10, text="!", fill=_COLORS["danger"],
                 font=("TkDefaultFont", 10, "bold"),
             )
             return
@@ -1505,8 +1527,8 @@ class TdbgTab(_LoggedTab):
         for i, (_, new_state) in enumerate(sub):
             new_x = margin_x + (i + 1) * step
             new_y = y_high if new_state else y_low
-            canvas.create_line(x, prev_y, new_x, prev_y, fill="#ff9933", width=1)
-            canvas.create_line(new_x, prev_y, new_x, new_y, fill="#ff9933", width=1)
+            canvas.create_line(x, prev_y, new_x, prev_y, fill=_COLORS["wave_orange"], width=1)
+            canvas.create_line(new_x, prev_y, new_x, new_y, fill=_COLORS["wave_orange"], width=1)
             x = new_x
             prev_y = new_y
 
@@ -1591,7 +1613,7 @@ class TdbgTab(_LoggedTab):
         ttk.Label(
             header,
             text=f"Cluster starts at t = {_format_duration_ns(start_ns)} of playback",
-            foreground="#666666",
+            foreground=_COLORS["text_secondary"],
         ).pack(side=tk.LEFT)
 
         # Geometry — pick a per-ns scale that makes the shortest pulse
@@ -1614,7 +1636,7 @@ class TdbgTab(_LoggedTab):
         wrap = ttk.Frame(parent)
         wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         canvas = tk.Canvas(
-            wrap, height=HEIGHT, background="#1a1a1a",
+            wrap, height=HEIGHT, background=_COLORS["canvas_bg"],
             scrollregion=(0, 0, canvas_w, HEIGHT),
             highlightthickness=0,
         )
@@ -1661,7 +1683,7 @@ class TdbgTab(_LoggedTab):
             # Horizontal segment from prev_x to x at prev_y.
             if x > prev_x:
                 canvas.create_line(
-                    prev_x, prev_y, x, prev_y, fill="#ff9933", width=2,
+                    prev_x, prev_y, x, prev_y, fill=_COLORS["wave_orange"], width=2,
                 )
             # Pulse-width label centred above the segment (skip the i=0
             # zero-width "anchor" segment).
@@ -1669,12 +1691,12 @@ class TdbgTab(_LoggedTab):
                 canvas.create_text(
                     (prev_x + x) / 2, LABEL_Y_TOP,
                     text=_format_duration_ns(seg_ns),
-                    fill="#ffe680", font=("Consolas", 8),
+                    fill=_COLORS["wave_label"], font=("Consolas", 8),
                 )
             # Vertical edge.
             new_y = Y_HIGH if new_state else Y_LOW
             canvas.create_line(
-                x, prev_y, x, new_y, fill="#ff9933", width=2,
+                x, prev_y, x, new_y, fill=_COLORS["wave_orange"], width=2,
             )
             prev_x, prev_y = x, new_y
             state = new_state
@@ -1683,7 +1705,7 @@ class TdbgTab(_LoggedTab):
         tail_x = canvas_w - RIGHT_PAD
         if prev_x < tail_x:
             canvas.create_line(
-                prev_x, prev_y, tail_x, prev_y, fill="#ff9933", width=2,
+                prev_x, prev_y, tail_x, prev_y, fill=_COLORS["wave_orange"], width=2,
             )
 
         # Time axis ticks at the canvas bottom — every 5 µs of cluster time.
@@ -1693,7 +1715,7 @@ class TdbgTab(_LoggedTab):
             tick_ns = k * tick_step_ns
             tx = LEFT_PAD + tick_ns * PIX_PER_NS
             canvas.create_line(
-                tx, AXIS_Y, tx, AXIS_Y + 4, fill="#666666",
+                tx, AXIS_Y, tx, AXIS_Y + 4, fill=_COLORS["text_secondary"],
             )
             canvas.create_text(
                 tx, AXIS_Y + 14,
@@ -1716,9 +1738,9 @@ class _RecordPinRow:
     recording. Created and destroyed dynamically via the [+] / [⊖] buttons.
     """
 
-    DOT_HIGH = "#1f7a1f"
-    DOT_LOW = "#666666"
-    DOT_UNKNOWN = "#aaaaaa"
+    DOT_HIGH = _COLORS["success"]
+    DOT_LOW = _COLORS["text_secondary"]
+    DOT_UNKNOWN = _COLORS["text_disabled"]
 
     def __init__(self, parent: ttk.Frame, on_remove, allow_remove: bool) -> None:
         self.frame = ttk.Frame(parent)
@@ -1827,7 +1849,7 @@ class RecordTab(_LoggedTab):
         ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
         self._conn_status_var = tk.StringVar(value="Disconnected")
         self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground="#b00020"
+            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger"]
         )
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
@@ -1855,7 +1877,7 @@ class RecordTab(_LoggedTab):
         # Thumbnail canvas (only visible after a successful recording).
         self._preview_canvas = tk.Canvas(
             action_row, width=20, height=20,
-            background="#1a1a1a", relief="raised", borderwidth=1,
+            background=_COLORS["canvas_bg"], relief="raised", borderwidth=1,
             highlightthickness=0, cursor="hand2",
         )
         # Reserved but not packed yet — we pack it after the first 結束.
@@ -1963,10 +1985,10 @@ class RecordTab(_LoggedTab):
             )
             return
         port = self.app.get_port()
-        self._set_conn_status("Connecting...", "#a06400")
+        self._set_conn_status("Connecting...", _COLORS["warning"])
         self._connect_btn.config(state=tk.DISABLED)
         self.app.lock_port_entry()
-        self.app.set_status("RECORD connecting...", "#a06400")
+        self.app.set_status("RECORD connecting...", _COLORS["warning"])
 
         def cmd():
             from binFileTransfer_core import RecordSession
@@ -1981,16 +2003,16 @@ class RecordTab(_LoggedTab):
 
     def _on_connect_done(self, session) -> None:
         if session is None:
-            self._set_conn_status("Disconnected", "#b00020")
+            self._set_conn_status("Disconnected", _COLORS["danger"])
             self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            self.app.set_status("RECORD connect failed", "#b00020")
+            self.app.set_status("RECORD connect failed", _COLORS["danger"])
             return
         self._session = session
-        self._set_conn_status("Connected", "#1f7a1f")
+        self._set_conn_status("Connected", _COLORS["success"])
         self._disconnect_btn.config(state=tk.NORMAL)
         self._refresh_start_button()
-        self.app.set_status("RECORD Connected", "#1f7a1f")
+        self.app.set_status("RECORD Connected", _COLORS["success"])
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -2002,7 +2024,7 @@ class RecordTab(_LoggedTab):
         self._disconnect_btn.config(state=tk.DISABLED)
         self._start_btn.config(state=tk.DISABLED)
         self._stop_btn.config(state=tk.DISABLED)
-        self._set_conn_status("Disconnecting...", "#a06400")
+        self._set_conn_status("Disconnecting...", _COLORS["warning"])
 
     def _do_close_session(self) -> None:
         if self._session is not None:
@@ -2012,13 +2034,13 @@ class RecordTab(_LoggedTab):
     def _on_disconnect_done(self) -> None:
         self._session = None
         self._recording = False
-        self._set_conn_status("Disconnected", "#b00020")
+        self._set_conn_status("Disconnected", _COLORS["danger"])
         self._connect_btn.config(state=tk.NORMAL)
         for row in self._pin_rows:
             row.set_live_state(None)
         self._refresh_start_button()
         self.app.unlock_port_entry()
-        self.app.set_status("RECORD Disconnected", "#666666")
+        self.app.set_status("RECORD Disconnected", _COLORS["text_secondary"])
 
     def disconnect_for_other(self, on_done) -> None:
         if self._session is None:
@@ -2079,7 +2101,7 @@ class RecordTab(_LoggedTab):
             self._preview_canvas.pack_forget()
         except Exception:
             pass
-        self.app.set_status("RECORD recording...", "#a06400")
+        self.app.set_status("RECORD recording...", _COLORS["warning"])
 
         # Build a row→pin mapping for live-callback dispatch.
         pin_to_row = {row.selected_pin(): row for row in self._pin_rows
@@ -2118,13 +2140,13 @@ class RecordTab(_LoggedTab):
         if self._session is not None:
             self._disconnect_btn.config(state=tk.NORMAL)
         self._refresh_start_button()
-        self.app.set_status("RECORD start failed", "#b00020")
+        self.app.set_status("RECORD start failed", _COLORS["danger"])
 
     def _on_stop(self) -> None:
         if not self._recording:
             return
         self._stop_btn.config(state=tk.DISABLED)
-        self.app.set_status("RECORD stopping...", "#a06400")
+        self.app.set_status("RECORD stopping...", _COLORS["warning"])
 
         def cmd():
             sess = self._session
@@ -2147,7 +2169,7 @@ class RecordTab(_LoggedTab):
         self._refresh_start_button()
 
         if result is None:
-            self.app.set_status("RECORD stop error", "#b00020")
+            self.app.set_status("RECORD stop error", _COLORS["danger"])
             return
         pins, events = result
         self._recorded_pins = pins
@@ -2161,10 +2183,10 @@ class RecordTab(_LoggedTab):
             total_us = sum(d for d, _ in events)
             self.app.set_status(
                 f"RECORD done: {len(events)} edges, {total_us / 1000:.3f} ms",
-                "#1f7a1f",
+                _COLORS["success"],
             )
         else:
-            self.app.set_status("RECORD done: no edges captured", "#a06400")
+            self.app.set_status("RECORD done: no edges captured", _COLORS["warning"])
 
     # ---- thumbnail + preview popup ---------------------------------------
 
@@ -2200,8 +2222,8 @@ class RecordTab(_LoggedTab):
             new_state = states.get(target_pin, prev_state)
             new_x = margin_x + (i + 1) * step
             new_y = y_high if new_state else y_low
-            canvas.create_line(x, prev_y, new_x, prev_y, fill="#ff9933", width=1)
-            canvas.create_line(new_x, prev_y, new_x, new_y, fill="#ff9933", width=1)
+            canvas.create_line(x, prev_y, new_x, prev_y, fill=_COLORS["wave_orange"], width=1)
+            canvas.create_line(new_x, prev_y, new_x, new_y, fill=_COLORS["wave_orange"], width=1)
             x = new_x
             prev_y = new_y
 
@@ -2314,7 +2336,7 @@ class RecordTab(_LoggedTab):
         wrap = ttk.Frame(parent)
         wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         canvas = tk.Canvas(
-            wrap, height=canvas_h, background="#1a1a1a",
+            wrap, height=canvas_h, background=_COLORS["canvas_bg"],
             scrollregion=(0, 0, canvas_w, canvas_h),
             highlightthickness=0,
         )
@@ -2351,7 +2373,7 @@ class RecordTab(_LoggedTab):
                 x = LEFT_PAD + cum[i + 1] * PIX_PER_US
                 if x > prev_x:
                     canvas.create_line(
-                        prev_x, prev_y, x, prev_y, fill="#ff9933", width=2,
+                        prev_x, prev_y, x, prev_y, fill=_COLORS["wave_orange"], width=2,
                     )
                     seg_us = cum[i + 1] - cum[i]
                     if seg_us > 0 and (x - prev_x) >= 16 and row_idx == 0:
@@ -2360,12 +2382,12 @@ class RecordTab(_LoggedTab):
                         canvas.create_text(
                             (prev_x + x) / 2, y_high + LABEL_Y_OFFSET,
                             text=_format_duration_ns(seg_us * 1000.0),
-                            fill="#ffe680", font=("Consolas", 8),
+                            fill=_COLORS["wave_label"], font=("Consolas", 8),
                         )
                 new_y = y_high if new_state else y_low
                 if new_y != prev_y:
                     canvas.create_line(
-                        x, prev_y, x, new_y, fill="#ff9933", width=2,
+                        x, prev_y, x, new_y, fill=_COLORS["wave_orange"], width=2,
                     )
                 prev_x, prev_y = x, new_y
                 state = new_state
@@ -2374,7 +2396,7 @@ class RecordTab(_LoggedTab):
             tail_x = canvas_w - RIGHT_PAD
             if prev_x < tail_x:
                 canvas.create_line(
-                    prev_x, prev_y, tail_x, prev_y, fill="#ff9933", width=2,
+                    prev_x, prev_y, tail_x, prev_y, fill=_COLORS["wave_orange"], width=2,
                 )
 
         # Bottom time axis.
@@ -2385,7 +2407,7 @@ class RecordTab(_LoggedTab):
             for k in range(n_ticks + 1):
                 t_us = k * tick_step_us
                 tx = LEFT_PAD + t_us * PIX_PER_US
-                canvas.create_line(tx, axis_y - 4, tx, axis_y, fill="#666666")
+                canvas.create_line(tx, axis_y - 4, tx, axis_y, fill=_COLORS["text_secondary"])
                 canvas.create_text(
                     tx, axis_y + 6,
                     text=_format_duration_ns(t_us * 1000.0),
@@ -2435,25 +2457,46 @@ class App:
         # Initial scan happens after notebook is built so any error logs
         # have somewhere to go (we keep this simple and silent for now).
 
-        # Notebook style — bold + blue background on the selected tab so
-        # it's obvious which tab is active. Default Vista theme makes the
-        # active vs inactive tabs nearly indistinguishable; switching to
-        # 'clam' lets us actually customise the background colour (the
-        # native themes often ignore style.map(background=...) on tabs).
+        # macOS-inspired Notebook style. Two real things being fixed here:
+        #   1. The previous bold-by-default font wasn't honoured on the
+        #      selected tab in clam, so the selected tab text actually
+        #      rendered SMALLER than the unselected ones. Setting font
+        #      explicitly via style.map(font=...) for the selected state
+        #      forces clam to apply the bold weight on selection.
+        #   2. clam gives the selected tab expand=[1,0,1,0] which makes it
+        #      "lift" out of the row. That asymmetry made tabs visually
+        #      uneven. expand=[0,0,0,0] keeps every tab the same size.
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
         style.configure(
+            "TNotebook",
+            background=_COLORS["surface_2"],
+            borderwidth=0,
+            tabmargins=[2, 4, 2, 0],
+        )
+        style.configure(
             "TNotebook.Tab",
-            padding=[14, 8],
-            font=("TkDefaultFont", 10, "bold"),
+            padding=[16, 8],
+            font=("TkDefaultFont", 10),
+            background=_COLORS["surface_2"],
+            foreground=_COLORS["text_secondary"],
+            borderwidth=0,
         )
         style.map(
             "TNotebook.Tab",
-            background=[("selected", "#1f6fb2"), ("active", "#d4e6f5")],
-            foreground=[("selected", "#ffffff"), ("active", "#1a1a1a")],
+            background=[
+                ("selected", _COLORS["window_bg"]),
+                ("active",   _COLORS["surface_hover"]),
+            ],
+            foreground=[
+                ("selected", _COLORS["accent"]),
+                ("active",   _COLORS["text_primary"]),
+            ],
+            font=[("selected", ("TkDefaultFont", 10, "bold"))],
+            expand=[("selected", [0, 0, 0, 0])],
         )
 
         self.notebook = ttk.Notebook(self.root)
@@ -2478,7 +2521,7 @@ class App:
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(bottom, text="Status:").pack(side=tk.LEFT)
         self.status_label = ttk.Label(
-            bottom, textvariable=self.status_var, foreground="#1a1a1a"
+            bottom, textvariable=self.status_var, foreground=_COLORS["text_primary"]
         )
         self.status_label.pack(side=tk.LEFT, padx=(6, 0))
 
@@ -2554,7 +2597,7 @@ class App:
             self.port_var.set(AUTO_DETECT_LABEL)
         if not self.port_combo["values"]:
             self.port_combo["values"] = [AUTO_DETECT_LABEL]
-        self.set_status(f"Port scan failed: {exc}", "#b00020")
+        self.set_status(f"Port scan failed: {exc}", _COLORS["danger"])
         self._maybe_unlock_refresh()
 
     def _maybe_unlock_refresh(self) -> None:
