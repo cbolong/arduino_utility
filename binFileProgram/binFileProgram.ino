@@ -1,39 +1,10 @@
 
-// Arduino core. The IDE normally injects this implicitly for .ino sketches;
-// keep it explicit so the build is reproducible across IDE versions and
-// folder layouts.
+// Arduino core — provides Serial, pinMode/digitalWrite, plus the CMSIS
+// transitive includes (DWT / CoreDebug used by tdbgEnableDwt() etc).
+// Arduino IDE injects this implicitly for .ino sketches, but on some IDE
+// versions / folder layouts the implicit injection doesn't happen, so
+// keeping it explicit makes the build deterministic.
 #include <Arduino.h>
-
-// ----- Cortex-M3 DWT cycle counter (manual declaration) ----------------
-// The CMSIS macros DWT / CoreDebug live in <core_cm3.h>. The Arduino SAM
-// core's <Arduino.h> → <sam.h> → <sam3xa.h> chain pulls in the SAM3X
-// peripheral headers (PIO / UART / etc.) but NOT core_cm3.h, so attempts
-// to dereference DWT or CoreDebug fail with "'DWT' was not declared in
-// this scope" on a stock Arduino SAM 1.6.12 install. The DWT block is
-// architecturally fixed (ARMv7-M: DWT @ 0xE0001000, CoreDebug @
-// 0xE000EDF0) on every Cortex-M3 part — including the SAM3X8E on the
-// Arduino Due — so declaring just the registers we touch is portable and
-// future-proof. The #ifndef DWT_BASE guard means that if a future
-// toolchain DOES expose CMSIS via Arduino.h, we silently defer to it.
-#ifndef DWT_BASE
-typedef struct {
-  volatile uint32_t CTRL;     // 0x000  Control
-  volatile uint32_t CYCCNT;   // 0x004  Cycle Count
-} DWT_Type;
-#define DWT_BASE                    (0xE0001000UL)
-#define DWT                         ((DWT_Type*)DWT_BASE)
-#define DWT_CTRL_CYCCNTENA_Msk      (1UL << 0)
-
-typedef struct {
-  volatile uint32_t DHCSR;    // 0x000  Debug Halting Control & Status
-  volatile uint32_t DCRSR;    // 0x004
-  volatile uint32_t DCRDR;    // 0x008
-  volatile uint32_t DEMCR;    // 0x00C  Debug Exception and Monitor Control
-} CoreDebug_Type;
-#define CoreDebug_BASE              (0xE000EDF0UL)
-#define CoreDebug                   ((CoreDebug_Type*)CoreDebug_BASE)
-#define CoreDebug_DEMCR_TRCENA_Msk  (1UL << 24)
-#endif
 
 
 // USER define
