@@ -1,10 +1,31 @@
 
 // Arduino core — provides Serial, pinMode/digitalWrite, plus the CMSIS
-// transitive includes (DWT / CoreDebug used by tdbgEnableDwt() etc).
+// transitive includes (CoreDebug used by tdbgEnableDwt() etc).
 // Arduino IDE injects this implicitly for .ino sketches, but on some IDE
 // versions / folder layouts the implicit injection doesn't happen, so
 // keeping it explicit makes the build deterministic.
 #include <Arduino.h>
+
+// ----- Cortex-M3 DWT cycle counter (manual declaration) ----------------
+// Empirically, the Atmel-bundled core_cm3.h shipped with Arduino SAM
+// 1.6.x declares CoreDebug_Type but NOT DWT_Type — building against it
+// gives "'DWT' was not declared in this scope" while CoreDebug works
+// fine. The DWT block is architecturally fixed by ARMv7-M (DWT @
+// 0xE0001000 on every Cortex-M3, including the SAM3X8E on the Due), so
+// declaring just the registers we touch is safe and produces the same
+// machine code as a CMSIS DWT would. Guard with #ifndef DWT_BASE so a
+// future SAM core that DOES expose DWT silently wins. We deliberately do
+// NOT redeclare CoreDebug_Type — CMSIS provides that and adding our own
+// would conflict (see commits dbc9544 → 814938a).
+#ifndef DWT_BASE
+typedef struct {
+  volatile uint32_t CTRL;     // 0x000  Control
+  volatile uint32_t CYCCNT;   // 0x004  Cycle Count
+} DWT_Type;
+#define DWT_BASE                  (0xE0001000UL)
+#define DWT                       ((DWT_Type*)DWT_BASE)
+#define DWT_CTRL_CYCCNTENA_Msk    (1UL << 0)
+#endif
 
 
 // USER define
