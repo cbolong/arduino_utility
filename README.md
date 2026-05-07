@@ -1,4 +1,4 @@
-# Arduino Utility — SST39 Flash EEPROM Programmer
+# Arduino應用軟體 — SST39 Flash EEPROM Programmer
 
 用 **Arduino Due** 來燒錄並驗證 SST39 系列並列介面 Flash EEPROM 的工具組。
 PC 端用 Python 透過 USB Serial 把 `firmware.bin` 傳給 Arduino，Arduino 直接驅動 EEPROM 的位址/資料/控制腳位完成 Erase → Program → Read-Back Verify。

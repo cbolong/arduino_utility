@@ -81,7 +81,7 @@ class _Tooltip:
             self._tip = None
 
 
-APP_TITLE = "SST39 Flash Programmer"
+APP_TITLE = "Arduino應用軟體"
 WINDOW_SIZE = "900x780"
 
 # Port dropdown — first option is the catch-all auto-detect.

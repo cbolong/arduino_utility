@@ -57,11 +57,11 @@ jobs:
               StringFileInfo([
                 StringTable(u'040904B0', [
                   StringStruct(u'CompanyName', u'cbolong'),
-                  StringStruct(u'FileDescription', u'SST39 Flash EEPROM Programmer'),
+                  StringStruct(u'FileDescription', u'Arduino應用軟體'),
                   StringStruct(u'FileVersion', u'${ver_str}'),
                   StringStruct(u'InternalName', u'SST39FlashProgrammer'),
                   StringStruct(u'OriginalFilename', u'SST39FlashProgrammer.exe'),
-                  StringStruct(u'ProductName', u'SST39 Flash Programmer'),
+                  StringStruct(u'ProductName', u'Arduino應用軟體'),
                   StringStruct(u'ProductVersion', u'${ver_str}')])]),
               VarFileInfo([VarStruct(u'Translation', [1033, 1200])])])
           EOF
