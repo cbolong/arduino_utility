@@ -204,11 +204,16 @@ GPIO_ERROR_PREFIX = "GPIO_ERROR"
 
 
 def _read_line(
-    ser: serial.Serial, log: LogCallback, timeout_s: float
+    ser: serial.Serial, log: LogCallback, timeout_s: float, *, quiet: bool = False
 ) -> str | None:
     """Read one line (stripped) within timeout. Returns None on timeout.
     Echoes any non-empty intermediate MCU lines via log so the user sees
-    boot chatter (Vendor ID, etc.) just like the flash flow."""
+    boot chatter (Vendor ID, etc.) just like the flash flow.
+
+    `quiet=True` suppresses the "Timeout after Xs..." error log on
+    timeout — pass it from polling callers (e.g. _await_play_done's
+    0.25s slices) where timeout is the expected steady state, not an
+    error condition."""
     deadline = time.monotonic() + timeout_s
     while True:
         if ser.in_waiting > 0:
@@ -216,7 +221,8 @@ def _read_line(
             if line:
                 return line
         if time.monotonic() > deadline:
-            log(f"Timeout after {timeout_s:.1f}s waiting for MCU reply", "err")
+            if not quiet:
+                log(f"Timeout after {timeout_s:.1f}s waiting for MCU reply", "err")
             return None
         time.sleep(0.01)
 
@@ -722,8 +728,11 @@ class TdbgSession:
                 sent_stop = True
 
             # Bound per-iteration wait so we revisit stop_event promptly.
+            # quiet=True: each empty slice IS the steady state during MCU
+            # bit-banging — surfacing "Timeout after 0.2s..." every iteration
+            # would spam the log with red lines that aren't real errors.
             slice_s = min(0.25, deadline - now) if not math.isinf(deadline) else 0.25
-            line = _read_line(self._ser, self._log, slice_s)
+            line = _read_line(self._ser, self._log, slice_s, quiet=True)
             if line is None:
                 continue
             if line == MCU_TDBG_PLAY_DONE:
@@ -891,7 +900,10 @@ class RecordSession:
         on_live callback; RECORD_OVERFLOW logs a warning; anything else
         gets parked for stop() to pick up."""
         while not self._live_stop.is_set():
-            line = _read_line(self._ser, self._log, 0.25)
+            # Same polling pattern as _await_play_done — empty slices are
+            # the normal idle state while waiting for the next RECORD_LIVE,
+            # not real errors. Suppress the timeout log.
+            line = _read_line(self._ser, self._log, 0.25, quiet=True)
             if line is None:
                 continue
             if line.startswith(MCU_RECORD_LIVE_PREFIX):

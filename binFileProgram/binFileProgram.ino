@@ -493,6 +493,23 @@ static bool tdbgPumpStop() {
 
 // Inner playback loop. Returns true if completed normally, false if STOP
 // was observed inside a long-gap window.
+//
+// Interrupt-masking strategy: noInterrupts() is hoisted to *cluster*
+// scope, not per-event. Empirically the captured patterns we replay are
+// dense bursts of short pulses (~380 ns / 32 cycles each) separated by
+// long gaps (≥10 ms = TDBG_LONG_GAP_CYCLES). A per-event mask was the
+// previous design — it left interrupts ON between consecutive short
+// events, so SysTick (1 kHz) or USB CDC RX could fire in the gap and
+// steal hundreds of cycles. With short deltas already at ~32 cycles,
+// even one interrupt blows the deadline and the next several events
+// fire as fast as the loop body lets them, collapsing what should be
+// even 380 ns pulses into an irregular burst.
+//
+// New shape: hold noInterrupts() across runs of short events; release
+// for long gaps (where we want STOP to be reachable) and re-acquire
+// before the next short cluster. Cluster lengths are bounded by the
+// captured pattern (typical 50-100 µs of masked time), well under the
+// USB CDC stall threshold.
 static bool tdbgPlayOnce() {
   // Pre-set initial level via direct PIO BEFORE flipping output enable, so
   // there's no float-LOW glitch between mode change and first write.
@@ -503,6 +520,7 @@ static bool tdbgPlayOnce() {
 
   uint32_t deadline = DWT->CYCCNT;
   const uint8_t* p = tdbgBuf;
+  bool masked = false;            // true while we hold noInterrupts()
 
   for (uint16_t i = 0; i < tdbgEventCount; ++i) {
     uint32_t delta;
@@ -511,10 +529,14 @@ static bool tdbgPlayOnce() {
     p += TDBG_EVENT_BYTES;
     deadline += delta;
 
-    // Long-gap service window: poll Serial for STOP without burning a tight
-    // spin loop. Bail out a bit before the deadline so the precise wait
-    // below has slack to absorb scheduling jitter.
     if (delta >= TDBG_LONG_GAP_CYCLES) {
+      // Entering a long gap. Drop the mask if we were holding it so
+      // SysTick / Serial RX / USB CDC get serviced during the wait, and
+      // poll for TDBG_STOP without burning a tight spin loop. Bail out a
+      // bit before the deadline so the precise wait below has slack to
+      // absorb scheduling jitter from any interrupt that happened to land
+      // late in the polling window.
+      if (masked) { interrupts(); masked = false; }
       while ((int32_t)(deadline - DWT->CYCCNT) > (int32_t)TDBG_LONG_GAP_BAILOUT) {
         if (tdbgPumpStop()) {
           tdbgStopRequested = true;
@@ -523,14 +545,15 @@ static bool tdbgPlayOnce() {
       }
     }
 
-    // Tight deterministic wait — interrupts masked only here, so Serial RX
-    // / USB CDC / SysTick all keep running between transitions.
-    noInterrupts();
+    // Tight deterministic wait. Acquire the mask once at the start of a
+    // cluster of short events and hold it across the whole cluster — see
+    // function-level comment for rationale.
+    if (!masked) { noInterrupts(); masked = true; }
     while ((int32_t)(deadline - DWT->CYCCNT) > 0) { /* spin */ }
     if (state) tdbgPort->PIO_SODR = tdbgMask;
     else       tdbgPort->PIO_CODR = tdbgMask;
-    interrupts();
   }
+  if (masked) interrupts();
   return true;
 }
 
