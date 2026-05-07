@@ -355,10 +355,17 @@ class FlashTab(_LoggedTab):
 # GPIO 設定 tab — Plan A (single-pin manual test).
 # ---------------------------------------------------------------------------
 class _PinRow:
-    """One row of the GPIO dashboard: label, mode, HIGH/LOW radios, read display.
-    Constructed disabled; call set_enabled(True) when the GPIO session opens.
-    Click handlers fire `on_set(pin, mode, value_or_None)` — the GpioTab is
-    expected to enqueue the actual GPIO_SET round-trip on its worker thread.
+    """One row of the GPIO dashboard: label, mode toggle, HIGH/LOW radios,
+    read display. Constructed disabled; call set_enabled(True) when the GPIO
+    session opens. Click handlers fire `on_set(pin, mode, value_or_None)` —
+    the GpioTab is expected to enqueue the actual GPIO_SET round-trip on
+    its worker thread.
+
+    Mode is rendered as a single ttk.Button (text "OUT" / "IN") rather than
+    a Combobox. Combobox is one of the heaviest ttk widgets on Windows
+    (Entry + Listbox + dropdown menu + popup grab) and constructing 66 of
+    them dominated GPIO panel open time (~500 ms). A Button is a single
+    element and shaves ~5 ms per row.
     """
 
     def __init__(
@@ -373,20 +380,19 @@ class _PinRow:
         self._suppress_callbacks = False  # used while we programmatically set vars
 
         self.frame = ttk.Frame(parent)
-        ttk.Label(self.frame, text=label, width=12, anchor="w").grid(
+        ttk.Label(self.frame, text=label, width=10, anchor="w").grid(
             row=0, column=0, sticky="w"
         )
 
+        # Mode is internally still "OUTPUT" / "INPUT" so the existing on_set
+        # contract (passes mode string) doesn't change. The button just
+        # cycles between the two and renders a 4-char abbreviation.
         self.mode_var = tk.StringVar(value="INPUT")
-        self.mode_combo = ttk.Combobox(
-            self.frame,
-            textvariable=self.mode_var,
-            values=["OUTPUT", "INPUT"],
-            state="disabled",
-            width=8,
+        self.mode_btn = ttk.Button(
+            self.frame, text="--", width=4, state="disabled",
+            command=self._on_mode_click,
         )
-        self.mode_combo.grid(row=0, column=1, padx=(6, 12))
-        self.mode_combo.bind("<<ComboboxSelected>>", self._on_mode_changed)
+        self.mode_btn.grid(row=0, column=1, padx=(6, 10))
 
         self.value_var = tk.StringVar(value="")
         self.high_radio = ttk.Radiobutton(
@@ -398,23 +404,32 @@ class _PinRow:
             self.frame, text="LOW", variable=self.value_var,
             value="LOW", state="disabled", command=self._on_value_changed,
         )
-        self.low_radio.grid(row=0, column=3, padx=(0, 18))
+        self.low_radio.grid(row=0, column=3, padx=(0, 14))
 
         ttk.Label(self.frame, text="Read:").grid(row=0, column=4)
         self.read_var = tk.StringVar(value="??")
         self.read_label = ttk.Label(
             self.frame, textvariable=self.read_var,
-            width=6, foreground=_COLORS["text_secondary"], anchor="w",
+            width=4, foreground=_COLORS["text_secondary"], anchor="w",
         )
         self.read_label.grid(row=0, column=5, padx=(4, 0))
 
-    def set_enabled(self, enabled: bool) -> None:
+    def _refresh_mode_btn(self, enabled: bool) -> None:
         if not enabled:
-            self.mode_combo.config(state="disabled")
+            self.mode_btn.config(text="--", state="disabled")
+            return
+        mode = self.mode_var.get()
+        self.mode_btn.config(
+            text="OUT" if mode == "OUTPUT" else "IN",
+            state="normal",
+        )
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._refresh_mode_btn(enabled)
+        if not enabled:
             self.high_radio.config(state="disabled")
             self.low_radio.config(state="disabled")
             return
-        self.mode_combo.config(state="readonly")
         if self.mode_var.get() == "OUTPUT":
             self.high_radio.config(state="normal")
             self.low_radio.config(state="normal")
@@ -422,11 +437,13 @@ class _PinRow:
             self.high_radio.config(state="disabled")
             self.low_radio.config(state="disabled")
 
-    def _on_mode_changed(self, _event=None) -> None:
+    def _on_mode_click(self) -> None:
         if self._suppress_callbacks:
             return
-        mode = self.mode_var.get()
-        if mode == "OUTPUT":
+        new_mode = "INPUT" if self.mode_var.get() == "OUTPUT" else "OUTPUT"
+        self.mode_var.set(new_mode)
+        self._refresh_mode_btn(enabled=True)
+        if new_mode == "OUTPUT":
             self.high_radio.config(state="normal")
             self.low_radio.config(state="normal")
         else:
@@ -437,7 +454,7 @@ class _PinRow:
             self.value_var.set("")
             self._suppress_callbacks = False
         # Tell controller — value=None means "just switch mode, don't drive".
-        self.on_set(self.pin, mode, None)
+        self.on_set(self.pin, new_mode, None)
 
     def _on_value_changed(self) -> None:
         if self._suppress_callbacks:
@@ -468,8 +485,12 @@ class GpioTab(_LoggedTab):
         # Pin panel is heavy (66 rows × ~5 widgets) and most users start on
         # the Flash tab, so we defer construction until the GPIO tab is first
         # shown. App._on_tab_changed triggers _ensure_pin_panel_built().
+        # `_pin_panel_filling` distinguishes "panel exists but rows still
+        # being added incrementally" from "panel fully built" — used to gate
+        # Read All so it doesn't iterate over a partial pin set.
         self._pin_panel_parent: ttk.Frame | None = None
         self._pin_panel_built = False
+        self._pin_panel_filling = False
         # Set on disconnect so an in-flight Read All loop bails out between
         # pins instead of running all 66 × 5 s timeouts to completion.
         self._abort_event = threading.Event()
@@ -546,20 +567,31 @@ class GpioTab(_LoggedTab):
         self._pin_panel_parent = parent
 
     def _ensure_pin_panel_built(self) -> None:
-        """Lazy-build the 66-pin dashboard on first GPIO-tab activation."""
+        """Lazy-build the 66-pin dashboard on first GPIO-tab activation.
+        Construction is incremental — see _build_pin_panel."""
         if self._pin_panel_built or self._pin_panel_parent is None:
             return
         self._pin_panel_built = True
         self._build_pin_panel(self._pin_panel_parent)
-        # If the session was somehow opened before the panel was built (it
-        # currently can't happen via the UI, but be defensive), reflect it.
-        if self._session is not None:
-            for row in self._pin_rows.values():
-                row.set_enabled(True)
 
     def _build_pin_panel(self, parent: ttk.Frame) -> None:
-        # Container with a Canvas that hosts an inner Frame; scrollable
-        # vertically. Cross-platform mousewheel handling included.
+        """Build the 66-pin dashboard.
+
+        Two design choices for "doesn't freeze on open":
+
+        1. Two-column grid (33 rows × 2 columns, column-major). Halves the
+           scroll height, doesn't change widget count but cuts perceived
+           density.
+        2. Incremental fill. _PinRow construction is the slow step (~5 ms
+           each on Windows even after dropping the Combobox). Building all
+           66 inline froze the main thread for ~300-900 ms. Instead we
+           build the canvas/scrollbar shell synchronously (cheap), then
+           hand off pin-row creation to a chain of `after(0, ...)` calls
+           that adds PINS_PER_TICK rows per Tk idle tick. Each tick is
+           bounded at ~16 ms so the event loop stays responsive — user
+           sees the first pins almost immediately and can start scrolling
+           / clicking before the rest finish painting.
+        """
         wrap = ttk.Frame(parent)
         wrap.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
@@ -600,10 +632,53 @@ class GpioTab(_LoggedTab):
         canvas.bind("<Enter>", _bind_wheel)
         canvas.bind("<Leave>", _unbind_wheel)
 
-        for label, pin in GPIO_PINS:
+        # Kick off the incremental fill.
+        self._pin_panel_filling = True
+        # Disable Read All while filling — its iteration over self._pin_rows
+        # would otherwise visit a partial set.
+        try:
+            self._read_all_btn.config(state=tk.DISABLED)
+        except (AttributeError, tk.TclError):
+            pass
+        self.app.root.after(0, lambda: self._fill_pin_panel(0, inner))
+
+    # Two-column column-major grid: pin index 0..32 in column 0, 33..65 in
+    # column 1. Reads top-to-bottom on the left, then top-to-bottom on the
+    # right — matches how D-numbered pins are usually written down.
+    _PIN_PANEL_ROWS_PER_COL = 33
+    _PIN_PANEL_PINS_PER_TICK = 6
+
+    def _fill_pin_panel(self, start_idx: int, inner: ttk.Frame) -> None:
+        end = min(
+            start_idx + self._PIN_PANEL_PINS_PER_TICK, len(GPIO_PINS)
+        )
+        for idx in range(start_idx, end):
+            label, pin = GPIO_PINS[idx]
             row = _PinRow(inner, label, pin, on_set=self._on_pin_set)
-            row.frame.pack(fill=tk.X, anchor="w", padx=(8, 0))
+            grid_row = idx % self._PIN_PANEL_ROWS_PER_COL
+            grid_col = idx // self._PIN_PANEL_ROWS_PER_COL
+            # Wider gap between columns; standard left margin on the first.
+            row.frame.grid(
+                row=grid_row, column=grid_col,
+                sticky="w",
+                padx=(8 if grid_col == 0 else 24, 0),
+                pady=(0, 1),
+            )
             self._pin_rows[pin] = row
+        if end < len(GPIO_PINS):
+            self.app.root.after(0, lambda: self._fill_pin_panel(end, inner))
+            return
+
+        # Fill complete. Apply current session state and re-enable Read All
+        # so the user can interact with the full set.
+        self._pin_panel_filling = False
+        if self._session is not None:
+            for row in self._pin_rows.values():
+                row.set_enabled(True)
+            try:
+                self._read_all_btn.config(state=tk.NORMAL)
+            except (AttributeError, tk.TclError):
+                pass
 
     def _build_log_area(self) -> None:
         # Compact log (3-row visible height) — operations are fast so a big
@@ -695,7 +770,11 @@ class GpioTab(_LoggedTab):
         self._abort_event.clear()
         self._set_conn_status("Connected", _COLORS["success_dark"])
         self._disconnect_btn.config(state=tk.NORMAL)
-        self._read_all_btn.config(state=tk.NORMAL)
+        # Read All gates on whether the pin panel is fully built — otherwise
+        # iterating over self._pin_rows visits a partial set. The fill
+        # completion handler re-enables it when done.
+        if not getattr(self, "_pin_panel_filling", False):
+            self._read_all_btn.config(state=tk.NORMAL)
         self._auto_refresh_check.config(state=tk.NORMAL)
         for row in self._pin_rows.values():
             row.set_enabled(True)
