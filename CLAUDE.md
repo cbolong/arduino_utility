@@ -137,6 +137,7 @@ If wiring changes, only the two arrays move. The bit-banging code indexes throug
 - **RECORD has 4 ISR trampolines, not one.** Don't try to consolidate `recordIsr0..3` into a single `recordIsrCommon(slot)` — `attachInterrupt()` takes a `void(*)(void)`, no userdata, so each pin needs its own thunk. The thunks are a one-line forward and the compiler inlines `recordIsrHandler` in practice.
 - **Mask bit ordering follows the host's `RECORD_START` pin list, not pin numbers.** `pin1` = bit 0, regardless of whether pin1 is D7 or D44. `parse_record_blob(blob, pins)` does the reverse mapping.
 - **`波形錄製` Start button enables on combo selection only.** Adding a pin row via `[+]` doesn't enable Start by itself — the user has to actually pick a pin from the combo. The `<<ComboboxSelected>>` binding in `_add_pin_row` triggers the refresh.
+- **`readSoftwareID()` no longer halts on missing/unrecognised chip.** Previously the sketch halted in `while(1)` so TDBG/GPIO/RECORD couldn't be tested without a flash chip wired. Now it sets `gChipDetected = false` and lets the idle loop come up; `ARDUINO_ERASE_TRIGGER` checks the flag and replies `ARDUINO_ERROR` if FLASH is attempted without a chip. The boot banner `FW: arduino_utility build <date> <time>` (compiler stamp) is the canonical way to verify the running .ino matches the source.
 
 ## CI / release
 

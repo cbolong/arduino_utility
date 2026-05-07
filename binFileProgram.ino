@@ -62,6 +62,11 @@ uint32_t chunkCount = 0;
 unsigned long lastRecvTime = 0;      // last received data time
 bool isTransferring = false;         // is transferring flag
 
+// Chip-detect outcome from readSoftwareID(). When false, FLASH mode is
+// blocked (ARDUINO_ERASE_TRIGGER replies ARDUINO_ERROR) but TDBG / GPIO /
+// RECORD modes work — those don't touch the parallel-flash bus.
+bool gChipDetected = true;
+
 // Timing instrumentation (cumulative, ms). Reset on transfer start.
 unsigned long t_recv_start_ms = 0;   // millis() when strReadyStart was sent
 unsigned long t_program_total_ms = 0;
@@ -124,11 +129,12 @@ void readSoftwareID() {
     Serial.println("SST39LF010/SST39VF010 detected!!");
   }
   else {
-    Serial.println("EEPROM ID ERROR!!");
-    
-    while (!Serial);
-    Serial.println(strError);
-    while (1) {}
+    Serial.println("EEPROM ID ERROR (TDBG/GPIO/RECORD will still work; "
+                   "FLASH mode requires a recognised chip and will reply "
+                   "ARDUINO_ERROR if attempted)");
+    gChipDetected = false;
+    // No more while(1) halt — we drop through and let the idle loop come
+    // up. FLASH mode is gated below by gChipDetected.
   }
 }
 
@@ -761,6 +767,11 @@ void setup() {
   delay(2000);
   Serial.begin(UART_BAUDRATE);
 
+  // Boot banner — surfaces the build timestamp so the host log can
+  // confirm the .ino on the Due actually matches the host expectations.
+  // __DATE__ / __TIME__ are stamped by the compiler at every rebuild.
+  Serial.println("FW: arduino_utility build " __DATE__ " " __TIME__);
+
   Serial.println("Pins initial.");
   // Initial All Pins
   for (int i = 0; i < addrPinsCount; i++) pinMode(addrPins[i], OUTPUT);
@@ -792,6 +803,13 @@ void setup() {
       input.trim();
 
       if (input == strEraseTrigger) {
+        if (!gChipDetected) {
+          // FLASH mode requires a recognised SST chip on the bus.
+          // Refuse the trigger and stay in the idle loop so the user
+          // can still use TDBG / GPIO / RECORD.
+          Serial.println(strError);
+          continue;
+        }
         break;  // 跳出迴圈，繼續往 loop 走
       } else if (input.startsWith("GPIO_SET ")) {
         handleGpioSet(input);
