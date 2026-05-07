@@ -537,6 +537,176 @@ void handleTdbgPlay(const String& cmd) {
 }
 
 
+// ----------------------------------------------------------------------------
+// RECORD (live waveform capture) — interrupt-driven multi-pin recorder. Only
+// active during the pre-erase idle window (same gating as GPIO / TDBG).
+//
+// Wire format:
+//   RECORD_START <pin1> [<pin2> ... up to 4]
+//     -> "RECORD_STARTED"
+//        ... while recording, every ~100 ms:
+//        "RECORD_LIVE <hex_mask>"   (current state of selected pins)
+//   RECORD_STOP
+//     -> "RECORD_STOPPED"
+//     -> "RECORD_DATA <count>"
+//     -> (raw binary: count * 5 bytes — uint32_le delta_us + uint8 mask)
+//     -> "RECORD_DONE <crc16_hex>"  (CRC-16/CCITT-FALSE, same as TDBG)
+//   "RECORD_OVERFLOW" emitted once if the buffer fills (auto-drops further
+//   events but keeps the live heartbeat alive).
+//   "RECORD_ERROR <reason>" on bad-input failure.
+//
+// Mask bit `i` corresponds to position `i` in the host's RECORD_START pin
+// list — not the absolute Due pin number.
+// ----------------------------------------------------------------------------
+
+#define RECORD_MAX_EVENTS         4096
+#define RECORD_EVENT_BYTES        5      // uint32_le delta_us + uint8 mask
+#define RECORD_MAX_PINS           4
+#define RECORD_LIVE_INTERVAL_MS   100
+
+static uint8_t  recordBuf[RECORD_MAX_EVENTS * RECORD_EVENT_BYTES];
+static volatile uint16_t recordEventCount = 0;
+static uint8_t  recordPinList[RECORD_MAX_PINS];
+static uint8_t  recordPinCount = 0;
+static volatile uint8_t  recordCurrentMask = 0;
+static volatile bool     recordActive = false;
+static volatile bool     recordOverflow = false;
+static volatile uint32_t recordPrevCycles = 0;
+static unsigned long     recordLastLiveMs = 0;
+
+// Read all selected pins, return the mask. Called from ISR and from
+// handleRecordStart()'s priming step.
+static inline uint8_t recordSampleMask() {
+  uint8_t m = 0;
+  for (uint8_t i = 0; i < recordPinCount; i++) {
+    if (digitalRead(recordPinList[i])) m |= (uint8_t)(1u << i);
+  }
+  return m;
+}
+
+// Common ISR body — called by the per-pin trampolines. attachInterrupt() can't
+// pass userdata, so we need 4 thin wrappers below.
+static void recordIsrHandler() {
+  if (!recordActive) return;
+  uint32_t now = DWT->CYCCNT;
+  uint8_t mask = recordSampleMask();
+  if (mask == recordCurrentMask) return;       // glitch / re-entry — no edge
+  uint32_t delta_cycles = now - recordPrevCycles;
+  // 84 MHz → divide by 84 for microseconds. Fast enough inside an ISR.
+  uint32_t delta_us = delta_cycles / 84UL;
+  recordPrevCycles = now;
+  recordCurrentMask = mask;
+  if (recordEventCount < RECORD_MAX_EVENTS) {
+    uint8_t* p = recordBuf + (uint32_t)recordEventCount * RECORD_EVENT_BYTES;
+    memcpy(p, &delta_us, sizeof(delta_us));
+    p[4] = mask;
+    recordEventCount++;
+  } else {
+    recordOverflow = true;
+  }
+}
+
+static void recordIsr0() { recordIsrHandler(); }
+static void recordIsr1() { recordIsrHandler(); }
+static void recordIsr2() { recordIsrHandler(); }
+static void recordIsr3() { recordIsrHandler(); }
+static void (* const recordIsrs[RECORD_MAX_PINS])() = {
+  recordIsr0, recordIsr1, recordIsr2, recordIsr3,
+};
+
+void handleRecordStart(const String& cmd) {
+  if (recordActive) {
+    Serial.println("RECORD_ERROR already_active");
+    return;
+  }
+  // Parse pin tokens after the command word.
+  uint8_t pins[RECORD_MAX_PINS];
+  uint8_t n = 0;
+  int p = cmd.indexOf(' ');
+  while (p >= 0 && n < RECORD_MAX_PINS) {
+    int q = cmd.indexOf(' ', p + 1);
+    String tok = (q >= 0) ? cmd.substring(p + 1, q) : cmd.substring(p + 1);
+    tok.trim();
+    if (tok.length() == 0) break;
+    int pin = tok.toInt();
+    if (pin < 0 || pin > 65) {
+      Serial.print("RECORD_ERROR bad_pin ");
+      Serial.println(pin);
+      return;
+    }
+    pins[n++] = (uint8_t)pin;
+    if (q < 0) break;
+    p = q;
+  }
+  if (n == 0) {
+    Serial.println("RECORD_ERROR no_pins");
+    return;
+  }
+
+  for (uint8_t i = 0; i < n; i++) {
+    pinMode(pins[i], INPUT);
+    recordPinList[i] = pins[i];
+  }
+  recordPinCount = n;
+  recordEventCount = 0;
+  recordOverflow = false;
+  tdbgEnableDwt();              // ensure DWT->CYCCNT runs
+  recordCurrentMask = recordSampleMask();
+  recordPrevCycles = DWT->CYCCNT;
+  recordActive = true;
+  for (uint8_t i = 0; i < n; i++) {
+    attachInterrupt(digitalPinToInterrupt(pins[i]), recordIsrs[i], CHANGE);
+  }
+  recordLastLiveMs = millis();
+  Serial.println("RECORD_STARTED");
+}
+
+// Called from the pre-erase idle loop while recordActive. Emits the periodic
+// live-state heartbeat and watches Serial for RECORD_STOP.
+void recordPump() {
+  if (!recordActive) return;
+  unsigned long now = millis();
+  if ((now - recordLastLiveMs) >= RECORD_LIVE_INTERVAL_MS) {
+    recordLastLiveMs = now;
+    char hexbuf[6];
+    snprintf(hexbuf, sizeof(hexbuf), "%02X", (unsigned)recordCurrentMask);
+    Serial.print("RECORD_LIVE ");
+    Serial.println(hexbuf);
+    if (recordOverflow) {
+      Serial.println("RECORD_OVERFLOW");
+      recordOverflow = false;     // emit once per fill
+    }
+  }
+}
+
+void handleRecordStop() {
+  if (!recordActive) {
+    Serial.println("RECORD_ERROR not_active");
+    return;
+  }
+  for (uint8_t i = 0; i < recordPinCount; i++) {
+    detachInterrupt(digitalPinToInterrupt(recordPinList[i]));
+  }
+  recordActive = false;
+  Serial.println("RECORD_STOPPED");
+
+  uint16_t count = recordEventCount;
+  Serial.print("RECORD_DATA ");
+  Serial.println((unsigned)count);
+  if (count > 0) {
+    uint32_t bytes = (uint32_t)count * RECORD_EVENT_BYTES;
+    Serial.write(recordBuf, bytes);
+    uint16_t crc = tdbgCrc16(recordBuf, bytes);
+    char hexbuf[8];
+    snprintf(hexbuf, sizeof(hexbuf), "%04X", (unsigned)crc);
+    Serial.print("RECORD_DONE ");
+    Serial.println(hexbuf);
+  } else {
+    Serial.println("RECORD_DONE 0000");
+  }
+}
+
+
 // IEEE 802.3 CRC32 (poly 0xEDB88320, refin/refout, init/xorout 0xFFFFFFFF).
 // Bitwise form — small code, plenty fast for our 128 KB sweep
 // (~150 ms on Cortex-M3 @ 84 MHz).
@@ -613,6 +783,10 @@ void setup() {
   // command (single-pin set/read). GPIO commands keep the wait open;
   // strEraseTrigger breaks out and proceeds to chip erase + program.
   while (true) {
+    // Record mode keeps a heartbeat going in the background while we
+    // sit here waiting for the next command line.
+    recordPump();
+
     if (Serial.available() > 0) {
       String input = Serial.readStringUntil('\n');
       input.trim();
@@ -627,6 +801,10 @@ void setup() {
         handleTdbgLoad(input);
       } else if (input == "TDBG_PLAY" || input.startsWith("TDBG_PLAY_LOOP ")) {
         handleTdbgPlay(input);
+      } else if (input.startsWith("RECORD_START")) {
+        handleRecordStart(input);
+      } else if (input == "RECORD_STOP") {
+        handleRecordStop();
       }
       // Unknown lines silently ignored.
     }

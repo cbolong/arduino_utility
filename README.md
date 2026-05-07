@@ -245,6 +245,39 @@ CLI 端目前**沒有**對應的 sub-command；要 scripting 或載入任意波�
 
 **GUI 三 tab 的 port 仲裁**：燒錄 / GPIO / TDBG 同時間最多只有一個能持有 serial port。在 TDBG 連線狀態下按 GPIO 的 Connect 會被擋；按 Start Programming 則會自動釋放 GPIO 與 TDBG 後再進入燒錄。
 
+### 波形錄製模式（GUI「波形錄製」tab 用）
+
+跟 GPIO / TDBG 一樣，**只在 MCU 收到 `ARDUINO_ERASE_TRIGGER` 之前可用**。發了 TRIGGER 後失效，要 reset Due 才能再用。
+
+用途：當作小型 logic analyzer。挑 1–4 個 Due GPIO，按開始，Due 用 pin-change interrupt 攔截每個轉態並用 DWT 計時，同時每 100 ms 回報一次當前狀態給 host 顯示 live HIGH / LOW；按結束後回傳整段時序給 host 畫成波形。
+
+| 階段 | 方向 | 訊息 | 意義 |
+|------|------|------|------|
+| 1 | PC → MCU | `RECORD_START <pin1> [<pin2> ...]` | 1–4 個 Due GPIO 編號；順序決定後續 mask 的 bit 位置（`pin1` = bit 0）|
+| 2 | MCU → PC | `RECORD_STARTED` | ISR 已掛上，DWT 已啟動 |
+| 3 | MCU → PC | `RECORD_LIVE <hex_mask>` | 約每 100 ms 一次，當前各 pin HIGH/LOW 的 bitmask |
+| - | MCU → PC | `RECORD_OVERFLOW` | （一次性）buffer 滿了，後續 transition 被丟棄，但 live 心跳繼續 |
+| 4 | PC → MCU | `RECORD_STOP` | 結束錄製 |
+| 5 | MCU → PC | `RECORD_STOPPED` | ISR 已 detach |
+| 6 | MCU → PC | `RECORD_DATA <count>` | 接下來會送 `count × 5 bytes` raw binary |
+| 7 | MCU → PC | （`count × 5` bytes raw）| 每個事件 = `uint32_le delta_us` + `uint8 mask`，bit i = pin list 第 i 個的 HIGH/LOW |
+| 8 | MCU → PC | `RECORD_DONE <crc16_hex>` | Blob 的 CRC-16/CCITT-FALSE，host 比對若不符表示傳輸出錯 |
+| ✗ | MCU → PC | `RECORD_ERROR <reason>` | `bad_pin <n>` / `no_pins` / `already_active` / `not_active` |
+
+時序保證：
+- 中斷驅動（`attachInterrupt CHANGE`），不是 polling — 主迴圈在做別的事也照樣抓到 transition
+- DWT 計數器標記絕對時間，delta 以 µs 為單位記錄
+- ISR 進入延遲 + handler prologue ≈ 300–500 ns（Cortex-M3 @ 84 MHz）
+- 同時發生在多 pin 上的 transition：先觸發的 ISR 進來時讀 PDSR 會看到所有相關 pin 已穩定的 mask，記到同一個 event 內
+
+容量限制：`RECORD_MAX_EVENTS = 4096` events × 5 bytes = 20 KB MCU buffer。對活躍訊號可錄幾十毫秒到數秒，視轉態密度而定。
+
+GUI 操作：在 **波形錄製** tab，按 [Connect] → 每個 row 的 Pin 下拉挑 Due GPIO，按 [+ 加 pin] 增加更多 row（最多 4 個），不要的 row 按 [⊖] 移除 → [開始]。錄製期間每個 pin row 的小圓點會即時變綠（HIGH）/ 灰（LOW）。按 [結束] 後 Due 把整段資料傳回，結束鍵右邊會出現一個小波形圖示 — 點下去開預覽視窗，把所有選的 pin 疊在同一個 X 軸上呈現，長間隔超過 10 ms 會自動分 cluster 顯示（像 TDBG 預覽那樣）。
+
+CLI 端**沒有**對應 sub-command；要 scripting 請直接 `from binFileTransfer_core import RecordSession, parse_record_blob`。
+
+**GUI 四 tab 的 port 仲裁**：燒錄 / GPIO / TDBG / 波形錄製 同時間最多一個持有 serial port。任意 tab Connect 中，其他 tab 的 Connect 會被擋。按 Start Programming 會自動依序釋放所有持有 session 的 tab 再進入燒錄。
+
 對應字串常數：
 - `.ino`：`strEraseReady` / `strEraseTrigger` / `strReadyStart` / `strLineReceivedResponse` / `strVerifyRequest` / `strVerifyOK` / `strTransferDone` / `strTransferCompleted` / `strError`
 - `.py`：`MCU_ERASE_READY` / `MCU_ERASE_TRIGGER` / `MCU_READY_TO_START` / `MCU_RECEIVED_LINE_RESPONSE` / `MCU_VERIFY_REQUEST` / `MCU_VERIFY_OK` / `MCU_TRANSFER_DONE_SIGNAL` / `MCU_TRANSFER_COMPLETED` / `MCU_ERROR`，集中在 `binFileTransfer_core.py`

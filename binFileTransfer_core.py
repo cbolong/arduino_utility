@@ -737,3 +737,275 @@ class TdbgSession:
                 return False
             # Surface anything else as info (debug chatter from MCU).
             self._log(f"MCU: {line}", "info")
+
+
+# ---------------------------------------------------------------------------
+# RECORD (live waveform capture) — multi-pin recorder. Pin states are sampled
+# on the MCU via per-pin CHANGE interrupts; events arrive as
+# (delta_us, mask) pairs. The mask bit `i` is the i-th pin in the host's
+# pin list, NOT the absolute Due pin number.
+# ---------------------------------------------------------------------------
+
+import threading
+
+RECORD_MAX_EVENTS = 4096
+RECORD_MAX_PINS = 4
+RECORD_EVENT_BYTES = 5
+
+MCU_RECORD_STARTED = "RECORD_STARTED"
+MCU_RECORD_LIVE_PREFIX = "RECORD_LIVE"
+MCU_RECORD_OVERFLOW = "RECORD_OVERFLOW"
+MCU_RECORD_STOPPED = "RECORD_STOPPED"
+MCU_RECORD_DATA_PREFIX = "RECORD_DATA"
+MCU_RECORD_DONE_PREFIX = "RECORD_DONE"
+MCU_RECORD_ERROR_PREFIX = "RECORD_ERROR"
+
+
+def parse_record_blob(
+    blob: bytes, pins: list[int]
+) -> list[tuple[int, dict[int, bool]]]:
+    """Decode raw RECORD_DATA bytes → [(delta_us, {pin: bool, ...}), ...].
+
+    `pins` is the ordered list given to RECORD_START — bit i of each event's
+    mask byte corresponds to pins[i]. Mask bit set = HIGH.
+    """
+    if len(blob) % RECORD_EVENT_BYTES != 0:
+        raise ValueError(
+            f"blob length {len(blob)} not a multiple of {RECORD_EVENT_BYTES}"
+        )
+    out: list[tuple[int, dict[int, bool]]] = []
+    import struct as _s
+    for i in range(0, len(blob), RECORD_EVENT_BYTES):
+        delta_us, mask = _s.unpack_from("<IB", blob, i)
+        states = {pin: bool((mask >> bit) & 1) for bit, pin in enumerate(pins)}
+        out.append((delta_us, states))
+    return out
+
+
+class RecordSession:
+    """Persistent recording session — same lifecycle as TdbgSession.
+
+    Workflow:
+        s = RecordSession(log, port=...)
+        s.open()
+        s.start([13, 7], on_live=lambda states: ...)   # callbacks fire on
+                                                        # each RECORD_LIVE
+        # ... wait however long ...
+        pins, events = s.stop()                         # returns capture
+        s.close()
+    """
+
+    def __init__(
+        self,
+        log: LogCallback,
+        *,
+        port: str | None = None,
+        handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+    ) -> None:
+        self._log = log
+        self._port = port
+        self._handshake_timeout_s = handshake_timeout_s
+        self._ser: serial.Serial | None = None
+        self._pins: list[int] = []
+        self._on_live = None
+        self._live_thread: threading.Thread | None = None
+        self._live_stop = threading.Event()
+        # When the live thread sees a non-LIVE/OVERFLOW line (typically the
+        # RECORD_STOPPED / RECORD_DATA / blob that comes back after we send
+        # RECORD_STOP), it parks the line here so stop() can pick up the
+        # exchange without competing for serial bytes.
+        self._stop_handoff: list[str] = []
+        self._stop_handoff_lock = threading.Lock()
+        self._handed_off = threading.Event()
+
+    @property
+    def is_open(self) -> bool:
+        return self._ser is not None
+
+    def open(self) -> bool:
+        if self.is_open:
+            return True
+        ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
+        if ser is None:
+            return False
+        self._ser = ser
+        return True
+
+    def close(self) -> None:
+        # Make sure live thread is wound up first.
+        self._live_stop.set()
+        if self._live_thread is not None:
+            self._live_thread.join(timeout=2.0)
+            self._live_thread = None
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+    def start(self, pins: list[int], on_live=None) -> bool:
+        if not self.is_open:
+            self._log("RECORD session not open.", "err")
+            return False
+        if not pins or len(pins) > RECORD_MAX_PINS:
+            self._log(
+                f"pin count {len(pins)} out of range (1..{RECORD_MAX_PINS})",
+                "err",
+            )
+            return False
+        for p in pins:
+            if not (0 <= p <= 65):
+                self._log(f"bad pin: {p}", "err")
+                return False
+
+        self._pins = list(pins)
+        self._on_live = on_live
+        self._live_stop.clear()
+        self._handed_off.clear()
+        with self._stop_handoff_lock:
+            self._stop_handoff.clear()
+
+        cmd = "RECORD_START " + " ".join(str(p) for p in pins)
+        self._log(f"send: {cmd}", "info")
+        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        reply = _read_line(self._ser, self._log, 5.0)
+        if reply != MCU_RECORD_STARTED:
+            if reply and reply.startswith(MCU_RECORD_ERROR_PREFIX):
+                self._log(f"recv: {reply}", "err")
+            else:
+                self._log(f"recv: {reply or '(no reply)'} (expected RECORD_STARTED)", "err")
+            return False
+        self._log(f"recv: {reply}", "ok")
+
+        # Spin up the live reader.
+        self._live_thread = threading.Thread(
+            target=self._live_loop, name="RecordLive", daemon=True,
+        )
+        self._live_thread.start()
+        return True
+
+    def _live_loop(self) -> None:
+        """Reads serial lines while recording. RECORD_LIVE updates the
+        on_live callback; RECORD_OVERFLOW logs a warning; anything else
+        gets parked for stop() to pick up."""
+        while not self._live_stop.is_set():
+            line = _read_line(self._ser, self._log, 0.25)
+            if line is None:
+                continue
+            if line.startswith(MCU_RECORD_LIVE_PREFIX):
+                # RECORD_LIVE <hex>
+                parts = line.split()
+                if len(parts) >= 2 and self._on_live is not None:
+                    try:
+                        mask = int(parts[1], 16)
+                    except ValueError:
+                        continue
+                    states = {
+                        pin: bool((mask >> bit) & 1)
+                        for bit, pin in enumerate(self._pins)
+                    }
+                    try:
+                        self._on_live(states)
+                    except Exception as e:
+                        self._log(f"on_live callback error: {e}", "warn")
+                continue
+            if line == MCU_RECORD_OVERFLOW:
+                self._log("recv: RECORD_OVERFLOW (event buffer full)", "warn")
+                continue
+            # Any other line — likely the start of the stop-exchange. Park it.
+            with self._stop_handoff_lock:
+                self._stop_handoff.append(line)
+            self._handed_off.set()
+
+    def stop(self) -> tuple[list[int], list[tuple[int, dict[int, bool]]]] | None:
+        """Stop recording, return (pins, events). None on failure."""
+        if not self.is_open:
+            self._log("RECORD session not open.", "err")
+            return None
+        if self._live_thread is None:
+            self._log("RECORD not active.", "err")
+            return None
+
+        self._log("send: RECORD_STOP", "info")
+        self._ser.write(b"RECORD_STOP\n")
+
+        # Wait briefly for the live thread to capture the first non-LIVE line
+        # (typically RECORD_STOPPED). Then drain the rest ourselves.
+        if not self._handed_off.wait(timeout=5.0):
+            self._log("timeout waiting for RECORD_STOPPED", "err")
+            self._live_stop.set()
+            self._live_thread.join(timeout=2.0)
+            self._live_thread = None
+            return None
+        self._live_stop.set()
+        self._live_thread.join(timeout=2.0)
+        self._live_thread = None
+
+        with self._stop_handoff_lock:
+            queued = list(self._stop_handoff)
+            self._stop_handoff.clear()
+
+        # Build a small re-source that yields the queued lines first then
+        # falls back to fresh _read_line calls.
+        def next_line(timeout=10.0) -> str | None:
+            if queued:
+                return queued.pop(0)
+            return _read_line(self._ser, self._log, timeout)
+
+        line = next_line()
+        if line != MCU_RECORD_STOPPED:
+            self._log(f"recv: {line or '(none)'} (expected RECORD_STOPPED)", "err")
+            return None
+        self._log(f"recv: {line}", "ok")
+
+        line = next_line()
+        if line is None or not line.startswith(MCU_RECORD_DATA_PREFIX):
+            self._log(f"recv: {line or '(none)'} (expected RECORD_DATA)", "err")
+            return None
+        try:
+            count = int(line.split()[1])
+        except (IndexError, ValueError):
+            self._log(f"malformed RECORD_DATA: {line!r}", "err")
+            return None
+        self._log(f"recv: {line}", "ok")
+
+        blob = b""
+        if count > 0:
+            expected = count * RECORD_EVENT_BYTES
+            saved_timeout = self._ser.timeout
+            self._ser.timeout = 5.0
+            blob = self._ser.read(expected)
+            self._ser.timeout = saved_timeout
+            if len(blob) != expected:
+                self._log(
+                    f"short blob read: got {len(blob)}/{expected}", "err",
+                )
+                return None
+
+        line = next_line()
+        if line is None or not line.startswith(MCU_RECORD_DONE_PREFIX):
+            self._log(f"recv: {line or '(none)'} (expected RECORD_DONE)", "err")
+            return None
+        try:
+            mcu_crc = int(line.split()[1], 16)
+        except (IndexError, ValueError):
+            self._log(f"malformed RECORD_DONE: {line!r}", "err")
+            return None
+        # Re-use TDBG's CRC-16/CCITT-FALSE.
+        host_crc = tdbg_crc16(blob) if blob else 0
+        if mcu_crc != host_crc:
+            self._log(
+                f"CRC mismatch: host=0x{host_crc:04X} mcu=0x{mcu_crc:04X}",
+                "err",
+            )
+            return None
+        self._log(f"recv: {line} (CRC OK)", "ok")
+
+        try:
+            events = parse_record_blob(blob, self._pins)
+        except ValueError as e:
+            self._log(f"blob decode error: {e}", "err")
+            return None
+        return list(self._pins), events

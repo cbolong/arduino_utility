@@ -1703,6 +1703,695 @@ class TdbgTab(_LoggedTab):
 
 
 # ---------------------------------------------------------------------------
+# 波形錄製 tab — multi-pin live recorder. ISR-driven on the MCU; this side
+# orchestrates the start/stop dance, displays live HIGH/LOW state per pin
+# while recording, and renders the captured timeline in a modal popup.
+# ---------------------------------------------------------------------------
+
+# Pin labels reused from TDBG (D0..D65 with flash-bus annotations).
+
+class _RecordPinRow:
+    """One selectable pin slot in the RecordTab. Holds a combo for the pin
+    number plus a coloured indicator that reflects live state during a
+    recording. Created and destroyed dynamically via the [+] / [⊖] buttons.
+    """
+
+    DOT_HIGH = "#1f7a1f"
+    DOT_LOW = "#666666"
+    DOT_UNKNOWN = "#aaaaaa"
+
+    def __init__(self, parent: ttk.Frame, on_remove, allow_remove: bool) -> None:
+        self.frame = ttk.Frame(parent)
+        self.frame.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(self.frame, text="Pin:").pack(side=tk.LEFT)
+        self.pin_var = tk.StringVar(value="")
+        self.pin_combo = ttk.Combobox(
+            self.frame, textvariable=self.pin_var,
+            values=TDBG_PIN_LABELS, state="readonly", width=14,
+        )
+        self.pin_combo.pack(side=tk.LEFT, padx=(6, 12))
+
+        self.dot = tk.Canvas(
+            self.frame, width=14, height=14,
+            highlightthickness=0, background=self.frame.cget("background"),
+        )
+        self.dot.pack(side=tk.LEFT)
+        self._draw_dot(self.DOT_UNKNOWN)
+        self.state_var = tk.StringVar(value="—")
+        ttk.Label(
+            self.frame, textvariable=self.state_var, width=5, anchor="w",
+        ).pack(side=tk.LEFT, padx=(4, 12))
+
+        self.remove_btn = ttk.Button(
+            self.frame, text="⊖", width=3,
+            command=lambda: on_remove(self),
+        )
+        if allow_remove:
+            self.remove_btn.pack(side=tk.LEFT)
+        else:
+            # Reserve space so layout doesn't shift when more rows are added.
+            self.remove_btn.pack_forget()
+
+    def _draw_dot(self, color: str) -> None:
+        self.dot.delete("all")
+        self.dot.create_oval(2, 2, 12, 12, fill=color, outline="")
+
+    def set_live_state(self, state: bool | None) -> None:
+        if state is None:
+            self._draw_dot(self.DOT_UNKNOWN)
+            self.state_var.set("—")
+        elif state:
+            self._draw_dot(self.DOT_HIGH)
+            self.state_var.set("HIGH")
+        else:
+            self._draw_dot(self.DOT_LOW)
+            self.state_var.set("LOW")
+
+    def selected_pin(self) -> int | None:
+        label = self.pin_var.get()
+        if not label:
+            return None
+        try:
+            return int(label.split(" ", 1)[0].lstrip("D"))
+        except ValueError:
+            return None
+
+    def set_combo_enabled(self, enabled: bool) -> None:
+        self.pin_combo.config(state="readonly" if enabled else "disabled")
+        self.remove_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def show_remove(self, show: bool) -> None:
+        if show:
+            self.remove_btn.pack(side=tk.LEFT)
+        else:
+            self.remove_btn.pack_forget()
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+class RecordTab(_LoggedTab):
+    MAX_PINS = 4
+
+    def __init__(self, parent: ttk.Notebook, app: "App") -> None:
+        self._session = None
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._busy = False
+        self._recording = False
+        # Captured recording — populated when 結束 succeeds.
+        self._recorded_pins: list[int] | None = None
+        self._recorded_events: list | None = None
+        self._preview_window: tk.Toplevel | None = None
+        self._pin_rows: list[_RecordPinRow] = []
+        super().__init__(parent, app)
+        self._worker_thread = threading.Thread(target=self._cmd_loop, daemon=True)
+        self._worker_thread.start()
+
+    def is_busy(self) -> bool:
+        return self._busy
+
+    def submit_work(self, target_callable) -> bool:
+        raise RuntimeError("RecordTab uses _cmd_queue, not submit_work")
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        # Row 1: Connection
+        conn_row = ttk.Frame(parent)
+        conn_row.pack(fill=tk.X)
+        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
+        self._conn_status_var = tk.StringVar(value="Disconnected")
+        self._conn_status_label = ttk.Label(
+            conn_row, textvariable=self._conn_status_var, foreground="#b00020"
+        )
+        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
+        self._connect_btn = ttk.Button(
+            conn_row, text="Connect", command=self._on_connect
+        )
+        self._connect_btn.pack(side=tk.LEFT)
+        self._disconnect_btn = ttk.Button(
+            conn_row, text="Disconnect",
+            command=self._on_disconnect, state=tk.DISABLED,
+        )
+        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Row 2: 開始 / 結束 / (post-stop) waveform thumbnail / Clear Log
+        action_row = ttk.Frame(parent)
+        action_row.pack(fill=tk.X, pady=(8, 0))
+        self._start_btn = ttk.Button(
+            action_row, text="開始", command=self._on_start, state=tk.DISABLED,
+        )
+        self._start_btn.pack(side=tk.LEFT)
+        self._stop_btn = ttk.Button(
+            action_row, text="結束", command=self._on_stop, state=tk.DISABLED,
+        )
+        self._stop_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Thumbnail canvas (only visible after a successful recording).
+        self._preview_canvas = tk.Canvas(
+            action_row, width=20, height=20,
+            background="#1a1a1a", relief="raised", borderwidth=1,
+            highlightthickness=0, cursor="hand2",
+        )
+        # Reserved but not packed yet — we pack it after the first 結束.
+        self._preview_canvas.bind("<Button-1>", self._open_preview)
+        _Tooltip(self._preview_canvas, "顯示波形")
+
+        self._clear_log_btn = ttk.Button(
+            action_row, text="Clear Log", command=self._clear_log
+        )
+        self._clear_log_btn.pack(side=tk.RIGHT)
+
+        # Row 3+: pin list — one row per pin slot. The first row is always
+        # present; [+] adds another up to MAX_PINS.
+        self._pins_frame = ttk.Frame(parent)
+        self._pins_frame.pack(fill=tk.X, pady=(8, 0))
+        self._add_pin_btn = ttk.Button(
+            parent, text="+ 加 pin", command=self._on_add_pin,
+        )
+        self._add_pin_btn.pack(anchor="w", pady=(2, 0))
+
+        # Seed with one pin row.
+        self._add_pin_row(allow_remove=False)
+
+    # ---- queue / worker ---------------------------------------------------
+
+    def _enqueue(self, cmd) -> None:
+        self._cmd_queue.put(cmd)
+
+    def _cmd_loop(self) -> None:
+        while True:
+            cmd = self._cmd_queue.get()
+            if cmd is None:
+                break
+            self._busy = True
+            try:
+                cmd()
+            except Exception as e:
+                self._log_callback_threadsafe(f"RECORD cmd error: {e}", "err")
+            finally:
+                self._busy = False
+
+    # ---- pin row management ----------------------------------------------
+
+    def _add_pin_row(self, allow_remove: bool = True) -> None:
+        row = _RecordPinRow(
+            self._pins_frame,
+            on_remove=self._on_remove_pin,
+            allow_remove=allow_remove,
+        )
+        # When the user picks a pin in this row, we may need to re-enable
+        # the 開始 button.
+        row.pin_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._refresh_start_button(),
+        )
+        self._pin_rows.append(row)
+        self._refresh_pin_buttons()
+        self._refresh_start_button()
+
+    def _on_add_pin(self) -> None:
+        if len(self._pin_rows) >= self.MAX_PINS:
+            return
+        self._add_pin_row(allow_remove=True)
+
+    def _on_remove_pin(self, row: _RecordPinRow) -> None:
+        if len(self._pin_rows) <= 1:
+            return
+        self._pin_rows.remove(row)
+        row.destroy()
+        self._refresh_pin_buttons()
+        self._refresh_start_button()
+
+    def _refresh_pin_buttons(self) -> None:
+        # Hide ⊖ on first row when it's the only one; show on all otherwise.
+        for i, row in enumerate(self._pin_rows):
+            row.show_remove(len(self._pin_rows) > 1)
+        # Disable + at MAX_PINS.
+        if len(self._pin_rows) >= self.MAX_PINS:
+            self._add_pin_btn.config(state=tk.DISABLED)
+        else:
+            self._add_pin_btn.config(state=tk.NORMAL)
+
+    # ---- connection -------------------------------------------------------
+
+    def is_connected(self) -> bool:
+        return self._session is not None
+
+    def _set_conn_status(self, text: str, color: str) -> None:
+        self._conn_status_var.set(text)
+        self._conn_status_label.config(foreground=color)
+
+    def _on_connect(self) -> None:
+        if self._session is not None:
+            return
+        if self.app.any_other_tab_holding_port(self):
+            messagebox.showinfo(
+                "Busy",
+                "Another tab is holding the serial port. Disconnect it first.",
+            )
+            return
+        if self.app.any_tab_busy():
+            messagebox.showinfo(
+                "Busy",
+                "Another tab has an operation in progress. Please wait.",
+            )
+            return
+        port = self.app.get_port()
+        self._set_conn_status("Connecting...", "#a06400")
+        self._connect_btn.config(state=tk.DISABLED)
+        self.app.lock_port_entry()
+        self.app.set_status("RECORD connecting...", "#a06400")
+
+        def cmd():
+            from binFileTransfer_core import RecordSession
+            session = RecordSession(self._log_callback_threadsafe, port=port)
+            success = session.open()
+            self.app.root.after(
+                0,
+                lambda: self._on_connect_done(session if success else None),
+            )
+
+        self._enqueue(cmd)
+
+    def _on_connect_done(self, session) -> None:
+        if session is None:
+            self._set_conn_status("Disconnected", "#b00020")
+            self._connect_btn.config(state=tk.NORMAL)
+            self.app.unlock_port_entry()
+            self.app.set_status("RECORD connect failed", "#b00020")
+            return
+        self._session = session
+        self._set_conn_status("Connected", "#1f7a1f")
+        self._disconnect_btn.config(state=tk.NORMAL)
+        self._refresh_start_button()
+        self.app.set_status("RECORD Connected", "#1f7a1f")
+
+    def _on_disconnect(self) -> None:
+        if self._session is None:
+            return
+        self._begin_disconnect()
+        self._enqueue(self._do_close_session)
+
+    def _begin_disconnect(self) -> None:
+        self._disconnect_btn.config(state=tk.DISABLED)
+        self._start_btn.config(state=tk.DISABLED)
+        self._stop_btn.config(state=tk.DISABLED)
+        self._set_conn_status("Disconnecting...", "#a06400")
+
+    def _do_close_session(self) -> None:
+        if self._session is not None:
+            self._session.close()
+        self.app.root.after(0, self._on_disconnect_done)
+
+    def _on_disconnect_done(self) -> None:
+        self._session = None
+        self._recording = False
+        self._set_conn_status("Disconnected", "#b00020")
+        self._connect_btn.config(state=tk.NORMAL)
+        for row in self._pin_rows:
+            row.set_live_state(None)
+        self._refresh_start_button()
+        self.app.unlock_port_entry()
+        self.app.set_status("RECORD Disconnected", "#666666")
+
+    def disconnect_for_other(self, on_done) -> None:
+        if self._session is None:
+            on_done()
+            return
+        self._begin_disconnect()
+
+        def cmd():
+            self._do_close_session()
+            self.app.root.after(0, on_done)
+
+        self._enqueue(cmd)
+
+    # ---- start / stop -----------------------------------------------------
+
+    def _refresh_start_button(self) -> None:
+        ready = (
+            self._session is not None
+            and not self._recording
+            and any(r.selected_pin() is not None for r in self._pin_rows)
+        )
+        self._start_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+
+    def _on_start(self) -> None:
+        if self._session is None or self._recording:
+            return
+        # Collect unique selected pins from rows in order.
+        pins: list[int] = []
+        seen: set[int] = set()
+        for row in self._pin_rows:
+            p = row.selected_pin()
+            if p is None:
+                continue
+            if p in seen:
+                continue
+            pins.append(p)
+            seen.add(p)
+        if not pins:
+            messagebox.showinfo("Pin", "Pick at least one pin first.")
+            return
+        if len(pins) > self.MAX_PINS:
+            messagebox.showinfo("Pin", f"Max {self.MAX_PINS} pins.")
+            return
+
+        # Lock the UI for recording.
+        self._recording = True
+        self._start_btn.config(state=tk.DISABLED)
+        self._stop_btn.config(state=tk.NORMAL)
+        self._disconnect_btn.config(state=tk.DISABLED)
+        for row in self._pin_rows:
+            row.set_combo_enabled(False)
+            row.set_live_state(None)
+        self._add_pin_btn.config(state=tk.DISABLED)
+        # Clear stale recording / hide thumbnail.
+        self._recorded_pins = None
+        self._recorded_events = None
+        try:
+            self._preview_canvas.pack_forget()
+        except Exception:
+            pass
+        self.app.set_status("RECORD recording...", "#a06400")
+
+        # Build a row→pin mapping for live-callback dispatch.
+        pin_to_row = {row.selected_pin(): row for row in self._pin_rows
+                      if row.selected_pin() is not None}
+
+        def on_live(states: dict[int, bool]) -> None:
+            # Called from the RecordSession's live thread — marshal to Tk.
+            def apply():
+                for pin, state in states.items():
+                    row = pin_to_row.get(pin)
+                    if row is not None:
+                        row.set_live_state(state)
+            try:
+                self.app.root.after(0, apply)
+            except Exception:
+                pass
+
+        def cmd():
+            sess = self._session
+            if sess is None:
+                return
+            ok = sess.start(pins, on_live=on_live)
+            if not ok:
+                self.app.root.after(0, lambda: self._on_recording_failed())
+
+        self._enqueue(cmd)
+
+    def _on_recording_failed(self) -> None:
+        self._recording = False
+        self._stop_btn.config(state=tk.DISABLED)
+        for row in self._pin_rows:
+            row.set_combo_enabled(True)
+        self._add_pin_btn.config(
+            state=tk.NORMAL if len(self._pin_rows) < self.MAX_PINS else tk.DISABLED
+        )
+        if self._session is not None:
+            self._disconnect_btn.config(state=tk.NORMAL)
+        self._refresh_start_button()
+        self.app.set_status("RECORD start failed", "#b00020")
+
+    def _on_stop(self) -> None:
+        if not self._recording:
+            return
+        self._stop_btn.config(state=tk.DISABLED)
+        self.app.set_status("RECORD stopping...", "#a06400")
+
+        def cmd():
+            sess = self._session
+            if sess is None:
+                return
+            result = sess.stop()
+            self.app.root.after(0, lambda: self._on_stop_done(result))
+
+        self._enqueue(cmd)
+
+    def _on_stop_done(self, result) -> None:
+        self._recording = False
+        for row in self._pin_rows:
+            row.set_combo_enabled(True)
+        self._add_pin_btn.config(
+            state=tk.NORMAL if len(self._pin_rows) < self.MAX_PINS else tk.DISABLED
+        )
+        if self._session is not None:
+            self._disconnect_btn.config(state=tk.NORMAL)
+        self._refresh_start_button()
+
+        if result is None:
+            self.app.set_status("RECORD stop error", "#b00020")
+            return
+        pins, events = result
+        self._recorded_pins = pins
+        self._recorded_events = events
+        # Reveal the thumbnail next to 結束.
+        self._draw_thumbnail()
+        try:
+            # Pack between 結束 and Clear Log — we kept Clear Log on RIGHT.
+            self._preview_canvas.pack(
+                side=tk.LEFT, padx=(8, 0), in_=self._stop_btn.master,
+                after=self._stop_btn,
+            )
+        except tk.TclError:
+            self._preview_canvas.pack(side=tk.LEFT, padx=(8, 0))
+        if events:
+            total_us = sum(d for d, _ in events)
+            self.app.set_status(
+                f"RECORD done: {len(events)} edges, {total_us / 1000:.3f} ms",
+                "#1f7a1f",
+            )
+        else:
+            self.app.set_status("RECORD done: no edges captured", "#a06400")
+
+    # ---- thumbnail + preview popup ---------------------------------------
+
+    def _draw_thumbnail(self) -> None:
+        canvas = self._preview_canvas
+        canvas.delete("all")
+        events = self._recorded_events or []
+        pins = self._recorded_pins or []
+        if not events or not pins:
+            canvas.create_text(
+                10, 10, text="—", fill="#888888",
+                font=("TkDefaultFont", 10, "bold"),
+            )
+            return
+        # Compress the first ~6 transitions of the first pin onto 20x20.
+        n_show = min(6, len(events))
+        sub = events[:n_show]
+        target_pin = pins[0]
+        margin_x = 2
+        margin_y = 2
+        w = 20
+        h = 20
+        usable_w = w - 2 * margin_x
+        y_high = margin_y
+        y_low = h - margin_y - 1
+
+        step = usable_w / max(1, n_show)
+        x = margin_x
+        prev_state = sub[0][1].get(target_pin, False)
+        prev_y = y_high if prev_state else y_low
+
+        for i, (_, states) in enumerate(sub):
+            new_state = states.get(target_pin, prev_state)
+            new_x = margin_x + (i + 1) * step
+            new_y = y_high if new_state else y_low
+            canvas.create_line(x, prev_y, new_x, prev_y, fill="#ff9933", width=1)
+            canvas.create_line(new_x, prev_y, new_x, new_y, fill="#ff9933", width=1)
+            x = new_x
+            prev_y = new_y
+
+    def _open_preview(self, _event=None) -> None:
+        if self._recorded_events is None or self._recorded_pins is None:
+            return
+        if self._preview_window is not None and self._preview_window.winfo_exists():
+            self._preview_window.lift()
+            return
+
+        from binFileTransfer_core import DUE_CPU_HZ  # noqa: F401  (kept for parity)
+        events = self._recorded_events
+        pins = self._recorded_pins
+        total_us = sum(d for d, _ in events)
+
+        win = tk.Toplevel(self.app.root)
+        win.title("波形錄製 — Captured Waveform")
+        win.geometry("1100x460")
+        win.transient(self.app.root)
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_preview())
+        self._preview_window = win
+
+        pin_list = ", ".join(f"D{p}" for p in pins)
+        summary = (
+            f"{len(events)} edges · "
+            f"total {_format_duration_ns(total_us * 1000.0)} · "
+            f"{len(pins)} pins ({pin_list})"
+        )
+        ttk.Label(win, text=summary, padding=(10, 8)).pack(fill=tk.X)
+
+        # Split into clusters at gaps ≥10 ms (10_000 µs). Same idea as TDBG.
+        clusters = self._split_record_into_clusters(events, gap_us=10_000)
+        if len(clusters) == 1:
+            holder = ttk.Frame(win)
+            holder.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+            self._build_record_canvas(holder, pins, clusters[0])
+        else:
+            nb = ttk.Notebook(win)
+            nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+            for idx, c_events in enumerate(clusters):
+                frame = ttk.Frame(nb)
+                c_total = sum(d for d, _ in c_events)
+                nb.add(
+                    frame,
+                    text=f"Cluster {idx + 1} "
+                         f"({len(c_events)} edges, "
+                         f"{_format_duration_ns(c_total * 1000.0)})",
+                )
+                self._build_record_canvas(frame, pins, c_events)
+
+        ttk.Button(
+            win, text="Close", command=self._close_preview
+        ).pack(pady=(0, 8))
+
+    def _close_preview(self) -> None:
+        win = self._preview_window
+        self._preview_window = None
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _split_record_into_clusters(events, gap_us: int = 10_000):
+        """Split recording events into clusters at long-gap boundaries.
+
+        Each event is (delta_us, {pin: bool}). Returns list of cluster
+        event-lists, where the first event of each cluster has its delta
+        reset to 0 so per-cluster timelines start at t=0.
+        """
+        clusters = []
+        current = []
+        for delta, states in events:
+            if current and delta > gap_us:
+                clusters.append(current)
+                current = [(0, states)]
+            else:
+                current.append((delta, states))
+        if current:
+            clusters.append(current)
+        return clusters or [[]]
+
+    def _build_record_canvas(
+        self, parent: ttk.Frame, pins: list[int], events: list,
+    ) -> None:
+        """Draw stacked per-pin waveforms on a horizontally-scrollable canvas."""
+        # Geometry
+        PIX_PER_US = 0.5             # 1 µs = 0.5 px → 200 µs / 100 px
+        ROW_HEIGHT = 60              # vertical span per pin
+        ROW_PAD_TOP = 16
+        Y_OFFSET = 30
+        LEFT_PAD = 60
+        RIGHT_PAD = 30
+        LABEL_Y_OFFSET = -16
+
+        cum = [0]
+        for delta, _ in events:
+            cum.append(cum[-1] + delta)
+        total_us = cum[-1] if events else 0
+        canvas_w = max(800, int(LEFT_PAD + total_us * PIX_PER_US + RIGHT_PAD))
+        canvas_h = Y_OFFSET + len(pins) * ROW_HEIGHT + 30
+
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        canvas = tk.Canvas(
+            wrap, height=canvas_h, background="#1a1a1a",
+            scrollregion=(0, 0, canvas_w, canvas_h),
+            highlightthickness=0,
+        )
+        hsb = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(xscrollcommand=hsb.set)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        def _on_wheel(event):
+            canvas.xview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        # Draw each pin as a stacked row.
+        for row_idx, pin in enumerate(pins):
+            y_high = Y_OFFSET + row_idx * ROW_HEIGHT + ROW_PAD_TOP
+            y_low = Y_OFFSET + row_idx * ROW_HEIGHT + ROW_HEIGHT - 8
+            canvas.create_text(
+                LEFT_PAD - 6, (y_high + y_low) // 2,
+                text=f"D{pin}", fill="#dddddd",
+                anchor="e", font=("Consolas", 10, "bold"),
+            )
+            # Initial state: from event 0 (which is the first "transition"
+            # at t=0 — the first sampled state).
+            if not events:
+                continue
+            state = events[0][1].get(pin, False)
+            prev_x = LEFT_PAD
+            prev_y = y_high if state else y_low
+
+            for i, (delta, states) in enumerate(events):
+                new_state = states.get(pin, state)
+                x = LEFT_PAD + cum[i + 1] * PIX_PER_US
+                if x > prev_x:
+                    canvas.create_line(
+                        prev_x, prev_y, x, prev_y, fill="#ff9933", width=2,
+                    )
+                    seg_us = cum[i + 1] - cum[i]
+                    if seg_us > 0 and (x - prev_x) >= 16 and row_idx == 0:
+                        # Pulse-width labels on the top row only — multi-row
+                        # gets cluttered fast.
+                        canvas.create_text(
+                            (prev_x + x) / 2, y_high + LABEL_Y_OFFSET,
+                            text=_format_duration_ns(seg_us * 1000.0),
+                            fill="#ffe680", font=("Consolas", 8),
+                        )
+                new_y = y_high if new_state else y_low
+                if new_y != prev_y:
+                    canvas.create_line(
+                        x, prev_y, x, new_y, fill="#ff9933", width=2,
+                    )
+                prev_x, prev_y = x, new_y
+                state = new_state
+
+            # Tail run.
+            tail_x = canvas_w - RIGHT_PAD
+            if prev_x < tail_x:
+                canvas.create_line(
+                    prev_x, prev_y, tail_x, prev_y, fill="#ff9933", width=2,
+                )
+
+        # Bottom time axis.
+        axis_y = canvas_h - 14
+        if total_us > 0:
+            tick_step_us = 50.0 if total_us < 2000 else 200.0
+            n_ticks = int(total_us / tick_step_us) + 1
+            for k in range(n_ticks + 1):
+                t_us = k * tick_step_us
+                tx = LEFT_PAD + t_us * PIX_PER_US
+                canvas.create_line(tx, axis_y - 4, tx, axis_y, fill="#666666")
+                canvas.create_text(
+                    tx, axis_y + 6,
+                    text=_format_duration_ns(t_us * 1000.0),
+                    fill="#888888", font=("Consolas", 8),
+                )
+
+
+# ---------------------------------------------------------------------------
 # App: top-level container with shared port entry, notebook, status bar.
 # ---------------------------------------------------------------------------
 class App:
@@ -1744,18 +2433,40 @@ class App:
         # Initial scan happens after notebook is built so any error logs
         # have somewhere to go (we keep this simple and silent for now).
 
-        # Notebook with two tabs
+        # Notebook style — bold + blue background on the selected tab so
+        # it's obvious which tab is active. Default Vista theme makes the
+        # active vs inactive tabs nearly indistinguishable; switching to
+        # 'clam' lets us actually customise the background colour (the
+        # native themes often ignore style.map(background=...) on tabs).
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "TNotebook.Tab",
+            padding=[14, 8],
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#1f6fb2"), ("active", "#d4e6f5")],
+            foreground=[("selected", "#ffffff"), ("active", "#1a1a1a")],
+        )
+
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 0))
 
         self.flash_tab = FlashTab(self.notebook, self)
         self.gpio_tab = GpioTab(self.notebook, self)
         self.tdbg_tab = TdbgTab(self.notebook, self)
+        self.record_tab = RecordTab(self.notebook, self)
         self.notebook.add(self.flash_tab.frame, text="燒錄 ROM")
         self.notebook.add(self.gpio_tab.frame, text="GPIO 設定")
         self.notebook.add(self.tdbg_tab.frame, text="TDBG")
+        self.notebook.add(self.record_tab.frame, text="波形錄製")
         self.notebook.select(self.flash_tab.frame)  # default tab
-        self.tabs.extend([self.flash_tab, self.gpio_tab, self.tdbg_tab])
+        self.tabs.extend([self.flash_tab, self.gpio_tab, self.tdbg_tab, self.record_tab])
         # Defer GPIO pin panel construction until that tab is first shown.
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -1851,6 +2562,8 @@ class App:
             return
         if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
             return
+        if hasattr(self, "record_tab") and self.record_tab.is_connected():
+            return
         try:
             self.port_refresh_btn.config(state=tk.NORMAL)
         except tk.TclError:
@@ -1862,13 +2575,15 @@ class App:
 
     def unlock_port_entry(self) -> None:
         # Stay locked if another tab is busy OR if any persistent-session
-        # tab (GPIO / TDBG) is still holding the serial connection open
-        # (would conflict with any other use until disconnected).
+        # tab (GPIO / TDBG / RECORD) is still holding the serial connection
+        # open (would conflict with any other use until disconnected).
         if self.any_tab_busy():
             return
         if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
             return
         if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
+            return
+        if hasattr(self, "record_tab") and self.record_tab.is_connected():
             return
         self.port_combo.config(state="readonly")
         self.port_refresh_btn.config(state=tk.NORMAL)
@@ -1882,16 +2597,19 @@ class App:
 
     def any_other_tab_holding_port(self, requesting_tab: "_LoggedTab") -> bool:
         """True if another tab currently has the serial port open. Used by
-        GpioTab / TdbgTab connect to refuse if a sibling already holds it."""
+        GpioTab / TdbgTab / RecordTab connect to refuse if a sibling already
+        holds it."""
         if requesting_tab is not self.gpio_tab and self.gpio_tab.is_connected():
             return True
         if requesting_tab is not self.tdbg_tab and self.tdbg_tab.is_connected():
             return True
+        if requesting_tab is not self.record_tab and self.record_tab.is_connected():
+            return True
         return False
 
     def release_port_then(self, except_tab, on_done) -> None:
-        """Sequentially close any persistent-session tab (GPIO, TDBG) that
-        currently holds the port, then invoke on_done() on the Tk thread.
+        """Sequentially close any persistent-session tab (GPIO, TDBG, RECORD)
+        that currently holds the port, then invoke on_done() on the Tk thread.
         FlashTab uses this before starting a flash flow."""
         # Build a chain of releases that ends with on_done().
         steps = []
@@ -1899,6 +2617,8 @@ class App:
             steps.append(self.gpio_tab.disconnect_for_other)
         if except_tab is not self.tdbg_tab and self.tdbg_tab.is_connected():
             steps.append(self.tdbg_tab.disconnect_for_other)
+        if except_tab is not self.record_tab and self.record_tab.is_connected():
+            steps.append(self.record_tab.disconnect_for_other)
 
         def chain(idx: int):
             if idx >= len(steps):
@@ -1935,6 +2655,11 @@ class App:
         if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
             try:
                 self.tdbg_tab._do_close_session()
+            except Exception:
+                pass
+        if hasattr(self, "record_tab") and self.record_tab.is_connected():
+            try:
+                self.record_tab._do_close_session()
             except Exception:
                 pass
         self.root.destroy()

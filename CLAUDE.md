@@ -10,10 +10,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A utility that programs SST39xF010-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet is in `spec/`.
 
-- `binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol for wiring verification, and a TDBG waveform-replay protocol that loads a captured pattern into RAM and plays it on a chosen pin via DWT cycle-counter timing.
-- `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, `GpioSession`, `TdbgSession`, and `parse_acute_txt` live here. The two front-ends are thin shells.
-- `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`). No TDBG sub-command yet; `TdbgSession` is library-only.
-- `binFileTransferGui.py` — Tkinter GUI front-end. Three tabs: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker, persistent connection), and `TDBG` (waveform replay).
+- `binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol, a TDBG waveform-replay protocol (load captured pattern into RAM, play on a chosen pin via DWT timing), and a RECORD live-capture protocol (interrupt-driven multi-pin recorder, 1–4 pins, 4096 events × 5 bytes RAM).
+- `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, `GpioSession`, `TdbgSession`, `RecordSession`, `parse_acute_txt`, `parse_record_blob` live here. The two front-ends are thin shells.
+- `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`). No TDBG/RECORD sub-commands yet; `TdbgSession` / `RecordSession` are library-only.
+- `binFileTransferGui.py` — Tkinter GUI front-end. Four tabs: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker, persistent connection), `TDBG` (waveform replay), and `波形錄製` (live multi-pin recorder). Custom `ttk.Style` on TNotebook (theme = clam, bold + blue selected tab) so the active tab is visible at a glance.
 
 `README.md` is the authoritative end-user doc (Chinese). When a question is about *user-facing behaviour* — wiring tables, CLI flags, troubleshooting — read it. When it's about *internal coupling* between the sketch and host, this file is faster.
 
@@ -37,7 +37,7 @@ There is no test suite. Verification is hardware-in-the-loop: flash a known `fir
 
 ## Architecture: protocol coupling
 
-`binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **three** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
+`binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **four** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG, RECORD). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
 
 ### Flash flow (8 strings, primary path)
 
@@ -77,6 +77,23 @@ Playback engine sits in `tdbgPlayOnce()`. Three implementation details that look
 
 Buffer is `TDBG_MAX_EVENTS × 5 = 20480 bytes` of static RAM. `Serial.setTimeout(5000)` is bumped during the load read because 20 KB at 115200 baud takes ~1.7 s — exceeds the default 1 s and would otherwise short-read.
 
+### RECORD flow (used by `波形錄製` tab and `core.RecordSession`)
+
+Same gating as GPIO/TDBG — only between `ARDUINO_ERASE_READY` and `ARDUINO_ERASE_TRIGGER`. Wire format:
+
+- `RECORD_START <pin1> [<pin2> ...]` (1..4 pins) → MCU `attachInterrupt(CHANGE)` on each pin → `RECORD_STARTED`
+- During recording: every ~100 ms MCU emits `RECORD_LIVE <hex_mask>` from the idle-loop's `recordPump()`. ISRs append `(delta_µs, mask)` to `recordBuf` (`RECORD_MAX_EVENTS × 5 = 20 KB`). Buffer-full → `RECORD_OVERFLOW` (one shot, ISR keeps live going but stops accumulating).
+- `RECORD_STOP` → MCU detaches all interrupts, emits `RECORD_STOPPED`, then `RECORD_DATA <count>`, then writes the raw blob, then `RECORD_DONE <crc16_hex>` (CRC-16/CCITT-FALSE, reuses `tdbgCrc16`).
+
+Mask bit `i` = host's pin-list position `i`, **not** the absolute Due pin number. Host's `parse_record_blob(blob, pins)` reverses the mapping into `[(delta_us, {pin: bool}), ...]`.
+
+`RecordSession.start()` spawns a daemon `_live_loop` thread that reads serial lines while recording — RECORD_LIVE messages dispatch into the host's `on_live` callback, anything else (i.e. the start of the stop-exchange) gets parked into `_stop_handoff` for `stop()` to drain.
+
+Implementation details that look like they could be simplified but can't:
+1. **Four ISR trampolines** `recordIsr0..3` each calling a common `recordIsrHandler()`. `attachInterrupt()` doesn't accept userdata, so we can't share a single handler across pins; consolidating with a `digitalPinToInterrupt` lookup in the body would add function-pointer-table latency in the ISR.
+2. **`recordCurrentMask` and `recordPrevCycles` are `volatile`** — they cross the ISR/loop boundary. Reads from `recordPump` are racy against ISR writes but the values are single bytes / 32-bit aligned words so torn reads aren't possible on Cortex-M3.
+3. **Same `tdbgCrc16` reused for the blob.** No need for a separate CRC implementation — the polynomial choice is documented once and validated by the host's import-time self-test.
+
 ### Constants that must stay in sync
 
 | Constant | `.ino` | `binFileTransfer_core.py` |
@@ -89,7 +106,11 @@ Buffer is `TDBG_MAX_EVENTS × 5 = 20480 bytes` of static RAM. `Serial.setTimeout
 | TDBG strings | inline literals in `handleTdbgLoad/Play` | `MCU_TDBG_*` constants in `TdbgSession` |
 | TDBG buffer cap | `TDBG_MAX_EVENTS` (4096) | `TDBG_MAX_EVENTS` |
 | TDBG event format | `tdbgBuf` packs `uint32_le delta + uint8 state` | `tdbg_pack_events()` uses `struct.pack('<IB', ...)` |
-| CRC poly for TDBG | `tdbgCrc16` (CCITT-FALSE) | `tdbg_crc16` (asserted on import) |
+| CRC poly for TDBG/RECORD | `tdbgCrc16` (CCITT-FALSE) — reused by RECORD blob | `tdbg_crc16` (asserted on import) — reused by RECORD |
+| RECORD strings | inline literals in `handleRecordStart/Stop` / `recordPump` | `MCU_RECORD_*` constants in `RecordSession` |
+| RECORD buffer cap | `RECORD_MAX_EVENTS` (4096) | `RECORD_MAX_EVENTS` |
+| RECORD event format | `recordBuf` packs `uint32_le delta_us + uint8 mask` | `parse_record_blob()` uses `struct.unpack_from('<IB', ...)` |
+| RECORD pin cap | `RECORD_MAX_PINS` (4) | `RECORD_MAX_PINS` |
 
 If you change a string, grep both files. The CLI sets `FILE_NAME = "firmware.bin"` as the only host-side default the core itself doesn't know.
 
@@ -113,6 +134,9 @@ If wiring changes, only the two arrays move. The bit-banging code indexes throug
 - **TDBG `noInterrupts()` masks per event, not the whole playback.** Looks aggressive but is necessary so STOP is reachable mid-loop. See "TDBG flow" above for the three reasons the inner loop is shaped this way.
 - **TDBG_LOAD takes `initial_state` as a separate arg, not implicit from event 0.** The captured trace's first row is the pre-trigger sample (often equal to event 0's state, but not always — if the trace starts mid-level, the first event has the same state as initial, intentionally producing a no-op transition that establishes timing anchor without an edge).
 - **Pin selection in the TDBG tab has no default.** User must pick each session — flash-bus pins are annotated `(WE#)` / `(A0)` / `(DQ3)` etc. but not blocked. Driving a flash-bus pin via TDBG corrupts the bus, same caveat as GPIO mode.
+- **RECORD has 4 ISR trampolines, not one.** Don't try to consolidate `recordIsr0..3` into a single `recordIsrCommon(slot)` — `attachInterrupt()` takes a `void(*)(void)`, no userdata, so each pin needs its own thunk. The thunks are a one-line forward and the compiler inlines `recordIsrHandler` in practice.
+- **Mask bit ordering follows the host's `RECORD_START` pin list, not pin numbers.** `pin1` = bit 0, regardless of whether pin1 is D7 or D44. `parse_record_blob(blob, pins)` does the reverse mapping.
+- **`波形錄製` Start button enables on combo selection only.** Adding a pin row via `[+]` doesn't enable Start by itself — the user has to actually pick a pin from the combo. The `<<ComboboxSelected>>` binding in `_add_pin_row` triggers the refresh.
 
 ## CI / release
 
