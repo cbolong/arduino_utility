@@ -13,7 +13,7 @@ A utility that programs SST39xF010-family parallel NOR flash chips using an **Ar
 - `binFileProgram/binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol, a TDBG waveform-replay protocol (load captured pattern into RAM, play on a chosen pin via DWT timing), and a RECORD live-capture protocol (interrupt-driven multi-pin recorder, 1–4 pins, 4096 events × 5 bytes RAM).
 - `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, `GpioSession`, `TdbgSession`, `RecordSession`, `parse_acute_txt`, `parse_record_blob` live here. The two front-ends are thin shells.
 - `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`). No TDBG/RECORD sub-commands yet; `TdbgSession` / `RecordSession` are library-only.
-- `binFileTransferGui.py` — Tkinter GUI front-end. Four tabs: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker, persistent connection), `TDBG` (waveform replay), and `波形錄製` (live multi-pin recorder). Custom `ttk.Style` on TNotebook (theme = clam, bold + blue selected tab) so the active tab is visible at a glance.
+- `binFileTransferGui.py` — Tkinter GUI front-end. Four tabs: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker, persistent connection), `TDBG` (waveform replay), and `波形錄製` (live multi-pin recorder). Mac-inspired `ttk.Style` on TNotebook (theme=clam; selected tab = white bg + Mac blue accent text + 11pt bold; unselected 10pt). All status colours come from a single `_COLORS` palette dict near the top of the GUI module — `*_dark` variants for ≥4.5:1 WCAG AA contrast on white, bright variants for indicators on dark canvases.
 
 `README.md` is the authoritative end-user doc (Chinese). When a question is about *user-facing behaviour* — wiring tables, CLI flags, troubleshooting — read it. When it's about *internal coupling* between the sketch and host, this file is faster.
 
@@ -33,7 +33,17 @@ python binFileTransferGui.py
 
 The sketch is uploaded with the Arduino IDE: board **Arduino Due (Programming Port)** — auto-detection only matches the programming port, not the native USB port.
 
-There is no test suite. Verification is hardware-in-the-loop: flash a known `firmware.bin`, watch the CRC32 match.
+There is no test suite. Verification is hardware-in-the-loop: flash a known `firmware.bin`, watch the CRC32 match. The TDBG path has one extra self-test affordance — see the calibration pattern note at the end of "TDBG flow".
+
+## Host-side concurrency
+
+Each connectable tab (GPIO / TDBG / RECORD) owns one daemon worker thread that drains a per-tab `_cmd_queue`. UI thread enqueues lambdas; worker runs them and marshals UI updates back via `root.after(0, ...)`. The shared rule: **never call into Tk widgets from a worker thread directly.**
+
+`RecordSession` adds a second daemon thread `_live_loop` that reads serial during recording. After the user clicks 結束:
+1. `_live_loop` reads the first non-`RECORD_LIVE` line (typically `RECORD_STOPPED`), parks it in `_stop_handoff`, and **exits** — this is critical, because the binary blob that follows must not be split between two threads' `ser.readline()` calls. (The blob can contain `0x0A` bytes; if `_live_loop` were still polling it would consume them as fake newlines, and the host would see truncated `ORD_DONE` instead of `RECORD_DONE`.)
+2. Main thread's `RecordSession.stop()` reads the parked line, then `RECORD_DATA <count>`, then `ser.read(count*5)` raw bytes, then `RECORD_DONE <crc16>`.
+
+Forced shutdown (Disconnect mid-recording) goes through `_live_stop.set()` + `join()`; the `while not _live_stop.is_set()` check at the top of `_live_loop` honours that path.
 
 ## Architecture: protocol coupling
 
@@ -41,7 +51,7 @@ There is no test suite. Verification is hardware-in-the-loop: flash a known `fir
 
 ### Flash flow (8 strings, primary path)
 
-1. Sketch boots → reads SST software ID (vendor `0xBF`, device `0xB5` SF010 / `0xD5` LF010 — anything else halts in `while(1)`) → emits `ARDUINO_ERASE_READY`.
+1. Sketch boots → reads SST software ID (vendor `0xBF`, device `0xB5` SF010 / `0xD5` LF010). On match: emits `ARDUINO_ERASE_READY`. On mismatch: sets `gChipDetected=false` but still emits `ARDUINO_ERASE_READY` so GPIO/TDBG/RECORD remain testable without a chip wired; only `ARDUINO_ERASE_TRIGGER` checks the flag and rejects with `ARDUINO_ERROR` (see "Things that look like bugs but aren't" → `readSoftwareID()`).
 2. Host sends `ARDUINO_ERASE_TRIGGER`.
 3. Sketch chip-erases, samples first 1 KB == `0xFF`, emits `ARDUINO_READY_TO_RECEIVED_DATA`.
 4. Host pads `firmware.bin` to 128 KB, sends 32 × 4 KB chunks. After each chunk it waits for `ARDUINO_RECEIVED_LINE_DONE`.
@@ -84,6 +94,8 @@ Three constants/decisions that look arbitrary but aren't:
 3. **`TDBG_TC_CHUNK_TC = 32768`.** Half of the 16-bit counter range, leaves margin for the next chunk's RC arm to be honoured before the counter wraps. Matches `TDBG_TC_CHUNK_CPU = 65536` (= chunk_tc × 2).
 
 Buffer is `TDBG_MAX_EVENTS × 5 = 20480 bytes` of static RAM. `Serial.setTimeout(5000)` is bumped during the load read because 20 KB at 115200 baud takes ~1.7 s — exceeds the default 1 s and would otherwise short-read.
+
+`tdbg_calibration_pattern()` in `core` returns a 4-burst square wave (deltas 100 / 200 / 500 / 1000 cycles, 1 ms separators). The GUI's 「校準」 button next to 「送出」 sends it. All deltas are well above the TC engine's ~60-cycle floor — if a logic-analyzer trace shows four distinct period groups, the engine is honouring deltas. If it looks like a uniform comb regardless of group, the engine is broken. This is the only end-to-end self-test for the playback path (no automated harness).
 
 ### RECORD flow (used by `波形錄製` tab and `core.RecordSession`)
 
@@ -147,6 +159,14 @@ If wiring changes, only the two arrays move. The bit-banging code indexes throug
 - **Mask bit ordering follows the host's `RECORD_START` pin list, not pin numbers.** `pin1` = bit 0, regardless of whether pin1 is D7 or D44. `parse_record_blob(blob, pins)` does the reverse mapping.
 - **`波形錄製` Start button enables on combo selection only.** Adding a pin row via `[+]` doesn't enable Start by itself — the user has to actually pick a pin from the combo. The `<<ComboboxSelected>>` binding in `_add_pin_row` triggers the refresh.
 - **`readSoftwareID()` no longer halts on missing/unrecognised chip.** Previously the sketch halted in `while(1)` so TDBG/GPIO/RECORD couldn't be tested without a flash chip wired. Now it sets `gChipDetected = false` and lets the idle loop come up; `ARDUINO_ERASE_TRIGGER` checks the flag and replies `ARDUINO_ERROR` if FLASH is attempted without a chip. The boot banner `FW: arduino_utility build <date> <time>` (compiler stamp) is the canonical way to verify the running .ino matches the source.
+- **GPIO panel fills incrementally, not all at once.** `GpioTab._build_pin_panel` builds the canvas/scrollbar shell synchronously, then chains `root.after(0, _fill_pin_panel)` calls that add 6 pin rows per Tk idle tick. This drops the main-thread freeze on first GPIO-tab activation from ~900 ms to ~16 ms per tick. The `_pin_panel_filling` flag gates Read All so it doesn't iterate over a partial set; the fill-completion handler re-enables it. Layout is 2-column column-major (D0-D32 left, D33-D65 right).
+- **GPIO mode is a single ttk.Button cycling OUT/IN, not a Combobox.** Combobox is the heaviest ttk widget on Windows (Entry + Listbox + dropdown + popup grab); 66 of them dominated panel-build cost. Button keeps the `on_set(pin, mode, value)` contract identical, just changes the click surface.
+- **CJK font rendering is pinned at startup.** Windows-only: `tkfont.nametofont(...)` resets all `Tk*Font` named fonts to Microsoft JhengHei UI 10pt before any widget is built. Without this, `clam` theme falls back to a low-quality CJK glyph set and Chinese labels look "扭曲".
+- **DWT must be declared manually in the .ino.** Atmel-bundled `core_cm3.h` (Arduino SAM 1.6.x) declares `CoreDebug_Type` but not `DWT_Type`. The `.ino` declares only DWT (CoreDebug stays from CMSIS) inside `#ifndef DWT_BASE` so a future SAM core that exposes DWT silently wins. `<Arduino.h>` must also be included explicitly — the IDE's implicit injection sometimes fails on non-default folder layouts.
+
+## Repo layout convention
+
+The `.ino` MUST sit in a same-named subfolder (`binFileProgram/binFileProgram.ino`) — Arduino IDE 2.x requires it. The host scripts and `.github/workflows/build-release.yml` only build the Python EXE; the `.ino` is uploaded manually via Arduino IDE.
 
 ## CI / release
 
