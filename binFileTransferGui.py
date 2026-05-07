@@ -1731,9 +1731,16 @@ class _RecordPinRow:
         )
         self.pin_combo.pack(side=tk.LEFT, padx=(6, 12))
 
+        # ttk.Frame doesn't expose `-background` via cget — its background
+        # is controlled by the ttk theme, so we have to ask the style
+        # system. Fall back to a reasonable clam-ish grey if lookup fails.
+        try:
+            bg = ttk.Style().lookup("TFrame", "background") or "#dcdad5"
+        except tk.TclError:
+            bg = "#dcdad5"
         self.dot = tk.Canvas(
             self.frame, width=14, height=14,
-            highlightthickness=0, background=self.frame.cget("background"),
+            highlightthickness=0, background=bg,
         )
         self.dot.pack(side=tk.LEFT)
         self._draw_dot(self.DOT_UNKNOWN)
@@ -2145,16 +2152,11 @@ class RecordTab(_LoggedTab):
         pins, events = result
         self._recorded_pins = pins
         self._recorded_events = events
-        # Reveal the thumbnail next to 結束.
+        # Reveal the thumbnail in the action row. Clear Log is packed RIGHT,
+        # so plain side=LEFT here puts the canvas after 結束 (the last
+        # LEFT-packed widget) and before Clear Log. No need for in_/after.
         self._draw_thumbnail()
-        try:
-            # Pack between 結束 and Clear Log — we kept Clear Log on RIGHT.
-            self._preview_canvas.pack(
-                side=tk.LEFT, padx=(8, 0), in_=self._stop_btn.master,
-                after=self._stop_btn,
-            )
-        except tk.TclError:
-            self._preview_canvas.pack(side=tk.LEFT, padx=(8, 0))
+        self._preview_canvas.pack(side=tk.LEFT, padx=(8, 0))
         if events:
             total_us = sum(d for d, _ in events)
             self.app.set_status(
