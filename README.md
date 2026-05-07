@@ -9,7 +9,8 @@ PC 端用 Python 透過 USB Serial 把 `firmware.bin` 傳給 Arduino，Arduino �
 
 ```
 arduino_utility/
-├── binFileProgram.ino       # Arduino 端燒錄程式（燒入 Arduino Due）
+├── binFileProgram/
+│   └── binFileProgram.ino   # Arduino 端燒錄程式（燒入 Arduino Due；Arduino IDE 慣例：sketch 與資料夾同名）
 ├── binFileTransfer_core.py  # 共用核心：握手協定 + 傳輸主流程
 ├── binFileTransfer.py       # CLI 入口（argparse 包 core）
 ├── binFileTransferGui.py    # Tkinter GUI 入口（包 core）
@@ -35,7 +36,7 @@ arduino_utility/
 
 不是這兩顆會直接送 `ARDUINO_ERROR` 並停在 `while(1)`。
 如果未來要支援 SST39xF020 / SST39xF040，需要：
-- 在 `binFileProgram.ino` 增加新的 `deviceID_*` 常數並修改 `readSoftwareID()` 判斷
+- 在 `binFileProgram/binFileProgram.ino` 增加新的 `deviceID_*` 常數並修改 `readSoftwareID()` 判斷
 - 在 `binFileTransfer.py` 把 `FILE_SIZE_SUPPORT` 從 `128 * 1024` 改成 256K / 512K
 - 注意 SST39xF020 多一條 A17、SST39xF040 多到 A18，硬體接線與 `addrPins[]` 也要擴充
 
@@ -47,7 +48,7 @@ arduino_utility/
 
 控制板：**Arduino Due**（程式以 Due 為前提，Mega 也接得起來但 Python 端的自動偵測 VID/PID 寫死 Due Programming Port）。
 
-接線定義在 `binFileProgram.ino` 開頭：
+接線定義在 `binFileProgram/binFileProgram.ino` 開頭：
 
 ### Address bus（A0 ~ A18，共 19 條，1Mbit 用到 A0~A16）
 
@@ -83,7 +84,7 @@ arduino_utility/
   pip install -r requirements.txt
   ```
   目前只有 `pyserial>=3.5`。`tkinter` 是 Python 標準庫，GUI 不額外裝。
-- Arduino IDE（用來燒 `binFileProgram.ino` 進 Arduino Due）
+- Arduino IDE（用來燒 `binFileProgram/binFileProgram.ino` 進 Arduino Due）
 - *（可選）*想自己打 Windows EXE：`pip install pyinstaller==6.11.1`
 
 ---
@@ -92,7 +93,7 @@ arduino_utility/
 
 ### Step 1：燒錄 Arduino sketch
 1. 打開 Arduino IDE → 安裝 **Arduino SAM Boards (Cortex-M3)**（給 Due 用的）
-2. 開啟 `binFileProgram.ino`
+2. 開啟 `binFileProgram/binFileProgram.ino`
 3. Board 選 `Arduino Due (Programming Port)`，Port 選對應的 COM
 4. Upload
 
@@ -289,7 +290,7 @@ CLI 端**沒有**對應 sub-command；要 scripting 請直接 `from binFileTrans
 
 ## 7. SST39 命令序列（datasheet 整理）
 
-下列命令都由 `binFileProgram.ino` 中的 `writeByte(addr, data)` 完成（一個週期 = WE# 拉低再拉高）。
+下列命令都由 `binFileProgram/binFileProgram.ino` 中的 `writeByte(addr, data)` 完成（一個週期 = WE# 拉低再拉高）。
 
 ### Software ID Entry / Exit
 ```
@@ -333,7 +334,7 @@ Datasheet 標稱 Chip Erase typ. 70 ms。`.ino` 目前用 `delay(100)` 後做 10
 
 ## 9. 重要常數一覽（修改前先看這裡）
 
-`binFileProgram.ino`：
+`binFileProgram/binFileProgram.ino`：
 ```c
 #define UART_BAUDRATE         115200
 #define CHUNK_SIZE            4096

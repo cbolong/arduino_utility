@@ -1,4 +1,15 @@
 
+// Explicit Arduino core include. The IDE normally injects this implicitly
+// for .ino sketches, which is why the file builds without it on a clean
+// install. But that implicit injection can silently fail when the build
+// toolchain caches go stale, the sketch lives in an unusual folder layout,
+// or the IDE version changes — the visible symptom is "'DWT' was not
+// declared in this scope" (DWT is a CMSIS macro reached via Arduino.h →
+// sam.h → core_cm3.h on the SAM3X). Including it explicitly makes the
+// build deterministic across IDE versions.
+#include <Arduino.h>
+
+
 // USER define
 #define UART_BAUDRATE 115200
 #define CHUNK_SIZE 4096

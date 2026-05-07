@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A utility that programs SST39xF010-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet is in `spec/`.
 
-- `binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol, a TDBG waveform-replay protocol (load captured pattern into RAM, play on a chosen pin via DWT timing), and a RECORD live-capture protocol (interrupt-driven multi-pin recorder, 1–4 pins, 4096 events × 5 bytes RAM).
+- `binFileProgram/binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol, a TDBG waveform-replay protocol (load captured pattern into RAM, play on a chosen pin via DWT timing), and a RECORD live-capture protocol (interrupt-driven multi-pin recorder, 1–4 pins, 4096 events × 5 bytes RAM).
 - `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, `GpioSession`, `TdbgSession`, `RecordSession`, `parse_acute_txt`, `parse_record_blob` live here. The two front-ends are thin shells.
 - `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`). No TDBG/RECORD sub-commands yet; `TdbgSession` / `RecordSession` are library-only.
 - `binFileTransferGui.py` — Tkinter GUI front-end. Four tabs: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker, persistent connection), `TDBG` (waveform replay), and `波形錄製` (live multi-pin recorder). Custom `ttk.Style` on TNotebook (theme = clam, bold + blue selected tab) so the active tab is visible at a glance.
@@ -37,7 +37,7 @@ There is no test suite. Verification is hardware-in-the-loop: flash a known `fir
 
 ## Architecture: protocol coupling
 
-`binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **four** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG, RECORD). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
+`binFileProgram/binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **four** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG, RECORD). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
 
 ### Flash flow (8 strings, primary path)
 
