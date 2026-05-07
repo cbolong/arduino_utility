@@ -1354,6 +1354,19 @@ class TdbgTab(_LoggedTab):
             card, text="送出", command=self._on_send, state=tk.DISABLED,
         )
         self._send_btn.pack(side=tk.LEFT)
+        # Calibration pattern — four bursts at 100/200/500/1000-cycle deltas
+        # separated by 1 ms gaps. Use this as a sanity check on the TC
+        # playback engine: if the captured trace shows four distinct
+        # period groups, the engine honours deltas above its ~60-cycle
+        # floor. Hosted in core's tdbg_calibration_pattern() so it stays
+        # in sync if delta semantics change.
+        self._calib_btn = ttk.Button(
+            card, text="校準", command=self._on_send_calibration,
+            state=tk.DISABLED,
+        )
+        self._calib_btn.pack(side=tk.LEFT, padx=(8, 0))
+        _Tooltip(self._calib_btn,
+                 "送出校準圖樣(100/200/500/1000 cycle 方波,驗證 TC 引擎)")
 
     # ---- queue / worker ---------------------------------------------------
 
@@ -1426,6 +1439,7 @@ class TdbgTab(_LoggedTab):
         self._disconnect_btn.config(state=tk.NORMAL)
         self._pin_combo.config(state="readonly")
         self._send_btn.config(state=tk.NORMAL)
+        self._calib_btn.config(state=tk.NORMAL)
         self.app.set_status("TDBG Connected", _COLORS["success_dark"])
 
     def _on_disconnect(self) -> None:
@@ -1437,6 +1451,7 @@ class TdbgTab(_LoggedTab):
     def _begin_disconnect(self) -> None:
         self._disconnect_btn.config(state=tk.DISABLED)
         self._send_btn.config(state=tk.DISABLED)
+        self._calib_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
 
@@ -1512,12 +1527,47 @@ class TdbgTab(_LoggedTab):
     def _on_send_done(self, success: bool) -> None:
         if self._session is not None:
             self._send_btn.config(state=tk.NORMAL)
+            self._calib_btn.config(state=tk.NORMAL)
             self._pin_combo.config(state="readonly")
             self._disconnect_btn.config(state=tk.NORMAL)
         self.app.set_status(
             "TDBG done" if success else "TDBG error",
             _COLORS["success_dark"] if success else _COLORS["danger_dark"],
         )
+
+    def _on_send_calibration(self) -> None:
+        """Send the built-in calibration pattern instead of the user's
+        TDBG password 1. Shares the same play-once flow as _on_send,
+        just substitutes events. Useful for verifying TC engine timing
+        with a logic analyzer."""
+        if self._session is None:
+            return
+        pin = self._selected_pin()
+        if pin is None:
+            messagebox.showinfo("Pin", "Select an output pin first.")
+            return
+        from binFileTransfer_core import (
+            tdbg_calibration_pattern, DUE_CPU_HZ,
+        )
+        initial, events = tdbg_calibration_pattern()
+        duration_s = sum(d for d, _ in events) / DUE_CPU_HZ
+
+        self._send_btn.config(state=tk.DISABLED)
+        self._calib_btn.config(state=tk.DISABLED)
+        self._pin_combo.config(state="disabled")
+        self._disconnect_btn.config(state=tk.DISABLED)
+        self.app.set_status("TDBG calibrating...", _COLORS["warning_dark"])
+
+        def cmd():
+            sess = self._session
+            if sess is None:
+                return
+            ok = sess.load(pin=pin, initial_state=initial, events=events)
+            if ok:
+                ok = sess.play(iterations=1, total_duration_s=duration_s)
+            self.app.root.after(0, lambda: self._on_send_done(ok))
+
+        self._enqueue(cmd)
 
     # ---- mini thumbnail + preview popup -----------------------------------
 

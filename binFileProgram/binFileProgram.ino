@@ -354,8 +354,16 @@ void handleGpioRead(const String& cmd) {
 //                                 playback only; replies "TDBG_STOPPED"
 //                                 followed by "TDBG_PLAY_DONE".
 //
-// Timing budget: DWT->CYCCNT runs at the CPU clock (84 MHz on Due, ~11.9 ns
-// per tick). Minimum reliable inter-event delta is ~32 cycles (~380 ns).
+// Timing budget: two engines, switched via TDBG_USE_TC_ENGINE.
+//   * Spin (legacy):  DWT->CYCCNT @ 84 MHz, ~11.9 ns per tick, loop body
+//     cost ~30 cycles → minimum reliable delta ~30-50 cycles (~360-600 ns).
+//     Patterns at 32 cycles ride the floor and collapse to a uniform comb
+//     at the loop's natural cadence. Useful as a fallback only.
+//   * TC (default):   TC2 ch0 @ 42 MHz (TIMER_CLOCK1), CPCS interrupt fires
+//     the pin. ISR round-trip ~50-60 cycles → minimum reliable delta
+//     ~60 cycles (~715 ns). 32-cycle patterns still slip but the floor is
+//     interrupt latency, not loop body — ports cleanly to a future DMA
+//     engine that lifts the floor below 1 cycle (Sprint 3).
 // Pin transitions use direct PIO_SODR/PIO_CODR — single-cycle store, no
 // digitalWrite() latency.
 // ----------------------------------------------------------------------------
@@ -365,6 +373,21 @@ void handleGpioRead(const String& cmd) {
 #define TDBG_LONG_GAP_CYCLES    840000UL     // ≥10 ms — open service window
 #define TDBG_LONG_GAP_BAILOUT   16800UL      // ~200 µs slack before deadline
 
+// Switch between the two playback engines. The TC engine is interrupt-
+// scheduled via SAM3X Timer Counter and produces deterministic 50-cycle
+// floor jitter on dense bursts; the spin-loop fallback (TDBG_USE_TC_ENGINE
+// 0) is the original DWT spin-wait, kept for instant rollback if the TC
+// path misbehaves on a particular pattern.
+#define TDBG_USE_TC_ENGINE      1
+
+// TC playback runs the channel at MCK/2 = 42 MHz (TIMER_CLOCK1). Stored
+// host deltas are in 84 MHz CPU cycles → divide by 2 in the ISR. The
+// 16-bit native counter caps single-RC reaches at 65535 ticks ≈ 1.56 ms;
+// for longer deltas (long gaps), the ISR splits the wait into chunks
+// without writing the pin until the final chunk lands.
+#define TDBG_TC_CHUNK_TC        32768U       // 32k ticks ≈ 780 µs per chunk
+#define TDBG_TC_CHUNK_CPU       (TDBG_TC_CHUNK_TC * 2U)   // = 65536 CPU cycles
+
 static uint8_t  tdbgBuf[TDBG_MAX_EVENTS * TDBG_EVENT_BYTES];
 static uint16_t tdbgEventCount = 0;
 static uint8_t  tdbgPin = 0;
@@ -373,6 +396,17 @@ static uint32_t tdbgMask = 0;
 static uint8_t  tdbgInitialState = 0;
 static volatile bool tdbgStopRequested = false;
 static bool tdbgDwtReady = false;
+static bool tdbgTcReady = false;
+
+// TC playback state — written by both ISR and main loop. `volatile` on
+// the bits the ISR mutates that main reads (and vice-versa). 32-bit
+// aligned single-word reads/writes are atomic on Cortex-M3 so we don't
+// need a critical section for these.
+static volatile const uint8_t* tdbgPlayPtr   = NULL;
+static volatile uint16_t       tdbgPlayLeft  = 0;
+static volatile uint16_t       tdbgTcDeadline = 0;
+static volatile uint32_t       tdbgRemainCpu = 0;
+static volatile bool           tdbgPlayDone  = false;
 
 static void tdbgEnableDwt() {
   if (tdbgDwtReady) return;
@@ -380,6 +414,26 @@ static void tdbgEnableDwt() {
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
   tdbgDwtReady = true;
+}
+
+// One-time init for the TC channel used by the new playback engine.
+// TC2 channel 0 (peripheral ID 27 + 6 = 33, ID_TC6, vector TC6_Handler).
+// Avoids Servo (TC4 = TC1.ch1), Tone (TC0 = TC0.ch0), and the lazy
+// analogWrite() PWM mapping which never picks ch0 of TC2 by default.
+// Idempotent — safe to call from every TDBG_LOAD.
+static void tdbgEnableTc() {
+  if (tdbgTcReady) return;
+  pmc_enable_periph_clk(ID_TC6);                 // TC2 ch0 clock gate
+  // CMR: waveform mode, count up (no auto-reset), TIMER_CLOCK1 = MCK/2
+  TC_Configure(TC2, 0,
+               TC_CMR_WAVE
+               | TC_CMR_WAVSEL_UP
+               | TC_CMR_TCCLKS_TIMER_CLOCK1);
+  // Highest priority — only competitor is SysTick (1 kHz), which costs
+  // ~50-80 cycles per displaced event. Bounded jitter across a 1.34 s
+  // playback is acceptable.
+  NVIC_SetPriority(TC6_IRQn, 0);
+  tdbgTcReady = true;
 }
 
 // CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflect, no xor-out.
@@ -458,6 +512,7 @@ void handleTdbgLoad(const String& cmd) {
   tdbgInitialState = (uint8_t)initialState;
 
   tdbgEnableDwt();
+  tdbgEnableTc();
 
   char hexbuf[8];
   snprintf(hexbuf, sizeof(hexbuf), "%04X", crc);
@@ -491,8 +546,7 @@ static bool tdbgPumpStop() {
   return false;
 }
 
-// Inner playback loop. Returns true if completed normally, false if STOP
-// was observed inside a long-gap window.
+// ----- Spin-loop playback engine (legacy, kept for rollback) ------------
 //
 // Interrupt-masking strategy: noInterrupts() is hoisted to *cluster*
 // scope, not per-event. Empirically the captured patterns we replay are
@@ -505,12 +559,11 @@ static bool tdbgPumpStop() {
 // fire as fast as the loop body lets them, collapsing what should be
 // even 380 ns pulses into an irregular burst.
 //
-// New shape: hold noInterrupts() across runs of short events; release
-// for long gaps (where we want STOP to be reachable) and re-acquire
-// before the next short cluster. Cluster lengths are bounded by the
-// captured pattern (typical 50-100 µs of masked time), well under the
-// USB CDC stall threshold.
-static bool tdbgPlayOnce() {
+// Cluster-scope masking still leaves a hard floor at ~30 CPU cycles per
+// event from the loop body itself (memcpy + compare + spin + fire), so
+// patterns with deltas ≤ ~30 cycles can't be replayed faithfully on this
+// engine. That's the motivation for the TC engine below.
+static bool tdbgPlayOnceSpin() {
   // Pre-set initial level via direct PIO BEFORE flipping output enable, so
   // there's no float-LOW glitch between mode change and first write.
   if (tdbgInitialState) tdbgPort->PIO_SODR = tdbgMask;
@@ -520,7 +573,7 @@ static bool tdbgPlayOnce() {
 
   uint32_t deadline = DWT->CYCCNT;
   const uint8_t* p = tdbgBuf;
-  bool masked = false;            // true while we hold noInterrupts()
+  bool masked = false;
 
   for (uint16_t i = 0; i < tdbgEventCount; ++i) {
     uint32_t delta;
@@ -530,12 +583,6 @@ static bool tdbgPlayOnce() {
     deadline += delta;
 
     if (delta >= TDBG_LONG_GAP_CYCLES) {
-      // Entering a long gap. Drop the mask if we were holding it so
-      // SysTick / Serial RX / USB CDC get serviced during the wait, and
-      // poll for TDBG_STOP without burning a tight spin loop. Bail out a
-      // bit before the deadline so the precise wait below has slack to
-      // absorb scheduling jitter from any interrupt that happened to land
-      // late in the polling window.
       if (masked) { interrupts(); masked = false; }
       while ((int32_t)(deadline - DWT->CYCCNT) > (int32_t)TDBG_LONG_GAP_BAILOUT) {
         if (tdbgPumpStop()) {
@@ -545,9 +592,6 @@ static bool tdbgPlayOnce() {
       }
     }
 
-    // Tight deterministic wait. Acquire the mask once at the start of a
-    // cluster of short events and hold it across the whole cluster — see
-    // function-level comment for rationale.
     if (!masked) { noInterrupts(); masked = true; }
     while ((int32_t)(deadline - DWT->CYCCNT) > 0) { /* spin */ }
     if (state) tdbgPort->PIO_SODR = tdbgMask;
@@ -555,6 +599,145 @@ static bool tdbgPlayOnce() {
   }
   if (masked) interrupts();
   return true;
+}
+
+// ----- TC compare-interrupt playback engine -----------------------------
+//
+// Architecture: SAM3X TC2 channel 0 runs in waveform mode at 42 MHz
+// (MCK/2). Each event's deadline is loaded into TC_RC; the channel's
+// CPCS interrupt fires at compare match; the ISR writes the pin state
+// and arms the next deadline. The 16-bit native counter caps a single
+// RC reach at 65535 ticks (~1.56 ms) — for longer deltas, the ISR
+// chunks the wait into TDBG_TC_CHUNK_TC-sized pieces, advancing the
+// deadline accumulator on each chunk but only writing the pin on the
+// final (possibly small) chunk that lands on the actual event time.
+//
+// Cycle budget per event: ~12 cycles entry + ~6 prologue + ~18 body +
+// ~6 epilogue + ~12 exit = ~54 CPU cycles ≈ 27 TC ticks. Deltas under
+// 30 TC ticks (~60 CPU cycles, ~715 ns) will slip — the engine simply
+// can't service them faster than the ISR round-trip. For the 380 ns
+// (~16 tick) target the user's existing pattern uses, that's still not
+// enough — but the floor is now interrupt latency, not loop-body cost,
+// so a future DMA-driven engine can push beneath it. Sprint 3.
+
+// State machine: tdbgRemainCpu counts CPU cycles still owed BEFORE the
+// next pin transition. Each ISR consumes up to TDBG_TC_CHUNK_CPU from
+// remain and advances the deadline accordingly. When remain hits 0,
+// THAT ISR is the firing one — write pin, load next event's delta into
+// remain, schedule the first chunk. Setup mirrors the same logic so the
+// first ISR gets to remain==0 only when the first event's full delta
+// has elapsed (or immediately, for the conventional delta=0 anchor).
+void TC6_Handler(void) {
+  // Ack the compare flag (read of SR clears CPCS).
+  uint32_t sr = TC2->TC_CHANNEL[0].TC_SR;
+  (void)sr;
+
+  // ---- Still mid-wait: schedule the next chunk, no pin write.
+  if (tdbgRemainCpu > 0) {
+    uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
+                    ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
+    tdbgRemainCpu -= step;
+    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + (uint16_t)(step >> 1));
+    TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
+    return;
+  }
+
+  // ---- remain == 0 → this compare is at the event-fire time.
+  if (tdbgPlayLeft == 0) {
+    // Trailing tick after the last fire; nothing left. Disarm.
+    TC2->TC_CHANNEL[0].TC_IDR = TC_IDR_CPCS;
+    TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
+    NVIC_DisableIRQ(TC6_IRQn);
+    tdbgPlayDone = true;
+    return;
+  }
+
+  // Drive the pin for the current event.
+  uint8_t state = tdbgPlayPtr[4];
+  if (state) tdbgPort->PIO_SODR = tdbgMask;
+  else       tdbgPort->PIO_CODR = tdbgMask;
+
+  // Advance to next event.
+  tdbgPlayPtr  += TDBG_EVENT_BYTES;
+  tdbgPlayLeft--;
+  if (tdbgPlayLeft == 0) {
+    // No more events — schedule one trailing tick so the next ISR
+    // takes the disarm branch above. 32 TC ticks ≈ 760 ns of dead
+    // time; negligible.
+    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + 32);
+    TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
+    return;
+  }
+
+  // Load next event's delta into the chunked accumulator. Schedule the
+  // first chunk (or the whole thing if it fits in 16 bits).
+  uint32_t delta_cpu;
+  __builtin_memcpy(&delta_cpu, (const void*)tdbgPlayPtr, sizeof(delta_cpu));
+  tdbgRemainCpu = delta_cpu;
+  uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
+                  ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
+  tdbgRemainCpu -= step;
+  tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + (uint16_t)(step >> 1));
+  TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
+}
+
+static bool tdbgPlayOnceTc() {
+  // Same float-LOW-safe pin priming as the spin engine.
+  if (tdbgInitialState) tdbgPort->PIO_SODR = tdbgMask;
+  else                  tdbgPort->PIO_CODR = tdbgMask;
+  tdbgPort->PIO_PER = tdbgMask;
+  tdbgPort->PIO_OER = tdbgMask;
+
+  // Prime ISR state for the FIRST event. State machine matches the
+  // ISR's: tdbgRemainCpu = full first delta minus the first chunk;
+  // deadline = chunk TC ticks. First ISR fires when counter reaches
+  // deadline and either consumes the next chunk or, if the residue
+  // already fits, hits remain==0 and triggers the pin fire.
+  tdbgPlayPtr  = tdbgBuf;
+  tdbgPlayLeft = tdbgEventCount;
+  tdbgPlayDone = false;
+
+  uint32_t delta_cpu;
+  memcpy(&delta_cpu, (const void*)tdbgPlayPtr, sizeof(delta_cpu));
+  tdbgTcDeadline = 0;
+  tdbgRemainCpu  = delta_cpu;
+  uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
+                  ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
+  tdbgRemainCpu -= step;
+  tdbgTcDeadline = (uint16_t)(step >> 1);
+  // RC=0 (delta=0 anchor) is legal: counter starts at 0 after SWTRG,
+  // immediate match → first ISR fires at t=0 and pin priming holds.
+  TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
+
+  // Arm: enable CPCS interrupt, enable clock, software-trigger reset.
+  TC2->TC_CHANNEL[0].TC_IER = TC_IER_CPCS;
+  NVIC_ClearPendingIRQ(TC6_IRQn);
+  NVIC_EnableIRQ(TC6_IRQn);
+  TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKEN | TC_CCR_SWTRG;
+
+  // Main loop spins polling for STOP — interrupts run normally so USB
+  // CDC, SysTick, and inbound serial all work. Zero noInterrupts()
+  // discipline needed: the ISR is short and self-contained.
+  while (!tdbgPlayDone) {
+    if (tdbgPumpStop()) {
+      NVIC_DisableIRQ(TC6_IRQn);
+      TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
+      tdbgStopRequested = true;
+      return false;
+    }
+  }
+  return true;
+}
+
+// Engine dispatcher — selected at compile time. Keep both functions
+// linked even when one is unused; the dead one is ~150 bytes of flash,
+// nothing on the SAM3X's 512 KB.
+static bool tdbgPlayOnce() {
+#if TDBG_USE_TC_ENGINE
+  return tdbgPlayOnceTc();
+#else
+  return tdbgPlayOnceSpin();
+#endif
 }
 
 void handleTdbgPlay(const String& cmd) {

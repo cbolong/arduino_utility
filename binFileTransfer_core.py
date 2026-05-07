@@ -527,6 +527,50 @@ def tdbg_pack_events(events: list[tuple[int, int]]) -> bytes:
     return bytes(out)
 
 
+def tdbg_calibration_pattern() -> tuple[int, list[tuple[int, int]]]:
+    """Built-in calibration pattern — four square-wave bursts at increasing
+    delta sizes, separated by 1 ms gaps. Use this to verify the TC playback
+    engine's timing fidelity end-to-end with a logic analyzer:
+
+      Burst 1: 16 transitions at 100 cycles  (~1.19 µs period)
+      Burst 2: 16 transitions at 200 cycles  (~2.38 µs period)
+      Burst 3: 16 transitions at 500 cycles  (~5.95 µs period)
+      Burst 4: 16 transitions at 1000 cycles (~11.9 µs period)
+
+    All deltas are well above the TC engine's ~60-cycle floor, so the
+    captured edges should land within ±5 cycles of the requested period.
+    If burst 1 looks like burst 4 (uniform comb regardless of delta),
+    the engine is broken.
+
+    Returns (initial_state, [(delta_cycles, new_state), ...]) — same shape
+    as parse_acute_txt() so the caller can drop it straight into
+    TdbgSession.load() without further packaging.
+    """
+    DUE_HZ = 84_000_000
+    GAP_CYCLES = round(1e-3 * DUE_HZ)   # 1 ms separation
+    BURSTS = (100, 200, 500, 1000)
+    BURST_LEN = 16
+
+    events: list[tuple[int, int]] = []
+    state = 1                          # toggling state across the run
+    first = True
+    for half_period in BURSTS:
+        for i in range(BURST_LEN):
+            delta = half_period
+            if first:
+                # First event has delta=0 — playback's t=0 anchor.
+                delta = 0
+                first = False
+            elif i == 0:
+                # Long inter-burst gap, replaces the first burst-event
+                # delta so the gap shows up in the trace.
+                delta = GAP_CYCLES
+            state ^= 1
+            events.append((delta, state))
+    initial_state = 0
+    return initial_state, events
+
+
 class TdbgSession:
     """Persistent TDBG session — same lifecycle pattern as GpioSession.
 
