@@ -926,10 +926,21 @@ class RecordSession:
             if line == MCU_RECORD_OVERFLOW:
                 self._log("recv: RECORD_OVERFLOW (event buffer full)", "warn")
                 continue
-            # Any other line — likely the start of the stop-exchange. Park it.
+            # Any other line — likely the start of the stop-exchange (typically
+            # RECORD_STOPPED). Park it for stop() to drain, then EXIT so the
+            # main thread has exclusive ownership of the serial port for the
+            # binary blob read that follows. Earlier the loop kept polling
+            # after parking; the next 0.25 s timeout window could swallow
+            # bytes from RECORD_DATA / blob / RECORD_DONE — and if the blob
+            # happened to contain a 0x0A byte, ser.readline() would split
+            # mid-blob and feed that fragment back to stop() in place of
+            # RECORD_DONE. The forced-shutdown path (Disconnect mid-recording)
+            # uses _live_stop.set() + join(), which still works because the
+            # while-check at the top of the loop honours it.
             with self._stop_handoff_lock:
                 self._stop_handoff.append(line)
             self._handed_off.set()
+            return
 
     def stop(self) -> tuple[list[int], list[tuple[int, dict[int, bool]]]] | None:
         """Stop recording, return (pins, events). None on failure."""

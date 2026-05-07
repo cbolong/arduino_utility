@@ -21,6 +21,27 @@ def _resource_path(rel: str) -> str:
     return os.path.join(base, rel)
 
 
+_DPI_SCALE_CACHE: float | None = None
+
+
+def _scale(px: int) -> int:
+    """Scale a hardcoded pixel size for the current DPI. Tk's
+    `tk scaling` returns points-per-pixel (1.0 at 72 DPI logical scale,
+    ~1.33 at the standard 96 DPI Windows desktop, higher on 4K). We
+    normalise to 1.33 so that values authored against the standard Windows
+    desktop look unchanged there but grow proportionally on high-DPI
+    monitors. Cached after first call — Tk needs to be initialised
+    before `tk scaling` is queryable, so we lazy-init."""
+    global _DPI_SCALE_CACHE
+    if _DPI_SCALE_CACHE is None:
+        try:
+            scaling = float(tk._default_root.tk.call("tk", "scaling"))
+        except (AttributeError, tk.TclError, ValueError, TypeError):
+            scaling = 1.33
+        _DPI_SCALE_CACHE = max(1.0, scaling / 1.33)
+    return int(round(px * _DPI_SCALE_CACHE))
+
+
 class _Tooltip:
     """Lightweight hover tooltip — shows `text` in a borderless Toplevel
     near the cursor when the pointer enters `widget`, hides on leave.
@@ -72,6 +93,12 @@ DUE_TARGET_PID = 0x003D
 # every Notebook-tab style references entries from here. The dark-canvas /
 # orange-waveform combination used by the TDBG and RECORD preview popups is
 # intentionally kept (logic-analyzer style, separate visual layer).
+#
+# success/danger/warning/accent are the bright "system colour" hues meant for
+# the accent text on a Notebook tab and for indicator dots on dark surfaces.
+# success_dark / danger_dark / warning_dark / accent_dark are the ≥4.5:1 WCAG
+# AA contrast variants for ordinary status text on a white background — the
+# bright hues clock in around 2.2-3.5:1 against #ffffff, which is hard to read.
 _COLORS = {
     "window_bg":      "#ffffff",
     "surface_2":      "#f5f5f7",
@@ -80,9 +107,13 @@ _COLORS = {
     "text_secondary": "#6e6e73",
     "text_disabled":  "#c7c7cc",
     "accent":         "#007aff",
+    "accent_dark":    "#0050b3",
     "success":        "#34c759",
+    "success_dark":   "#1f7a1f",
     "danger":         "#ff3b30",
+    "danger_dark":    "#c41a1a",
     "warning":        "#ff9500",
+    "warning_dark":   "#a06400",
     "separator":      "#d2d2d7",
     "canvas_bg":      "#1a1a1a",
     "wave_orange":    "#ff9933",
@@ -91,9 +122,9 @@ _COLORS = {
 
 LEVEL_TAGS = {
     "info": ("log_info", _COLORS["text_primary"]),
-    "ok":   ("log_ok",   _COLORS["success"]),
-    "warn": ("log_warn", _COLORS["warning"]),
-    "err":  ("log_err",  _COLORS["danger"]),
+    "ok":   ("log_ok",   _COLORS["success_dark"]),
+    "warn": ("log_warn", _COLORS["warning_dark"]),
+    "err":  ("log_err",  _COLORS["danger_dark"]),
     "wait": ("log_wait", _COLORS["text_secondary"]),
 }
 
@@ -299,7 +330,7 @@ class FlashTab(_LoggedTab):
             return program_firmware(firmware_path, log_cb, port=port)
 
         if self.submit_work(work):
-            self.app.set_status("Programming...", _COLORS["warning"])
+            self.app.set_status("Programming...", _COLORS["warning_dark"])
             self.app.lock_port_entry()
         else:
             # Worker refused (already busy). Re-enable buttons so user can retry.
@@ -312,9 +343,9 @@ class FlashTab(_LoggedTab):
                 f"{os.path.basename(self.firmware_path or '')} Program Successful.",
                 "ok",
             )
-            self.app.set_status("Success", _COLORS["success"])
+            self.app.set_status("Success", _COLORS["success_dark"])
         else:
-            self.app.set_status("Error", _COLORS["danger"])
+            self.app.set_status("Error", _COLORS["danger_dark"])
         self.start_btn.config(state=tk.NORMAL)
         self.browse_btn.config(state=tk.NORMAL)
         self.app.unlock_port_entry()
@@ -419,7 +450,7 @@ class _PinRow:
         """Update the right-most "Read:" cell. Coloured for readability."""
         self.read_var.set(value)
         self.read_label.config(
-            foreground=_COLORS["success"] if value == "HIGH" else _COLORS["text_primary"]
+            foreground=_COLORS["success_dark"] if value == "HIGH" else _COLORS["text_primary"]
         )
 
 
@@ -467,7 +498,7 @@ class GpioTab(_LoggedTab):
         ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
         self._conn_status_var = tk.StringVar(value="Disconnected")
         self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger"]
+            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger_dark"]
         )
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
@@ -532,7 +563,7 @@ class GpioTab(_LoggedTab):
         wrap = ttk.Frame(parent)
         wrap.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
-        canvas = tk.Canvas(wrap, highlightthickness=0, height=420)
+        canvas = tk.Canvas(wrap, highlightthickness=0, height=_scale(420))
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -636,10 +667,10 @@ class GpioTab(_LoggedTab):
             )
             return
         port = self.app.get_port()
-        self._set_conn_status("Connecting...", _COLORS["warning"])
+        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
         self._connect_btn.config(state=tk.DISABLED)
         self.app.lock_port_entry()
-        self.app.set_status("GPIO connecting...", _COLORS["warning"])
+        self.app.set_status("GPIO connecting...", _COLORS["warning_dark"])
 
         def cmd():
             from binFileTransfer_core import GpioSession
@@ -654,21 +685,21 @@ class GpioTab(_LoggedTab):
 
     def _on_connect_done(self, session: GpioSession | None) -> None:
         if session is None:
-            self._set_conn_status("Disconnected", _COLORS["danger"])
+            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
             self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            self.app.set_status("GPIO connect failed", _COLORS["danger"])
+            self.app.set_status("GPIO connect failed", _COLORS["danger_dark"])
             return
 
         self._session = session
         self._abort_event.clear()
-        self._set_conn_status("Connected", _COLORS["success"])
+        self._set_conn_status("Connected", _COLORS["success_dark"])
         self._disconnect_btn.config(state=tk.NORMAL)
         self._read_all_btn.config(state=tk.NORMAL)
         self._auto_refresh_check.config(state=tk.NORMAL)
         for row in self._pin_rows.values():
             row.set_enabled(True)
-        self.app.set_status("GPIO Connected", _COLORS["success"])
+        self.app.set_status("GPIO Connected", _COLORS["success_dark"])
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -701,7 +732,7 @@ class GpioTab(_LoggedTab):
         self._auto_refresh_check.config(state=tk.DISABLED)
         for row in self._pin_rows.values():
             row.set_enabled(False)
-        self._set_conn_status("Disconnecting...", _COLORS["warning"])
+        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
 
     def _do_close_session(self) -> None:
         if self._session is not None:
@@ -710,7 +741,7 @@ class GpioTab(_LoggedTab):
 
     def _on_disconnect_done(self) -> None:
         self._session = None
-        self._set_conn_status("Disconnected", _COLORS["danger"])
+        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
         self._connect_btn.config(state=tk.NORMAL)
         self.app.unlock_port_entry()
         self.app.set_status("GPIO Disconnected", _COLORS["text_secondary"])
@@ -1274,7 +1305,7 @@ class TdbgTab(_LoggedTab):
         ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
         self._conn_status_var = tk.StringVar(value="Disconnected")
         self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger"]
+            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger_dark"]
         )
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
@@ -1311,7 +1342,7 @@ class TdbgTab(_LoggedTab):
             font=("TkDefaultFont", 10, "bold"),
         ).pack(side=tk.LEFT)
         self._preview_canvas = tk.Canvas(
-            card, width=20, height=20,
+            card, width=_scale(20), height=_scale(20),
             background=_COLORS["canvas_bg"], relief="raised", borderwidth=1,
             highlightthickness=0, cursor="hand2",
         )
@@ -1367,10 +1398,10 @@ class TdbgTab(_LoggedTab):
             )
             return
         port = self.app.get_port()
-        self._set_conn_status("Connecting...", _COLORS["warning"])
+        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
         self._connect_btn.config(state=tk.DISABLED)
         self.app.lock_port_entry()
-        self.app.set_status("TDBG connecting...", _COLORS["warning"])
+        self.app.set_status("TDBG connecting...", _COLORS["warning_dark"])
 
         def cmd():
             from binFileTransfer_core import TdbgSession
@@ -1385,17 +1416,17 @@ class TdbgTab(_LoggedTab):
 
     def _on_connect_done(self, session) -> None:
         if session is None:
-            self._set_conn_status("Disconnected", _COLORS["danger"])
+            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
             self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            self.app.set_status("TDBG connect failed", _COLORS["danger"])
+            self.app.set_status("TDBG connect failed", _COLORS["danger_dark"])
             return
         self._session = session
-        self._set_conn_status("Connected", _COLORS["success"])
+        self._set_conn_status("Connected", _COLORS["success_dark"])
         self._disconnect_btn.config(state=tk.NORMAL)
         self._pin_combo.config(state="readonly")
         self._send_btn.config(state=tk.NORMAL)
-        self.app.set_status("TDBG Connected", _COLORS["success"])
+        self.app.set_status("TDBG Connected", _COLORS["success_dark"])
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -1407,7 +1438,7 @@ class TdbgTab(_LoggedTab):
         self._disconnect_btn.config(state=tk.DISABLED)
         self._send_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
-        self._set_conn_status("Disconnecting...", _COLORS["warning"])
+        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
 
     def _do_close_session(self) -> None:
         if self._session is not None:
@@ -1416,7 +1447,7 @@ class TdbgTab(_LoggedTab):
 
     def _on_disconnect_done(self) -> None:
         self._session = None
-        self._set_conn_status("Disconnected", _COLORS["danger"])
+        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
         self._connect_btn.config(state=tk.NORMAL)
         self.app.unlock_port_entry()
         self.app.set_status("TDBG Disconnected", _COLORS["text_secondary"])
@@ -1465,7 +1496,7 @@ class TdbgTab(_LoggedTab):
         self._send_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._disconnect_btn.config(state=tk.DISABLED)
-        self.app.set_status("TDBG playing...", _COLORS["warning"])
+        self.app.set_status("TDBG playing...", _COLORS["warning_dark"])
 
         def cmd():
             sess = self._session
@@ -1485,7 +1516,7 @@ class TdbgTab(_LoggedTab):
             self._disconnect_btn.config(state=tk.NORMAL)
         self.app.set_status(
             "TDBG done" if success else "TDBG error",
-            _COLORS["success"] if success else _COLORS["danger"],
+            _COLORS["success_dark"] if success else _COLORS["danger_dark"],
         )
 
     # ---- mini thumbnail + preview popup -----------------------------------
@@ -1738,7 +1769,7 @@ class _RecordPinRow:
     recording. Created and destroyed dynamically via the [+] / [⊖] buttons.
     """
 
-    DOT_HIGH = _COLORS["success"]
+    DOT_HIGH = _COLORS["success_dark"]
     DOT_LOW = _COLORS["text_secondary"]
     DOT_UNKNOWN = _COLORS["text_disabled"]
 
@@ -1849,7 +1880,7 @@ class RecordTab(_LoggedTab):
         ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
         self._conn_status_var = tk.StringVar(value="Disconnected")
         self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger"]
+            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger_dark"]
         )
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
@@ -1876,7 +1907,7 @@ class RecordTab(_LoggedTab):
 
         # Thumbnail canvas (only visible after a successful recording).
         self._preview_canvas = tk.Canvas(
-            action_row, width=20, height=20,
+            action_row, width=_scale(20), height=_scale(20),
             background=_COLORS["canvas_bg"], relief="raised", borderwidth=1,
             highlightthickness=0, cursor="hand2",
         )
@@ -1985,10 +2016,10 @@ class RecordTab(_LoggedTab):
             )
             return
         port = self.app.get_port()
-        self._set_conn_status("Connecting...", _COLORS["warning"])
+        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
         self._connect_btn.config(state=tk.DISABLED)
         self.app.lock_port_entry()
-        self.app.set_status("RECORD connecting...", _COLORS["warning"])
+        self.app.set_status("RECORD connecting...", _COLORS["warning_dark"])
 
         def cmd():
             from binFileTransfer_core import RecordSession
@@ -2003,16 +2034,16 @@ class RecordTab(_LoggedTab):
 
     def _on_connect_done(self, session) -> None:
         if session is None:
-            self._set_conn_status("Disconnected", _COLORS["danger"])
+            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
             self._connect_btn.config(state=tk.NORMAL)
             self.app.unlock_port_entry()
-            self.app.set_status("RECORD connect failed", _COLORS["danger"])
+            self.app.set_status("RECORD connect failed", _COLORS["danger_dark"])
             return
         self._session = session
-        self._set_conn_status("Connected", _COLORS["success"])
+        self._set_conn_status("Connected", _COLORS["success_dark"])
         self._disconnect_btn.config(state=tk.NORMAL)
         self._refresh_start_button()
-        self.app.set_status("RECORD Connected", _COLORS["success"])
+        self.app.set_status("RECORD Connected", _COLORS["success_dark"])
 
     def _on_disconnect(self) -> None:
         if self._session is None:
@@ -2024,7 +2055,7 @@ class RecordTab(_LoggedTab):
         self._disconnect_btn.config(state=tk.DISABLED)
         self._start_btn.config(state=tk.DISABLED)
         self._stop_btn.config(state=tk.DISABLED)
-        self._set_conn_status("Disconnecting...", _COLORS["warning"])
+        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
 
     def _do_close_session(self) -> None:
         if self._session is not None:
@@ -2034,7 +2065,7 @@ class RecordTab(_LoggedTab):
     def _on_disconnect_done(self) -> None:
         self._session = None
         self._recording = False
-        self._set_conn_status("Disconnected", _COLORS["danger"])
+        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
         self._connect_btn.config(state=tk.NORMAL)
         for row in self._pin_rows:
             row.set_live_state(None)
@@ -2101,7 +2132,7 @@ class RecordTab(_LoggedTab):
             self._preview_canvas.pack_forget()
         except Exception:
             pass
-        self.app.set_status("RECORD recording...", _COLORS["warning"])
+        self.app.set_status("RECORD recording...", _COLORS["warning_dark"])
 
         # Build a row→pin mapping for live-callback dispatch.
         pin_to_row = {row.selected_pin(): row for row in self._pin_rows
@@ -2140,13 +2171,13 @@ class RecordTab(_LoggedTab):
         if self._session is not None:
             self._disconnect_btn.config(state=tk.NORMAL)
         self._refresh_start_button()
-        self.app.set_status("RECORD start failed", _COLORS["danger"])
+        self.app.set_status("RECORD start failed", _COLORS["danger_dark"])
 
     def _on_stop(self) -> None:
         if not self._recording:
             return
         self._stop_btn.config(state=tk.DISABLED)
-        self.app.set_status("RECORD stopping...", _COLORS["warning"])
+        self.app.set_status("RECORD stopping...", _COLORS["warning_dark"])
 
         def cmd():
             sess = self._session
@@ -2169,7 +2200,7 @@ class RecordTab(_LoggedTab):
         self._refresh_start_button()
 
         if result is None:
-            self.app.set_status("RECORD stop error", _COLORS["danger"])
+            self.app.set_status("RECORD stop error", _COLORS["danger_dark"])
             return
         pins, events = result
         self._recorded_pins = pins
@@ -2183,10 +2214,10 @@ class RecordTab(_LoggedTab):
             total_us = sum(d for d, _ in events)
             self.app.set_status(
                 f"RECORD done: {len(events)} edges, {total_us / 1000:.3f} ms",
-                _COLORS["success"],
+                _COLORS["success_dark"],
             )
         else:
-            self.app.set_status("RECORD done: no edges captured", _COLORS["warning"])
+            self.app.set_status("RECORD done: no edges captured", _COLORS["warning_dark"])
 
     # ---- thumbnail + preview popup ---------------------------------------
 
@@ -2431,6 +2462,23 @@ class App:
             # Windows-only, so this branch only triggers in dev.
             pass
 
+        # CJK font normalisation. On Windows, Tk's default named fonts
+        # (Segoe UI 9pt) fall back to a low-quality CJK glyph set when the
+        # clam theme renders Chinese — labels look "扭曲" / pixelated. Pin
+        # the named fonts to Microsoft JhengHei UI (繁中,Win 8+,always
+        # installed on a stock Windows install) so every ttk widget
+        # inherits CJK-clean glyphs without per-widget overrides.
+        if sys.platform == "win32":
+            import tkinter.font as tkfont
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                         "TkHeadingFont", "TkCaptionFont",
+                         "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont"):
+                try:
+                    tkfont.nametofont(name).configure(
+                        family="Microsoft JhengHei UI", size=10)
+                except tk.TclError:
+                    pass
+
         self.tabs: list[_LoggedTab] = []
         self._build_widgets()
         # Populate port dropdown right after widgets exist, default-selects
@@ -2457,15 +2505,11 @@ class App:
         # Initial scan happens after notebook is built so any error logs
         # have somewhere to go (we keep this simple and silent for now).
 
-        # macOS-inspired Notebook style. Two real things being fixed here:
-        #   1. The previous bold-by-default font wasn't honoured on the
-        #      selected tab in clam, so the selected tab text actually
-        #      rendered SMALLER than the unselected ones. Setting font
-        #      explicitly via style.map(font=...) for the selected state
-        #      forces clam to apply the bold weight on selection.
-        #   2. clam gives the selected tab expand=[1,0,1,0] which makes it
-        #      "lift" out of the row. That asymmetry made tabs visually
-        #      uneven. expand=[0,0,0,0] keeps every tab the same size.
+        # macOS-inspired Notebook style. Selected tab renders ONE point
+        # larger (11pt bold) than unselected (10pt regular) per user
+        # request — visually distinguishable without the layout jitter
+        # that a 12+pt jump would cause. expand=[0,0,0,0] disables clam's
+        # default "lift" of the selected tab so all tabs stay co-planar.
         style = ttk.Style()
         try:
             style.theme_use("clam")
@@ -2495,9 +2539,16 @@ class App:
                 ("selected", _COLORS["accent"]),
                 ("active",   _COLORS["text_primary"]),
             ],
-            font=[("selected", ("TkDefaultFont", 10, "bold"))],
+            font=[("selected", ("TkDefaultFont", 11, "bold"))],
             expand=[("selected", [0, 0, 0, 0])],
         )
+
+        # Disabled-state foreground — _COLORS["text_disabled"] was defined
+        # but never applied. Without this, disabled buttons / labels are
+        # rendered with the default (full-strength) foreground, making it
+        # hard to tell whether a control is interactive.
+        for w in ("TButton", "TLabel", "TEntry", "TCombobox", "TRadiobutton"):
+            style.map(w, foreground=[("disabled", _COLORS["text_disabled"])])
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 0))
@@ -2597,7 +2648,7 @@ class App:
             self.port_var.set(AUTO_DETECT_LABEL)
         if not self.port_combo["values"]:
             self.port_combo["values"] = [AUTO_DETECT_LABEL]
-        self.set_status(f"Port scan failed: {exc}", _COLORS["danger"])
+        self.set_status(f"Port scan failed: {exc}", _COLORS["danger_dark"])
         self._maybe_unlock_refresh()
 
     def _maybe_unlock_refresh(self) -> None:
@@ -2680,6 +2731,27 @@ class App:
             return
         if selected == str(self.gpio_tab.frame):
             self.gpio_tab._ensure_pin_panel_built()
+        # Focus the Connect button of the freshly-selected tab when it's
+        # interactable, so pressing Enter immediately triggers connection
+        # without an extra mouse click. Tabs without a connect_btn (Flash)
+        # are skipped silently.
+        for tab_attr, frame_attr in (
+            ("gpio_tab", "frame"),
+            ("tdbg_tab", "frame"),
+            ("record_tab", "frame"),
+        ):
+            t = getattr(self, tab_attr, None)
+            if t is None:
+                continue
+            if selected != str(getattr(t, frame_attr)):
+                continue
+            btn = getattr(t, "_connect_btn", None)
+            if btn is not None and str(btn["state"]) == tk.NORMAL:
+                try:
+                    btn.focus_set()
+                except tk.TclError:
+                    pass
+            break
 
     def _on_close(self) -> None:
         if self.any_tab_busy():
@@ -2689,24 +2761,27 @@ class App:
                 "before closing.",
             )
             return
-        # If GPIO / TDBG tabs still hold the serial port open, close them
-        # cleanly so the OS releases the COM port. session.close() is fast
-        # (no Due round-trip), safe to do synchronously here.
-        if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
-            try:
-                self.gpio_tab._do_close_session()
-            except Exception:
-                pass
-        if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
-            try:
-                self.tdbg_tab._do_close_session()
-            except Exception:
-                pass
-        if hasattr(self, "record_tab") and self.record_tab.is_connected():
-            try:
-                self.record_tab._do_close_session()
-            except Exception:
-                pass
+        # Close any open preview Toplevel windows BEFORE destroying the
+        # root, otherwise Tk leaves them as orphaned floating windows that
+        # outlive the app on some platforms.
+        for tab in ("tdbg_tab", "record_tab"):
+            t = getattr(self, tab, None)
+            if t is not None and getattr(t, "_preview_window", None) is not None:
+                try:
+                    t._close_preview()
+                except Exception:
+                    pass
+        # If GPIO / TDBG / RECORD tabs still hold the serial port open,
+        # close them cleanly so the OS releases the COM port.
+        # session.close() is fast (no Due round-trip), safe to do
+        # synchronously here.
+        for tab in ("gpio_tab", "tdbg_tab", "record_tab"):
+            t = getattr(self, tab, None)
+            if t is not None and t.is_connected():
+                try:
+                    t._do_close_session()
+                except Exception:
+                    pass
         self.root.destroy()
 
 
