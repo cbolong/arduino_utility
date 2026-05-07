@@ -1280,30 +1280,27 @@ class TdbgTab(_LoggedTab):
         )
         self._clear_log_btn.pack(side=tk.LEFT)
 
-        # Row 3: pattern card — bordered box with title on top and a body
-        # row below holding the (square) waveform thumbnail and the Send
-        # button. The thumbnail is the click target for the preview popup.
+        # Row 3: pattern card — bordered box, single horizontal line:
+        # title + small clickable waveform thumbnail + Send button.
         card = ttk.Frame(parent, relief="groove", borderwidth=1, padding=8)
         card.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(
             card, text="TDBG 密碼1",
             font=("TkDefaultFont", 10, "bold"),
-        ).pack(anchor="w")
-        card_body = ttk.Frame(card)
-        card_body.pack(fill=tk.X, pady=(6, 0))
+        ).pack(side=tk.LEFT)
         self._preview_canvas = tk.Canvas(
-            card_body, width=32, height=32,
+            card, width=20, height=20,
             background="#1a1a1a", relief="raised", borderwidth=1,
             highlightthickness=0, cursor="hand2",
         )
-        self._preview_canvas.pack(side=tk.LEFT)
+        self._preview_canvas.pack(side=tk.LEFT, padx=(10, 8))
         self._preview_canvas.bind("<Button-1>", self._open_preview)
         _Tooltip(self._preview_canvas, "顯示波形")
         self._draw_thumbnail()
         self._send_btn = ttk.Button(
-            card_body, text="Send", command=self._on_send, state=tk.DISABLED,
+            card, text="送出", command=self._on_send, state=tk.DISABLED,
         )
-        self._send_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._send_btn.pack(side=tk.LEFT)
 
     # ---- queue / worker ---------------------------------------------------
 
@@ -1472,7 +1469,7 @@ class TdbgTab(_LoggedTab):
     # ---- mini thumbnail + preview popup -----------------------------------
 
     def _draw_thumbnail(self) -> None:
-        """Render a small square-wave shape on the row-3 32x32 canvas. The
+        """Render a small square-wave shape on the row-3 20x20 canvas. The
         canvas is the click target that opens the full preview popup —
         timing accuracy isn't important, the alternating shape just says
         "this is a digital waveform"."""
@@ -1482,22 +1479,22 @@ class TdbgTab(_LoggedTab):
             init, events = _ensure_builtin_parsed()
         except ValueError:
             canvas.create_text(
-                16, 16, text="!", fill="#b00020",
-                font=("TkDefaultFont", 12, "bold"),
+                10, 10, text="!", fill="#b00020",
+                font=("TkDefaultFont", 10, "bold"),
             )
             return
 
-        n_show = min(6, len(events))
+        n_show = min(4, len(events))
         if n_show < 2:
             return
         sub = events[:n_show]
 
         margin_x = 2
-        margin_y = 3
+        margin_y = 2
         w = int(canvas.cget("width"))
         h = int(canvas.cget("height"))
         usable_w = w - 2 * margin_x
-        y_high = margin_y + 1
+        y_high = margin_y
         y_low = h - margin_y - 1
 
         step = usable_w / n_show
