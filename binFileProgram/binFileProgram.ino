@@ -6,35 +6,13 @@
 // keeping it explicit makes the build deterministic.
 #include <Arduino.h>
 
-// ---- Forward declaration for the TC2 ch0 vector handler ----------------
-// Why this is here, not at the function definition site below:
-//
-// Arduino IDE pre-processes .ino files by running a ctags-based pass
-// that AUTO-GENERATES forward declarations for every function it finds
-// and inserts them at the TOP of the file (immediately after
-// `#include <Arduino.h>`). The .ino is then compiled as C++. For our
-// `extern "C" void TC6_Handler(void) { ... }` definition further down,
-// the auto-prototype is plain `void TC6_Handler(void);` — without
-// `extern "C"` — so the FIRST visible declaration of the symbol pins
-// it to C++ linkage. The later `extern "C"` definition then disagrees
-// with that linkage; GCC may accept the build but resolve the symbol
-// with C++ name mangling (`_Z11TC6_Handlerv`), which DOESN'T override
-// the C-linkage weak alias the SAM core's startup file declares for
-// the vector slot. Result: vector stays bound to `Dummy_Handler`
-// (a `while(1);` hang), CPCS interrupt freezes the MCU.
-//
-// Putting the forward declaration here in an explicit `extern "C"`
-// block makes the FIRST declaration C-linked. arduino-builder either
-// sees an existing prototype and skips its own, or adds one that's
-// type-system-compatible with ours. Either way, the symbol gets
-// C linkage at the link step and the vector override binds correctly.
-#ifdef __cplusplus
-extern "C" {
-#endif
-void TC6_Handler(void);
-#ifdef __cplusplus
-}
-#endif
+// TC6_Handler (TC2 ch0 compare-match ISR) is intentionally NOT defined
+// here. It lives in a sibling `tdbg_tc_isr.c` file inside the sketch
+// folder. Arduino IDE compiles `.c` files with `gcc` (not `g++`), so
+// the symbol naturally gets C linkage and bypasses the IDE's auto-
+// prototype generator that mangles the vector-table override when
+// the handler body sits in a .ino. See the file-header comment in
+// `tdbg_tc_isr.c` for the full diagnosis.
 
 // ----- Cortex-M3 DWT cycle counter (manual declaration) ----------------
 // Empirically, the Atmel-bundled core_cm3.h shipped with Arduino SAM
@@ -421,22 +399,35 @@ void handleGpioRead(const String& cmd) {
 static uint8_t  tdbgBuf[TDBG_MAX_EVENTS * TDBG_EVENT_BYTES];
 static uint16_t tdbgEventCount = 0;
 static uint8_t  tdbgPin = 0;
-static Pio*     tdbgPort = NULL;
-static uint32_t tdbgMask = 0;
 static uint8_t  tdbgInitialState = 0;
 static volatile bool tdbgStopRequested = false;
 static bool tdbgDwtReady = false;
 static bool tdbgTcReady = false;
 
-// TC playback state — written by both ISR and main loop. `volatile` on
-// the bits the ISR mutates that main reads (and vice-versa). 32-bit
-// aligned single-word reads/writes are atomic on Cortex-M3 so we don't
-// need a critical section for these.
-static volatile const uint8_t* tdbgPlayPtr   = NULL;
-static volatile uint16_t       tdbgPlayLeft  = 0;
-static volatile uint16_t       tdbgTcDeadline = 0;
-static volatile uint32_t       tdbgRemainCpu = 0;
-static volatile bool           tdbgPlayDone  = false;
+// TC playback state shared with tdbg_tc_isr.c — see file-header comment
+// in that .c file for the full rationale on why the ISR lives in a
+// separate translation unit. These vars are intentionally NOT static
+// (they need cross-TU visibility) and wrapped in an `extern "C"` block
+// so the symbol names use C linkage; the ISR's `extern uint32_t
+// tdbgMask;` etc. references resolve at link time without C++ name
+// mangling getting in the way.
+//
+// `volatile` on the bits the ISR mutates that main reads (and vice
+// versa). 32-bit aligned single-word reads/writes are atomic on
+// Cortex-M3 so we don't need a critical section for these.
+#ifdef __cplusplus
+extern "C" {
+#endif
+Pio*                    tdbgPort = NULL;
+uint32_t                tdbgMask = 0;
+volatile const uint8_t* tdbgPlayPtr   = NULL;
+volatile uint16_t       tdbgPlayLeft  = 0;
+volatile uint16_t       tdbgTcDeadline = 0;
+volatile uint32_t       tdbgRemainCpu = 0;
+volatile bool           tdbgPlayDone  = false;
+#ifdef __cplusplus
+}
+#endif
 
 static void tdbgEnableDwt() {
   if (tdbgDwtReady) return;
@@ -657,105 +648,10 @@ static bool tdbgPlayOnceSpin() {
 // remain, schedule the first chunk. Setup mirrors the same logic so the
 // first ISR gets to remain==0 only when the first event's full delta
 // has elapsed (or immediately, for the conventional delta=0 anchor).
-// RC ≥ 1 floor on every TC_RC write: SAM3X TC compare-match is
-// edge-triggered (CV transitioning into equality with RC), and a
-// deadline_inc of 0 means RC stays at the previous value — if CV is
-// already past it, we wait a full counter wrap (~1.56 ms penalty); if
-// CV is still on it, no edge fires at all (the CV: x→x non-transition
-// is what hangs fresh-arm with delta=0). Forcing the increment to ≥ 1
-// guarantees RC moves forward at least one tick, so the next CV
-// increment produces a clean edge.
-#define TDBG_TC_DEADLINE_INC(step) ({                          \
-  uint16_t _inc = (uint16_t)((uint32_t)(step) >> 1);           \
-  if (_inc == 0) _inc = 1;                                     \
-  _inc;                                                         \
-})
-
-// extern "C" is mandatory: the Arduino IDE compiles .ino files as C++,
-// and the SAM core's startup file (startup_sam3xa.c) declares the
-// vector-table slot for TC2 ch0 with C linkage —
-//   extern "C" void TC6_Handler(void) __attribute__((weak, alias("Dummy_Handler")))
-// Without `extern "C"` here, this definition gets C++ name-mangled to
-// `_Z11TC6_Handlerv`, which doesn't override the weak alias. The vector
-// stays bound to Dummy_Handler (a `while(1);` hang), and the first CPCS
-// match silently freezes the MCU — symptoms: priming and the synchronous
-// delta=0 prefix drain run, then no further pin transitions, no
-// TDBG_PLAY_DONE, host 10 s timeout. Caught by the LA capture showing
-// exactly that one HIGH→LOW transition pair.
-extern "C" void TC6_Handler(void) {
-  // Ack the compare flag (read of SR clears CPCS).
-  uint32_t sr = TC2->TC_CHANNEL[0].TC_SR;
-  (void)sr;
-
-  // Sanity probe — D13 (LED_BUILTIN, PB27) is pre-configured as output
-  // in tdbgPlayOnceTc setup; here we just SODR it on every ISR entry.
-  // SODR is idempotent (writing 1 to an already-set bit is a no-op at
-  // the hardware level), so cost is one ~1-cycle register store per
-  // ISR — negligible. tdbgPlayOnceTc's disarm paths CODR it off when
-  // playback ends, so across multiple play attempts the LED behaviour
-  // is: dark → ISR fires → lights up for ~playback duration → dark
-  // again. If the LED never lights, we know the vector slot is still
-  // bound to Dummy_Handler.
-  PIOB->PIO_SODR = (1u << 27);
-
-  // ---- Still mid-wait: schedule the next chunk, no pin write.
-  if (tdbgRemainCpu > 0) {
-    uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
-                    ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
-    tdbgRemainCpu -= step;
-    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + TDBG_TC_DEADLINE_INC(step));
-    TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
-    return;
-  }
-
-  // ---- remain == 0 → this compare is at the event-fire time.
-  if (tdbgPlayLeft == 0) {
-    // Trailing tick after the last fire; nothing left. Disarm.
-    // Order: mask source IRQ in TC, stop clock, drain stale SR flag,
-    // then mask in NVIC and clear pending. Without the SR drain +
-    // pending clear, a CPCS that asserted between IDR and CLKDIS would
-    // leave the NVIC pending bit latched, and the NEXT play's
-    // NVIC_EnableIRQ would immediately re-fire this disarm branch
-    // before any real work began.
-    TC2->TC_CHANNEL[0].TC_IDR = TC_IDR_CPCS;
-    TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
-    (void)TC2->TC_CHANNEL[0].TC_SR;
-    NVIC_DisableIRQ(TC6_IRQn);
-    NVIC_ClearPendingIRQ(TC6_IRQn);
-    PIOB->PIO_CODR = (1u << 27);   // LED probe off — playback complete
-    tdbgPlayDone = true;
-    return;
-  }
-
-  // Drive the pin for the current event.
-  uint8_t state = tdbgPlayPtr[4];
-  if (state) tdbgPort->PIO_SODR = tdbgMask;
-  else       tdbgPort->PIO_CODR = tdbgMask;
-
-  // Advance to next event.
-  tdbgPlayPtr  += TDBG_EVENT_BYTES;
-  tdbgPlayLeft--;
-  if (tdbgPlayLeft == 0) {
-    // No more events — schedule one trailing tick so the next ISR
-    // takes the disarm branch above. 64 TC ticks ≈ 1.5 µs of dead
-    // time, comfortably above the ISR round-trip cost so the next
-    // compare actually lands ahead of CV.
-    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + 64);
-    TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
-    return;
-  }
-
-  // Load next event's delta into the chunked accumulator. Schedule the
-  // first chunk (or the whole thing if it fits in 16 bits).
-  uint32_t delta_cpu;
-  __builtin_memcpy(&delta_cpu, (const void*)tdbgPlayPtr, sizeof(delta_cpu));
-  tdbgRemainCpu = delta_cpu;
-  uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
-                  ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
-  tdbgRemainCpu -= step;
-  tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + TDBG_TC_DEADLINE_INC(step));
-  TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
-}
+// TC6_Handler (TC2 ch0 compare-match ISR) lives in tdbg_tc_isr.c.
+// See that file's header for why a separate .c TU is required (Arduino
+// IDE auto-prototype + C++ name mangling were leaving the vector slot
+// bound to Dummy_Handler, freezing the MCU on the first CPCS match).
 
 static bool tdbgPlayOnceTc() {
   // Same float-LOW-safe pin priming as the spin engine.
