@@ -641,7 +641,18 @@ static bool tdbgPlayOnceSpin() {
   _inc;                                                         \
 })
 
-void TC6_Handler(void) {
+// extern "C" is mandatory: the Arduino IDE compiles .ino files as C++,
+// and the SAM core's startup file (startup_sam3xa.c) declares the
+// vector-table slot for TC2 ch0 with C linkage —
+//   extern "C" void TC6_Handler(void) __attribute__((weak, alias("Dummy_Handler")))
+// Without `extern "C"` here, this definition gets C++ name-mangled to
+// `_Z11TC6_Handlerv`, which doesn't override the weak alias. The vector
+// stays bound to Dummy_Handler (a `while(1);` hang), and the first CPCS
+// match silently freezes the MCU — symptoms: priming and the synchronous
+// delta=0 prefix drain run, then no further pin transitions, no
+// TDBG_PLAY_DONE, host 10 s timeout. Caught by the LA capture showing
+// exactly that one HIGH→LOW transition pair.
+extern "C" void TC6_Handler(void) {
   // Ack the compare flag (read of SR clears CPCS).
   uint32_t sr = TC2->TC_CHANNEL[0].TC_SR;
   (void)sr;
