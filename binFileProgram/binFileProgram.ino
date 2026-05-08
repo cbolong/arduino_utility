@@ -6,6 +6,36 @@
 // keeping it explicit makes the build deterministic.
 #include <Arduino.h>
 
+// ---- Forward declaration for the TC2 ch0 vector handler ----------------
+// Why this is here, not at the function definition site below:
+//
+// Arduino IDE pre-processes .ino files by running a ctags-based pass
+// that AUTO-GENERATES forward declarations for every function it finds
+// and inserts them at the TOP of the file (immediately after
+// `#include <Arduino.h>`). The .ino is then compiled as C++. For our
+// `extern "C" void TC6_Handler(void) { ... }` definition further down,
+// the auto-prototype is plain `void TC6_Handler(void);` — without
+// `extern "C"` — so the FIRST visible declaration of the symbol pins
+// it to C++ linkage. The later `extern "C"` definition then disagrees
+// with that linkage; GCC may accept the build but resolve the symbol
+// with C++ name mangling (`_Z11TC6_Handlerv`), which DOESN'T override
+// the C-linkage weak alias the SAM core's startup file declares for
+// the vector slot. Result: vector stays bound to `Dummy_Handler`
+// (a `while(1);` hang), CPCS interrupt freezes the MCU.
+//
+// Putting the forward declaration here in an explicit `extern "C"`
+// block makes the FIRST declaration C-linked. arduino-builder either
+// sees an existing prototype and skips its own, or adds one that's
+// type-system-compatible with ours. Either way, the symbol gets
+// C linkage at the link step and the vector override binds correctly.
+#ifdef __cplusplus
+extern "C" {
+#endif
+void TC6_Handler(void);
+#ifdef __cplusplus
+}
+#endif
+
 // ----- Cortex-M3 DWT cycle counter (manual declaration) ----------------
 // Empirically, the Atmel-bundled core_cm3.h shipped with Arduino SAM
 // 1.6.x declares CoreDebug_Type but NOT DWT_Type — building against it
@@ -657,6 +687,17 @@ extern "C" void TC6_Handler(void) {
   uint32_t sr = TC2->TC_CHANNEL[0].TC_SR;
   (void)sr;
 
+  // Sanity probe — D13 (LED_BUILTIN, PB27) is pre-configured as output
+  // in tdbgPlayOnceTc setup; here we just SODR it on every ISR entry.
+  // SODR is idempotent (writing 1 to an already-set bit is a no-op at
+  // the hardware level), so cost is one ~1-cycle register store per
+  // ISR — negligible. tdbgPlayOnceTc's disarm paths CODR it off when
+  // playback ends, so across multiple play attempts the LED behaviour
+  // is: dark → ISR fires → lights up for ~playback duration → dark
+  // again. If the LED never lights, we know the vector slot is still
+  // bound to Dummy_Handler.
+  PIOB->PIO_SODR = (1u << 27);
+
   // ---- Still mid-wait: schedule the next chunk, no pin write.
   if (tdbgRemainCpu > 0) {
     uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
@@ -681,6 +722,7 @@ extern "C" void TC6_Handler(void) {
     (void)TC2->TC_CHANNEL[0].TC_SR;
     NVIC_DisableIRQ(TC6_IRQn);
     NVIC_ClearPendingIRQ(TC6_IRQn);
+    PIOB->PIO_CODR = (1u << 27);   // LED probe off — playback complete
     tdbgPlayDone = true;
     return;
   }
@@ -721,6 +763,13 @@ static bool tdbgPlayOnceTc() {
   else                  tdbgPort->PIO_CODR = tdbgMask;
   tdbgPort->PIO_PER = tdbgMask;
   tdbgPort->PIO_OER = tdbgMask;
+
+  // Sanity-probe LED setup — D13 (LED_BUILTIN = PB27) starts dark; the
+  // ISR will SODR it on at first entry. Disarm paths CODR it off so
+  // each play attempt has its own visible "ISR ran" signal.
+  PIOB->PIO_PER  = (1u << 27);
+  PIOB->PIO_OER  = (1u << 27);
+  PIOB->PIO_CODR = (1u << 27);
 
   // Drain leading delta=0 events synchronously, BEFORE arming TC. The
   // parser at parse_acute_txt anchors playback's t=0 at the first
@@ -785,6 +834,7 @@ static bool tdbgPlayOnceTc() {
       (void)TC2->TC_CHANNEL[0].TC_SR;
       NVIC_DisableIRQ(TC6_IRQn);
       NVIC_ClearPendingIRQ(TC6_IRQn);
+      PIOB->PIO_CODR = (1u << 27); // LED probe off — STOP path
       tdbgStopRequested = true;
       return false;
     }
