@@ -1584,10 +1584,29 @@ class TdbgTab(_LoggedTab):
         except ValueError as e:
             self._append_log(f"builtin pattern parse error: {e}", "err")
             return
-        from binFileTransfer_core import DUE_CPU_HZ
+        # Source captures sit at ~380 ns deltas (32 cycles), well below the
+        # TC engine's ~700 ns ISR floor — replaying as-is would slip every
+        # short pulse onto a counter wrap (~1.56 ms penalty each) and lose
+        # the cluster shape entirely. Retime the within-cluster deltas so
+        # the minimum half-period clears the floor; long inter-cluster
+        # gaps are passed through, keeping total runtime close to the
+        # original capture. The receiver's PLL locks on whatever clean
+        # period it sees in the 32-cycle preamble, so absolute timing
+        # doesn't matter.
+        from binFileTransfer_core import DUE_CPU_HZ, tdbg_retime_for_engine
+        original_duration_s = sum(d for d, _ in events) / DUE_CPU_HZ
+        events, scale = tdbg_retime_for_engine(events)
         duration_s = sum(d for d, _ in events) / DUE_CPU_HZ
+        if scale != 1.0:
+            self._append_log(
+                f"retimed: {scale:.2f}× (engine-floor scale, "
+                f"{original_duration_s*1000:.0f} ms → "
+                f"{duration_s*1000:.0f} ms)",
+                "info",
+            )
 
         self._send_btn.config(state=tk.DISABLED)
+        self._calib_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._disconnect_btn.config(state=tk.DISABLED)
         self.app.set_status("TDBG playing...", _COLORS["warning_dark"])

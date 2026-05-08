@@ -571,6 +571,55 @@ def tdbg_calibration_pattern() -> tuple[int, list[tuple[int, int]]]:
     return initial_state, events
 
 
+def tdbg_retime_for_engine(
+    events: list[tuple[int, int]],
+    target_min_half_period_cycles: int = 126,
+    gap_threshold_cycles: int = 84_000,
+) -> tuple[list[tuple[int, int]], float]:
+    """Scale within-cluster deltas so the minimum half-period meets the
+    TC engine's safe floor. Used by the GUI before sending captured
+    patterns whose source min delta (e.g. 32 cycles ≈ 380 ns from a
+    1.3 MHz capture) sits below the ISR's ~700-800 ns round-trip floor.
+
+    Long gaps (delta > gap_threshold_cycles) are passed through
+    unchanged, so total runtime stays close to the original capture
+    duration — most of the time in a captured pattern lives in
+    inter-cluster gaps, and stretching those would multiply user-
+    visible playback latency for no protocol benefit.
+
+    The delta=0 anchor (event 0 from parse_acute_txt) is also passed
+    through unchanged.
+
+    Args:
+        events: list of (delta_cycles, state) from parse_acute_txt.
+        target_min_half_period_cycles: lower floor for short deltas
+            after scaling. Default 126 = 1.5 µs at 84 MHz, matching
+            the engine's safely-replayable minimum.
+        gap_threshold_cycles: deltas above this are treated as "long
+            gaps" and not scaled. Default 84_000 = 1 ms at 84 MHz.
+
+    Returns:
+        (scaled_events, scale_factor). scale_factor is 1.0 if no
+        scaling was needed (i.e. min short delta already met the
+        floor) — the caller can skip the "scaled to X×" log line.
+    """
+    short_deltas = [d for d, _ in events
+                    if 0 < d <= gap_threshold_cycles]
+    if not short_deltas:
+        return events, 1.0
+    min_short = min(short_deltas)
+    if min_short >= target_min_half_period_cycles:
+        return events, 1.0
+    scale = target_min_half_period_cycles / min_short
+    out: list[tuple[int, int]] = []
+    for d, s in events:
+        if 0 < d <= gap_threshold_cycles:
+            out.append((round(d * scale), s))
+        else:
+            out.append((d, s))
+    return out, scale
+
+
 class TdbgSession:
     """Persistent TDBG session — same lifecycle pattern as GpioSession.
 
