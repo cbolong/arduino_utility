@@ -694,6 +694,12 @@ class TdbgSession:
         blob = tdbg_pack_events(events)
         expected_crc = tdbg_crc16(blob)
 
+        # Drain any leftover lines from a previous fire-and-forget play()
+        # (TDBG_PLAY_DONE / TDBG_STOPPED). If we don't, _read_line below
+        # would consume one of those in place of TDBG_READY and the
+        # handshake mismatches.
+        self._drain_stale()
+
         cmd = f"TDBG_LOAD {pin} {len(events)} {initial_state}"
         self._log(f"send: {cmd}", "info")
         self._ser.write(f"{cmd}\n".encode("UTF-8"))
@@ -739,26 +745,41 @@ class TdbgSession:
         total_duration_s: float = 0.0,
         stop_event: "threading.Event | None" = None,
     ) -> bool:
-        """Run playback and block until TDBG_PLAY_DONE.
+        """Send TDBG_PLAY and return as soon as the MCU acks with
+        TDBG_PLAY_STARTED. Fire-and-forget — we do NOT wait for
+        TDBG_PLAY_DONE.
 
-        iterations=1 → single shot; >1 → finite loop; 0 → infinite (use only
-        with stop_event so this can actually return).
+        Rationale (per user spec): TDBG is a clock-burst output, not a
+        request/response transaction. Once the MCU starts driving the
+        pin, the receiver hardware is what cares about the signal. The
+        host has nothing useful to do during the playback, and a
+        timeout-based "did it finish" check just produces spurious
+        errors when the MCU is fine but slower than the host's guess
+        (or when the user yanks the cable mid-play, etc.).
 
-        `total_duration_s` is a per-iteration estimate used to size the
-        completion timeout; pass 0 for default.
+        Subsequent commands on this session drain any leftover
+        TDBG_PLAY_DONE / TDBG_STOPPED that the MCU may have queued
+        after we walked away, so the next handshake doesn't see stale
+        replies (see `load`).
 
-        `stop_event` (optional threading.Event) — if set during the wait,
-        the session writes TDBG_STOP and continues to drain replies until
-        TDBG_PLAY_DONE arrives.
+        iterations=0 (infinite) is rejected here — without a wait
+        loop, "infinite" just means "fire once and pretend it's
+        infinite", which isn't useful. Use iterations=N for a finite
+        loop the MCU will run on its own.
+
+        stop_event and total_duration_s are accepted for API
+        compatibility but ignored — there's no longer a poll loop to
+        notice them.
         """
+        del stop_event, total_duration_s   # unused under fire-and-forget
         if not self.is_open:
             self._log("TDBG session not open.", "err")
             return False
-        if iterations < 0:
-            self._log(f"iterations must be >= 0, got {iterations}", "err")
-            return False
-        if iterations == 0 and stop_event is None:
-            self._log("infinite loop without stop_event would never return", "err")
+        if iterations < 1:
+            self._log(
+                f"iterations must be >= 1 under fire-and-forget play, got {iterations}",
+                "err",
+            )
             return False
 
         if iterations == 1:
@@ -768,15 +789,7 @@ class TdbgSession:
         self._log(f"send: {cmd}", "info")
         self._ser.write(f"{cmd}\n".encode("UTF-8"))
 
-        if not self._await_play_started():
-            return False
-
-        if iterations == 0:
-            # Infinite — just keep the read pump alive until stop arrives.
-            timeout = float("inf")
-        else:
-            timeout = max(10.0, total_duration_s * iterations + 5.0)
-        return self._await_play_done(timeout, stop_event=stop_event)
+        return self._await_play_started()
 
     def _await_play_started(self) -> bool:
         reply = _read_line(self._ser, self._log, 5.0)
@@ -788,6 +801,23 @@ class TdbgSession:
         else:
             self._log(f"recv: {reply or '(no reply)'} (expected TDBG_PLAY_STARTED)", "err")
         return False
+
+    def _drain_stale(self, max_lines: int = 16) -> None:
+        """Drain any leftover lines the MCU sent after a previous
+        fire-and-forget play (typically TDBG_PLAY_DONE or TDBG_STOPPED).
+        Called at the start of load() so the next handshake doesn't
+        consume them in place of TDBG_READY / TDBG_LOADED."""
+        # in_waiting is a count; readline blocks up to ser.timeout. To
+        # stay non-blocking, only readline while there's data buffered.
+        try:
+            for _ in range(max_lines):
+                if self._ser.in_waiting <= 0:
+                    return
+                stale = self._ser.readline().decode(errors="ignore").strip()
+                if stale:
+                    self._log(f"drained stale: {stale}", "info")
+        except Exception:
+            return
 
     def _await_play_done(
         self,

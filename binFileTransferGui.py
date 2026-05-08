@@ -1609,7 +1609,7 @@ class TdbgTab(_LoggedTab):
         self._calib_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._disconnect_btn.config(state=tk.DISABLED)
-        self.app.set_status("TDBG playing...", _COLORS["warning_dark"])
+        self.app.set_status("TDBG sending...", _COLORS["warning_dark"])
 
         def cmd():
             sess = self._session
@@ -1629,7 +1629,7 @@ class TdbgTab(_LoggedTab):
             self._pin_combo.config(state="readonly")
             self._disconnect_btn.config(state=tk.NORMAL)
         self.app.set_status(
-            "TDBG done" if success else "TDBG error",
+            "TDBG sent — D23 driving" if success else "TDBG error",
             _COLORS["success_dark"] if success else _COLORS["danger_dark"],
         )
 
@@ -1654,7 +1654,7 @@ class TdbgTab(_LoggedTab):
         self._calib_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
         self._disconnect_btn.config(state=tk.DISABLED)
-        self.app.set_status("TDBG calibrating...", _COLORS["warning_dark"])
+        self.app.set_status("TDBG sending calibration...", _COLORS["warning_dark"])
 
         def cmd():
             sess = self._session
