@@ -627,6 +627,20 @@ static bool tdbgPlayOnceSpin() {
 // remain, schedule the first chunk. Setup mirrors the same logic so the
 // first ISR gets to remain==0 only when the first event's full delta
 // has elapsed (or immediately, for the conventional delta=0 anchor).
+// RC ≥ 1 floor on every TC_RC write: SAM3X TC compare-match is
+// edge-triggered (CV transitioning into equality with RC), and a
+// deadline_inc of 0 means RC stays at the previous value — if CV is
+// already past it, we wait a full counter wrap (~1.56 ms penalty); if
+// CV is still on it, no edge fires at all (the CV: x→x non-transition
+// is what hangs fresh-arm with delta=0). Forcing the increment to ≥ 1
+// guarantees RC moves forward at least one tick, so the next CV
+// increment produces a clean edge.
+#define TDBG_TC_DEADLINE_INC(step) ({                          \
+  uint16_t _inc = (uint16_t)((uint32_t)(step) >> 1);           \
+  if (_inc == 0) _inc = 1;                                     \
+  _inc;                                                         \
+})
+
 void TC6_Handler(void) {
   // Ack the compare flag (read of SR clears CPCS).
   uint32_t sr = TC2->TC_CHANNEL[0].TC_SR;
@@ -637,7 +651,7 @@ void TC6_Handler(void) {
     uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
                     ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
     tdbgRemainCpu -= step;
-    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + (uint16_t)(step >> 1));
+    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + TDBG_TC_DEADLINE_INC(step));
     TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
     return;
   }
@@ -645,9 +659,17 @@ void TC6_Handler(void) {
   // ---- remain == 0 → this compare is at the event-fire time.
   if (tdbgPlayLeft == 0) {
     // Trailing tick after the last fire; nothing left. Disarm.
+    // Order: mask source IRQ in TC, stop clock, drain stale SR flag,
+    // then mask in NVIC and clear pending. Without the SR drain +
+    // pending clear, a CPCS that asserted between IDR and CLKDIS would
+    // leave the NVIC pending bit latched, and the NEXT play's
+    // NVIC_EnableIRQ would immediately re-fire this disarm branch
+    // before any real work began.
     TC2->TC_CHANNEL[0].TC_IDR = TC_IDR_CPCS;
     TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
+    (void)TC2->TC_CHANNEL[0].TC_SR;
     NVIC_DisableIRQ(TC6_IRQn);
+    NVIC_ClearPendingIRQ(TC6_IRQn);
     tdbgPlayDone = true;
     return;
   }
@@ -662,9 +684,10 @@ void TC6_Handler(void) {
   tdbgPlayLeft--;
   if (tdbgPlayLeft == 0) {
     // No more events — schedule one trailing tick so the next ISR
-    // takes the disarm branch above. 32 TC ticks ≈ 760 ns of dead
-    // time; negligible.
-    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + 32);
+    // takes the disarm branch above. 64 TC ticks ≈ 1.5 µs of dead
+    // time, comfortably above the ISR round-trip cost so the next
+    // compare actually lands ahead of CV.
+    tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + 64);
     TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
     return;
   }
@@ -677,7 +700,7 @@ void TC6_Handler(void) {
   uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
                   ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
   tdbgRemainCpu -= step;
-  tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + (uint16_t)(step >> 1));
+  tdbgTcDeadline = (uint16_t)(tdbgTcDeadline + TDBG_TC_DEADLINE_INC(step));
   TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
 }
 
@@ -688,15 +711,38 @@ static bool tdbgPlayOnceTc() {
   tdbgPort->PIO_PER = tdbgMask;
   tdbgPort->PIO_OER = tdbgMask;
 
-  // Prime ISR state for the FIRST event. State machine matches the
-  // ISR's: tdbgRemainCpu = full first delta minus the first chunk;
-  // deadline = chunk TC ticks. First ISR fires when counter reaches
-  // deadline and either consumes the next chunk or, if the residue
-  // already fits, hits remain==0 and triggers the pin fire.
+  // Drain leading delta=0 events synchronously, BEFORE arming TC. The
+  // parser at parse_acute_txt anchors playback's t=0 at the first
+  // transition by emitting events[0] with delta=0; arming TC with RC=0
+  // against a freshly-reset CV=0 is a hardware no-op on SAM3X — the TC
+  // compare event is edge-triggered (CV transitioning into equality
+  // with RC), and CV: 0→0 produces no edge, so the CPCS interrupt
+  // never fires and playback hangs. Treating the delta=0 prefix as
+  // setup-time pin writes (analogous to the priming PIO_OER above)
+  // lets us arm TC with the first non-zero-delta event, which yields
+  // RC ≥ 1 and a clean CV: 0→1→...→RC edge into equality.
   tdbgPlayPtr  = tdbgBuf;
   tdbgPlayLeft = tdbgEventCount;
   tdbgPlayDone = false;
 
+  while (tdbgPlayLeft > 0) {
+    uint32_t prefix_delta;
+    memcpy(&prefix_delta, (const void*)tdbgPlayPtr, sizeof(prefix_delta));
+    if (prefix_delta != 0) break;
+    uint8_t pstate = tdbgPlayPtr[4];
+    if (pstate) tdbgPort->PIO_SODR = tdbgMask;
+    else        tdbgPort->PIO_CODR = tdbgMask;
+    tdbgPlayPtr += TDBG_EVENT_BYTES;
+    tdbgPlayLeft--;
+  }
+  if (tdbgPlayLeft == 0) {
+    // Degenerate input: every event had delta=0. Pin already reflects
+    // the final state from the prefix loop. Nothing to schedule.
+    tdbgPlayDone = true;
+    return true;
+  }
+
+  // First non-zero-delta event ready to arm TC against.
   uint32_t delta_cpu;
   memcpy(&delta_cpu, (const void*)tdbgPlayPtr, sizeof(delta_cpu));
   tdbgTcDeadline = 0;
@@ -704,9 +750,9 @@ static bool tdbgPlayOnceTc() {
   uint32_t step = (tdbgRemainCpu > TDBG_TC_CHUNK_CPU)
                   ? TDBG_TC_CHUNK_CPU : tdbgRemainCpu;
   tdbgRemainCpu -= step;
-  tdbgTcDeadline = (uint16_t)(step >> 1);
-  // RC=0 (delta=0 anchor) is legal: counter starts at 0 after SWTRG,
-  // immediate match → first ISR fires at t=0 and pin priming holds.
+  uint16_t deadline_inc = (uint16_t)(step >> 1);
+  if (deadline_inc == 0) deadline_inc = 1;   // RC ≥ 1 floor — see ISR
+  tdbgTcDeadline = deadline_inc;
   TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
 
   // Arm: enable CPCS interrupt, enable clock, software-trigger reset.
@@ -720,8 +766,14 @@ static bool tdbgPlayOnceTc() {
   // discipline needed: the ISR is short and self-contained.
   while (!tdbgPlayDone) {
     if (tdbgPumpStop()) {
-      NVIC_DisableIRQ(TC6_IRQn);
+      // Same disarm sequence as the natural-end disarm path in the
+      // ISR — mask + stop + drain SR + clear NVIC pending — so a
+      // subsequent re-arm doesn't immediately fire on a stale flag.
+      TC2->TC_CHANNEL[0].TC_IDR = TC_IDR_CPCS;
       TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
+      (void)TC2->TC_CHANNEL[0].TC_SR;
+      NVIC_DisableIRQ(TC6_IRQn);
+      NVIC_ClearPendingIRQ(TC6_IRQn);
       tdbgStopRequested = true;
       return false;
     }
