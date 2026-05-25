@@ -815,31 +815,23 @@ class TdbgSession:
         total_duration_s: float = 0.0,
         stop_event: "threading.Event | None" = None,
     ) -> bool:
-        """Send TDBG_PLAY and return as soon as the MCU acks with
-        TDBG_PLAY_STARTED. Fire-and-forget — we do NOT wait for
-        TDBG_PLAY_DONE.
+        """Send TDBG_PLAY and return immediately. Fire-and-forget — we do
+        NOT read any reply, not even TDBG_PLAY_STARTED.
 
         Rationale (per user spec): TDBG is a clock-burst output, not a
-        request/response transaction. Once the MCU starts driving the
-        pin, the receiver hardware is what cares about the signal. The
-        host has nothing useful to do during the playback, and a
-        timeout-based "did it finish" check just produces spurious
-        errors when the MCU is fine but slower than the host's guess
-        (or when the user yanks the cable mid-play, etc.).
+        request/response transaction. The receiver on the driven pin never
+        ACKs, so there is nothing to wait for. The MCU still emits
+        TDBG_PLAY_STARTED / TDBG_PLAY_DONE, but those just sit in the input
+        buffer and get drained by the next command (see `load`, which sends
+        TDBG_STOP + drains before its handshake).
 
-        Subsequent commands on this session drain any leftover
-        TDBG_PLAY_DONE / TDBG_STOPPED that the MCU may have queued
-        after we walked away, so the next handshake doesn't see stale
-        replies (see `load`).
+        iterations=0 (infinite) is rejected — without a wait loop,
+        "infinite" just means "fire once and pretend it's infinite", which
+        isn't useful. Use iterations=N for a finite loop the MCU runs on
+        its own.
 
-        iterations=0 (infinite) is rejected here — without a wait
-        loop, "infinite" just means "fire once and pretend it's
-        infinite", which isn't useful. Use iterations=N for a finite
-        loop the MCU will run on its own.
-
-        stop_event and total_duration_s are accepted for API
-        compatibility but ignored — there's no longer a poll loop to
-        notice them.
+        stop_event and total_duration_s are accepted for API compatibility
+        but ignored — there's no poll loop to notice them.
         """
         del stop_event, total_duration_s   # unused under fire-and-forget
         if not self.is_open:
@@ -859,18 +851,8 @@ class TdbgSession:
         with _serial_guard(self._lock):
             self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
-            return self._await_play_started()
-
-    def _await_play_started(self) -> bool:
-        reply = _read_line(self._ser, self._log, 5.0)
-        if reply == MCU_TDBG_PLAY_STARTED:
-            self._log(f"recv: {reply}", "ok")
-            return True
-        if reply and reply.startswith(MCU_TDBG_ERROR_PREFIX):
-            self._log(f"recv: {reply}", "err")
-        else:
-            self._log(f"recv: {reply or '(no reply)'} (expected TDBG_PLAY_STARTED)", "err")
-        return False
+            self._ser.flush()
+        return True
 
     def _drain_stale(self, max_lines: int = 16) -> None:
         """Drain any leftover lines the MCU sent after a previous

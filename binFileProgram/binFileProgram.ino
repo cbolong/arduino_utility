@@ -425,12 +425,6 @@ volatile uint16_t       tdbgPlayLeft  = 0;
 volatile uint16_t       tdbgTcDeadline = 0;
 volatile uint32_t       tdbgRemainCpu = 0;
 volatile bool           tdbgPlayDone  = false;
-// Set true on every TC6 ISR entry (in tdbg_tc_isr.c). The play-wait loop
-// uses it as a liveness beacon: the chunking logic guarantees the ISR
-// fires at least every ~780 µs even across long gaps, so a multi-hundred-
-// ms silence means the engine has stalled. Lets a hang surface as a
-// host-visible TDBG_ERROR instead of a dead-silent freeze.
-volatile bool           tdbgIsrFired = false;
 // Defined in tdbg_tc_isr.c (C linkage). Forward-declared here so we can
 // install it by address into the relocated RAM vector table — see
 // tdbgInstallTcVector(). We no longer rely on the link-time weak-alias
@@ -752,7 +746,6 @@ static bool tdbgPlayOnceTc() {
   TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
 
   // Arm: enable CPCS interrupt, enable clock, software-trigger reset.
-  tdbgIsrFired = false;
   TC2->TC_CHANNEL[0].TC_IER = TC_IER_CPCS;
   NVIC_ClearPendingIRQ(TC6_IRQn);
   NVIC_EnableIRQ(TC6_IRQn);
@@ -761,36 +754,7 @@ static bool tdbgPlayOnceTc() {
   // Main loop spins polling for STOP — interrupts run normally so USB
   // CDC, SysTick, and inbound serial all work. Zero noInterrupts()
   // discipline needed: the ISR is short and self-contained.
-  //
-  // Liveness watchdog: the chunking logic re-arms RC at least every
-  // ~780 µs (TDBG_TC_CHUNK_CPU), so the ISR keeps firing throughout the
-  // whole playback — even across multi-hundred-ms gaps. If the beacon
-  // stays quiet for far longer than that, the engine has stalled. We
-  // report it instead of spinning forever (which is what produced the
-  // dead-silent "PLAY_STARTED then nothing" symptom). `everFired`
-  // distinguishes "ISR never ran at all" (vector/setup problem) from
-  // "ISR ran then stalled" (engine logic problem) in the error line.
-  // NOTE: this can only fire if the ISR returns to this loop; a true
-  // hard wedge (vector bound to a while(1) handler) never reaches here —
-  // that case is what tdbgInstallTcVector() exists to prevent.
-  bool everFired = false;
-  unsigned long lastIsrMs = millis();
   while (!tdbgPlayDone) {
-    if (tdbgIsrFired) {
-      tdbgIsrFired = false;
-      everFired = true;
-      lastIsrMs = millis();
-    } else if (millis() - lastIsrMs > 500) {
-      TC2->TC_CHANNEL[0].TC_IDR = TC_IDR_CPCS;
-      TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
-      (void)TC2->TC_CHANNEL[0].TC_SR;
-      NVIC_DisableIRQ(TC6_IRQn);
-      NVIC_ClearPendingIRQ(TC6_IRQn);
-      PIOB->PIO_CODR = (1u << 27); // LED probe off — watchdog path
-      Serial.print("TDBG_ERROR play_timeout isrfired=");
-      Serial.println(everFired ? "1" : "0");
-      return false;
-    }
     if (tdbgPumpStop()) {
       // Same disarm sequence as the natural-end disarm path in the
       // ISR — mask + stop + drain SR + clear NVIC pending — so a

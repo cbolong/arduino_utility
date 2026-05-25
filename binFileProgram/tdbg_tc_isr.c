@@ -52,7 +52,6 @@ extern volatile uint16_t       tdbgPlayLeft;
 extern volatile uint16_t       tdbgTcDeadline;
 extern volatile uint32_t       tdbgRemainCpu;
 extern volatile bool           tdbgPlayDone;
-extern volatile bool           tdbgIsrFired;
 
 /* Inline helper: deadline_inc = step >> 1, floored at 1.
  *
@@ -73,11 +72,6 @@ void TC6_Handler(void) {
     /* Acknowledge the compare flag (read of SR clears CPCS). */
     uint32_t sr = TC2->TC_CHANNEL[0].TC_SR;
     (void)sr;
-
-    /* Liveness beacon for the play-wait loop's watchdog (see
-     * tdbgPlayOnceTc in the .ino). Set on every entry; the loop clears
-     * it and treats a long silence as a stall. */
-    tdbgIsrFired = true;
 
     /* Sanity probe — D13 (LED_BUILTIN, PB27) is pre-configured as an
      * output by tdbgPlayOnceTc setup; here we just SODR it on every
