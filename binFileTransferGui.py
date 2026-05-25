@@ -457,10 +457,15 @@ class _PinRow:
         else:
             self.high_radio.config(state="disabled")
             self.low_radio.config(state="disabled")
-            # Clear stale value selection so radios visually match disabled state.
+            # Clear stale value selection so radios visually match disabled
+            # state. try/finally so a Tk error can't leave the flag stuck at
+            # True — that would silently swallow every later HIGH/LOW click
+            # via the guard at the top of _on_value_changed.
             self._suppress_callbacks = True
-            self.value_var.set("")
-            self._suppress_callbacks = False
+            try:
+                self.value_var.set("")
+            finally:
+                self._suppress_callbacks = False
         # Tell controller — value=None means "just switch mode, don't drive".
         self.on_set(self.pin, new_mode, None)
 
@@ -750,6 +755,7 @@ class GpioTab(_LoggedTab):
 
     def _on_pin_set(self, pin: int, mode: str, value: str | None) -> None:
         if self._session is None:
+            self._log_callback_threadsafe(f"尚未連線，無法設定 D{pin}", "warn")
             return
 
         def cmd():
@@ -774,6 +780,7 @@ class GpioTab(_LoggedTab):
 
     def _on_read_all(self) -> None:
         if self._session is None:
+            self._log_callback_threadsafe("尚未連線，無法讀取", "warn")
             return
 
         def cmd():
