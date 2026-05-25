@@ -13,6 +13,13 @@ from tkinter import filedialog, messagebox, ttk
 # launch instead of waiting for those imports to finish first.
 
 
+# Real font-family name behind TkDefaultFont, resolved once in App.__init__
+# (needs a live Tk root). Used wherever a (family, size, weight) tuple is
+# needed — passing the named-font string "TkDefaultFont" as the family is a
+# bug (no family by that name → ugly fallback). Placeholder until resolved.
+_UI_FAMILY = "TkDefaultFont"
+
+
 def _resource_path(rel: str) -> str:
     """Resolve a path relative to either the script dir (dev) or
     PyInstaller's _MEIPASS extraction dir (built EXE)."""
@@ -68,7 +75,7 @@ class _Tooltip:
             tw, text=self._text,
             background="#2c2c2e", foreground="#ffffff",
             borderwidth=0, padx=8, pady=3,
-            font=("TkDefaultFont", 9),
+            font=(_UI_FAMILY, 9),
         ).pack()
         self._tip = tw
 
@@ -1418,7 +1425,7 @@ class TdbgTab(_LoggedTab):
         card.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(
             card, text="TDBG 密碼1",
-            font=("TkDefaultFont", 10, "bold"),
+            font=(_UI_FAMILY, 10, "bold"),
         ).pack(side=tk.LEFT)
         self._preview_canvas = tk.Canvas(
             card, width=_scale(20), height=_scale(20),
@@ -1681,7 +1688,7 @@ class TdbgTab(_LoggedTab):
         except ValueError:
             canvas.create_text(
                 10, 10, text="!", fill=_COLORS["danger"],
-                font=("TkDefaultFont", 10, "bold"),
+                font=(_UI_FAMILY, 10, "bold"),
             )
             return
 
@@ -2377,7 +2384,7 @@ class RecordTab(_LoggedTab):
         if not events or not pins:
             canvas.create_text(
                 10, 10, text="—", fill="#888888",
-                font=("TkDefaultFont", 10, "bold"),
+                font=(_UI_FAMILY, 10, "bold"),
             )
             return
         # Compress the first ~6 transitions of the first pin onto 20x20.
@@ -2616,8 +2623,8 @@ class App:
         # the named fonts to Microsoft JhengHei UI (繁中,Win 8+,always
         # installed on a stock Windows install) so every ttk widget
         # inherits CJK-clean glyphs without per-widget overrides.
+        import tkinter.font as tkfont
         if sys.platform == "win32":
-            import tkinter.font as tkfont
             for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                          "TkHeadingFont", "TkCaptionFont",
                          "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont"):
@@ -2626,6 +2633,21 @@ class App:
                         family="Microsoft JhengHei UI", size=10)
                 except tk.TclError:
                     pass
+        # Resolve the REAL family name behind the TkDefaultFont named font.
+        # Widgets/styles that need a custom size or weight can't use the
+        # named-font string directly — they must pass a (family, size,
+        # ...) tuple, and the first tuple element is interpreted as a font
+        # FAMILY, not a named font. Passing "TkDefaultFont" there is a bug:
+        # there's no family by that name, so Tk falls back to an ugly
+        # default and size/weight apply inconsistently (this is why the
+        # tabs looked pixelated and the selected tab wasn't visibly larger).
+        # Resolve the actual family once and use it everywhere via the
+        # module global _UI_FAMILY.
+        global _UI_FAMILY
+        try:
+            _UI_FAMILY = tkfont.nametofont("TkDefaultFont").actual("family")
+        except tk.TclError:
+            _UI_FAMILY = "TkDefaultFont"
 
         self.tabs: list[_LoggedTab] = []
         self._build_widgets()
@@ -2653,11 +2675,13 @@ class App:
         # Initial scan happens after notebook is built so any error logs
         # have somewhere to go (we keep this simple and silent for now).
 
-        # macOS-inspired Notebook style. Selected tab renders ONE point
-        # larger (11pt bold) than unselected (10pt regular) per user
-        # request — visually distinguishable without the layout jitter
-        # that a 12+pt jump would cause. expand=[0,0,0,0] disables clam's
-        # default "lift" of the selected tab so all tabs stay co-planar.
+        # macOS-inspired Notebook style. Selected tab renders 12pt bold vs
+        # unselected 10pt regular, using the resolved _UI_FAMILY (NOT the
+        # "TkDefaultFont" named-font string, which as a tuple family name
+        # is invalid and falls back to an ugly default — that bug is why
+        # the selected tab previously didn't look larger). expand=[0,0,0,0]
+        # disables clam's default "lift" of the selected tab so all tabs
+        # stay co-planar.
         style = ttk.Style()
         try:
             style.theme_use("clam")
@@ -2672,7 +2696,7 @@ class App:
         style.configure(
             "TNotebook.Tab",
             padding=[16, 8],
-            font=("TkDefaultFont", 10),
+            font=(_UI_FAMILY, 10),
             background=_COLORS["surface_2"],
             foreground=_COLORS["text_secondary"],
             borderwidth=0,
@@ -2687,7 +2711,7 @@ class App:
                 ("selected", _COLORS["accent"]),
                 ("active",   _COLORS["text_primary"]),
             ],
-            font=[("selected", ("TkDefaultFont", 11, "bold"))],
+            font=[("selected", (_UI_FAMILY, 12, "bold"))],
             expand=[("selected", [0, 0, 0, 0])],
         )
 
