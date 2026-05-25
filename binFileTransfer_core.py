@@ -749,6 +749,26 @@ class TdbgSession:
             # handshake mismatches.
             self._drain_stale()
 
+            # Abort any still-running playback before loading. Under
+            # fire-and-forget play() the MCU may still be mid-playback
+            # (~1.3 s) when the user sends a new pattern; while playing it
+            # is blocked in its play loop and silently DISCARDS any
+            # non-TDBG_STOP line — so a TDBG_LOAD sent now would be eaten
+            # and we'd time out waiting for TDBG_READY. TDBG_STOP is the
+            # one command that loop honours: it cleanly aborts and returns
+            # the MCU to its idle command loop. If nothing is playing, the
+            # idle loop just ignores TDBG_STOP (no reply), so this is a
+            # harmless no-op. Drain the TDBG_STOPPED / TDBG_PLAY_DONE the
+            # abort produces before starting the LOAD handshake.
+            self._ser.write(b"TDBG_STOP\n")
+            self._ser.flush()
+            _stop_deadline = time.monotonic() + 0.5
+            while time.monotonic() < _stop_deadline:
+                line = _read_line(self._ser, self._log, 0.15, quiet=True)
+                if line is None:
+                    break
+                self._log(f"drained: {line}", "info")
+
             cmd = f"TDBG_LOAD {pin} {len(events)} {initial_state}"
             self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))

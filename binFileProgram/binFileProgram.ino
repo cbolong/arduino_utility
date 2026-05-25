@@ -425,6 +425,18 @@ volatile uint16_t       tdbgPlayLeft  = 0;
 volatile uint16_t       tdbgTcDeadline = 0;
 volatile uint32_t       tdbgRemainCpu = 0;
 volatile bool           tdbgPlayDone  = false;
+// Set true on every TC6 ISR entry (in tdbg_tc_isr.c). The play-wait loop
+// uses it as a liveness beacon: the chunking logic guarantees the ISR
+// fires at least every ~780 µs even across long gaps, so a multi-hundred-
+// ms silence means the engine has stalled. Lets a hang surface as a
+// host-visible TDBG_ERROR instead of a dead-silent freeze.
+volatile bool           tdbgIsrFired = false;
+// Defined in tdbg_tc_isr.c (C linkage). Forward-declared here so we can
+// install it by address into the relocated RAM vector table — see
+// tdbgInstallTcVector(). We no longer rely on the link-time weak-alias
+// override of the SAM core's Dummy_Handler, which proved unreliable under
+// the Arduino IDE's C++/auto-prototype build.
+void TC6_Handler(void);
 #ifdef __cplusplus
 }
 #endif
@@ -437,13 +449,41 @@ static void tdbgEnableDwt() {
   tdbgDwtReady = true;
 }
 
-// One-time init for the TC channel used by the new playback engine.
+// SRAM copy of the Cortex-M3 vector table. SAM3X8E has 16 system
+// exceptions + 45 peripheral IRQs = 61 entries; 64 rounded up satisfies
+// the VTOR alignment rule (table-size-rounded-to-power-of-two, min 128 B).
+static uint32_t tdbgRamVectors[64] __attribute__((aligned(256)));
+
+// Bind TC6_Handler by relocating the vector table into SRAM and writing
+// our handler's address into the TC6 slot — instead of depending on the
+// link-time weak-alias override (defining TC6_Handler in a .c file and
+// hoping the linker picks it over the SAM core's `weak alias
+// Dummy_Handler`). That override has repeatedly failed under the Arduino
+// IDE build, leaving the vector on Dummy_Handler's while(1) so the first
+// CPCS match wedges the MCU. Doing it at runtime is linkage-independent
+// and definitive. Idempotent: the VTOR copy happens once, the slot write
+// is harmless to repeat.
+static void tdbgInstallTcVector() {
+  if (SCB->VTOR != (uint32_t)tdbgRamVectors) {
+    memcpy(tdbgRamVectors, (const void*)SCB->VTOR, sizeof(tdbgRamVectors));
+    __DSB();
+    SCB->VTOR = (uint32_t)tdbgRamVectors;
+    __DSB();
+    __ISB();
+  }
+  tdbgRamVectors[TC6_IRQn + 16] = (uint32_t)&TC6_Handler;
+  __DSB();
+  __ISB();
+}
+
+// One-time init for the TC channel used by the playback engine.
 // TC2 channel 0 (peripheral ID 27 + 6 = 33, ID_TC6, vector TC6_Handler).
 // Avoids Servo (TC4 = TC1.ch1), Tone (TC0 = TC0.ch0), and the lazy
 // analogWrite() PWM mapping which never picks ch0 of TC2 by default.
 // Idempotent — safe to call from every TDBG_LOAD.
 static void tdbgEnableTc() {
   if (tdbgTcReady) return;
+  tdbgInstallTcVector();                         // bind TC6 vector first
   pmc_enable_periph_clk(ID_TC6);                 // TC2 ch0 clock gate
   // CMR: waveform mode, count up (no auto-reset), TIMER_CLOCK1 = MCK/2
   TC_Configure(TC2, 0,
@@ -712,6 +752,7 @@ static bool tdbgPlayOnceTc() {
   TC2->TC_CHANNEL[0].TC_RC = tdbgTcDeadline;
 
   // Arm: enable CPCS interrupt, enable clock, software-trigger reset.
+  tdbgIsrFired = false;
   TC2->TC_CHANNEL[0].TC_IER = TC_IER_CPCS;
   NVIC_ClearPendingIRQ(TC6_IRQn);
   NVIC_EnableIRQ(TC6_IRQn);
@@ -720,7 +761,36 @@ static bool tdbgPlayOnceTc() {
   // Main loop spins polling for STOP — interrupts run normally so USB
   // CDC, SysTick, and inbound serial all work. Zero noInterrupts()
   // discipline needed: the ISR is short and self-contained.
+  //
+  // Liveness watchdog: the chunking logic re-arms RC at least every
+  // ~780 µs (TDBG_TC_CHUNK_CPU), so the ISR keeps firing throughout the
+  // whole playback — even across multi-hundred-ms gaps. If the beacon
+  // stays quiet for far longer than that, the engine has stalled. We
+  // report it instead of spinning forever (which is what produced the
+  // dead-silent "PLAY_STARTED then nothing" symptom). `everFired`
+  // distinguishes "ISR never ran at all" (vector/setup problem) from
+  // "ISR ran then stalled" (engine logic problem) in the error line.
+  // NOTE: this can only fire if the ISR returns to this loop; a true
+  // hard wedge (vector bound to a while(1) handler) never reaches here —
+  // that case is what tdbgInstallTcVector() exists to prevent.
+  bool everFired = false;
+  unsigned long lastIsrMs = millis();
   while (!tdbgPlayDone) {
+    if (tdbgIsrFired) {
+      tdbgIsrFired = false;
+      everFired = true;
+      lastIsrMs = millis();
+    } else if (millis() - lastIsrMs > 500) {
+      TC2->TC_CHANNEL[0].TC_IDR = TC_IDR_CPCS;
+      TC2->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKDIS;
+      (void)TC2->TC_CHANNEL[0].TC_SR;
+      NVIC_DisableIRQ(TC6_IRQn);
+      NVIC_ClearPendingIRQ(TC6_IRQn);
+      PIOB->PIO_CODR = (1u << 27); // LED probe off — watchdog path
+      Serial.print("TDBG_ERROR play_timeout isrfired=");
+      Serial.println(everFired ? "1" : "0");
+      return false;
+    }
     if (tdbgPumpStop()) {
       // Same disarm sequence as the natural-end disarm path in the
       // ISR — mask + stop + drain SR + clear NVIC pending — so a
