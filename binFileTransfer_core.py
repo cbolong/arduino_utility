@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import zlib
@@ -250,6 +251,34 @@ def _open_and_wait_idle(
     return ser
 
 
+@contextlib.contextmanager
+def _serial_guard(lock):
+    """Acquire `lock` for the duration of a serial transaction so the GPIO
+    and TDBG sessions sharing one port don't interleave their reads/writes.
+    No-op when lock is None (standalone own-the-port lifecycle)."""
+    if lock is None:
+        yield
+        return
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def open_due_link(
+    port: str | None,
+    log: LogCallback,
+    handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+) -> "serial.Serial | None":
+    """Public entry point for the GUI's single shared connection: open the
+    Due and wait until it's sitting in the pre-erase idle loop. The three
+    persistent-session tabs (GPIO / TDBG / RECORD) all share the returned
+    serial; the App owns it and is responsible for closing it. Returns the
+    open serial, or None on failure."""
+    return _open_and_wait_idle(port, log, handshake_timeout_s)
+
+
 class GpioSession:
     """Persistent GPIO session over one open serial port.
 
@@ -267,11 +296,20 @@ class GpioSession:
         *,
         port: str | None = None,
         handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+        ser: "serial.Serial | None" = None,
+        lock: "threading.Lock | None" = None,
     ) -> None:
         self._log = log
         self._port = port
         self._handshake_timeout_s = handshake_timeout_s
-        self._ser: serial.Serial | None = None
+        # When `ser` is supplied the session BORROWS the App's shared
+        # serial — it neither opens nor closes it (the App owns the
+        # lifecycle). `lock` serialises serial access across the GPIO /
+        # TDBG sessions that share one port. Both default to None for the
+        # standalone (own-the-port) lifecycle the CLI / tests still use.
+        self._ser: serial.Serial | None = ser
+        self._owns_ser = ser is None
+        self._lock = lock
 
     @property
     def is_open(self) -> bool:
@@ -280,6 +318,8 @@ class GpioSession:
     def open(self) -> bool:
         if self.is_open:
             return True
+        if not self._owns_ser:
+            return self._ser is not None
         ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
         if ser is None:
             return False
@@ -287,12 +327,12 @@ class GpioSession:
         return True
 
     def close(self) -> None:
-        if self._ser is not None:
+        if self._ser is not None and self._owns_ser:
             try:
                 self._ser.close()
             except Exception:
                 pass
-            self._ser = None
+        self._ser = None
 
     def set_pin(self, pin: int, mode: str, value: str | None = None) -> bool:
         if not self.is_open:
@@ -308,10 +348,10 @@ class GpioSession:
         cmd = f"GPIO_SET {pin} {mode}"
         if value is not None:
             cmd += f" {value}"
-        self._log(f"send: {cmd}", "info")
-        self._ser.write(f"{cmd}\n".encode("UTF-8"))
-
-        reply = _read_line(self._ser, self._log, 5.0)
+        with _serial_guard(self._lock):
+            self._log(f"send: {cmd}", "info")
+            self._ser.write(f"{cmd}\n".encode("UTF-8"))
+            reply = _read_line(self._ser, self._log, 5.0)
         if reply == GPIO_OK:
             self._log(f"recv: {reply}", "ok")
             return True
@@ -325,10 +365,10 @@ class GpioSession:
             return None
 
         cmd = f"GPIO_READ {pin}"
-        self._log(f"send: {cmd}", "info")
-        self._ser.write(f"{cmd}\n".encode("UTF-8"))
-
-        reply = _read_line(self._ser, self._log, 5.0)
+        with _serial_guard(self._lock):
+            self._log(f"send: {cmd}", "info")
+            self._ser.write(f"{cmd}\n".encode("UTF-8"))
+            reply = _read_line(self._ser, self._log, 5.0)
         if reply and reply.startswith(GPIO_VALUE_PREFIX):
             # Format: "GPIO_VALUE <pin> <0|1>"
             parts = reply.split()
@@ -642,11 +682,17 @@ class TdbgSession:
         *,
         port: str | None = None,
         handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+        ser: "serial.Serial | None" = None,
+        lock: "threading.Lock | None" = None,
     ) -> None:
         self._log = log
         self._port = port
         self._handshake_timeout_s = handshake_timeout_s
-        self._ser: serial.Serial | None = None
+        # See GpioSession.__init__ — `ser` borrows the App's shared serial,
+        # `lock` serialises access against the other shared-port sessions.
+        self._ser: serial.Serial | None = ser
+        self._owns_ser = ser is None
+        self._lock = lock
 
     @property
     def is_open(self) -> bool:
@@ -655,6 +701,8 @@ class TdbgSession:
     def open(self) -> bool:
         if self.is_open:
             return True
+        if not self._owns_ser:
+            return self._ser is not None
         ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
         if ser is None:
             return False
@@ -662,12 +710,12 @@ class TdbgSession:
         return True
 
     def close(self) -> None:
-        if self._ser is not None:
+        if self._ser is not None and self._owns_ser:
             try:
                 self._ser.close()
             except Exception:
                 pass
-            self._ser = None
+        self._ser = None
 
     def load(
         self,
@@ -694,28 +742,30 @@ class TdbgSession:
         blob = tdbg_pack_events(events)
         expected_crc = tdbg_crc16(blob)
 
-        # Drain any leftover lines from a previous fire-and-forget play()
-        # (TDBG_PLAY_DONE / TDBG_STOPPED). If we don't, _read_line below
-        # would consume one of those in place of TDBG_READY and the
-        # handshake mismatches.
-        self._drain_stale()
+        with _serial_guard(self._lock):
+            # Drain any leftover lines from a previous fire-and-forget play()
+            # (TDBG_PLAY_DONE / TDBG_STOPPED). If we don't, _read_line below
+            # would consume one of those in place of TDBG_READY and the
+            # handshake mismatches.
+            self._drain_stale()
 
-        cmd = f"TDBG_LOAD {pin} {len(events)} {initial_state}"
-        self._log(f"send: {cmd}", "info")
-        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+            cmd = f"TDBG_LOAD {pin} {len(events)} {initial_state}"
+            self._log(f"send: {cmd}", "info")
+            self._ser.write(f"{cmd}\n".encode("UTF-8"))
 
-        ready = _read_line(self._ser, self._log, 5.0)
-        if ready != MCU_TDBG_READY:
-            self._log(f"recv: {ready or '(no reply)'} (expected TDBG_READY)", "err")
-            return False
-        self._log(f"recv: {ready}", "ok")
+            ready = _read_line(self._ser, self._log, 5.0)
+            if ready != MCU_TDBG_READY:
+                self._log(f"recv: {ready or '(no reply)'} (expected TDBG_READY)", "err")
+                return False
+            self._log(f"recv: {ready}", "ok")
 
-        # Generous timeout — 20 KB at 115200 takes ~1.7 s, MCU then replies.
-        self._ser.write(blob)
-        self._ser.flush()
-        self._log(f"sent {len(blob)} bytes of waveform data", "info")
+            # Generous timeout — 20 KB at 115200 takes ~1.7 s, MCU then replies.
+            self._ser.write(blob)
+            self._ser.flush()
+            self._log(f"sent {len(blob)} bytes of waveform data", "info")
 
-        reply = _read_line(self._ser, self._log, 10.0)
+            reply = _read_line(self._ser, self._log, 10.0)
+
         if not reply:
             self._log("no reply after blob", "err")
             return False
@@ -786,10 +836,10 @@ class TdbgSession:
             cmd = "TDBG_PLAY"
         else:
             cmd = f"TDBG_PLAY_LOOP {iterations}"
-        self._log(f"send: {cmd}", "info")
-        self._ser.write(f"{cmd}\n".encode("UTF-8"))
-
-        return self._await_play_started()
+        with _serial_guard(self._lock):
+            self._log(f"send: {cmd}", "info")
+            self._ser.write(f"{cmd}\n".encode("UTF-8"))
+            return self._await_play_started()
 
     def _await_play_started(self) -> bool:
         reply = _read_line(self._ser, self._log, 5.0)
@@ -933,11 +983,20 @@ class RecordSession:
         *,
         port: str | None = None,
         handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+        ser: "serial.Serial | None" = None,
+        lock: "threading.Lock | None" = None,
     ) -> None:
         self._log = log
         self._port = port
         self._handshake_timeout_s = handshake_timeout_s
-        self._ser: serial.Serial | None = None
+        # See GpioSession.__init__ — `ser` borrows the App's shared serial.
+        # RECORD is exclusive while recording (its live_loop owns the port,
+        # and the App disables the other tabs' actions during a recording),
+        # so `lock` is accepted for API symmetry but RECORD's own start/stop
+        # transactions don't contend with GPIO/TDBG in practice.
+        self._ser: serial.Serial | None = ser
+        self._owns_ser = ser is None
+        self._lock = lock
         self._pins: list[int] = []
         self._on_live = None
         self._live_thread: threading.Thread | None = None
@@ -957,6 +1016,8 @@ class RecordSession:
     def open(self) -> bool:
         if self.is_open:
             return True
+        if not self._owns_ser:
+            return self._ser is not None
         ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
         if ser is None:
             return False
@@ -969,12 +1030,12 @@ class RecordSession:
         if self._live_thread is not None:
             self._live_thread.join(timeout=2.0)
             self._live_thread = None
-        if self._ser is not None:
+        if self._ser is not None and self._owns_ser:
             try:
                 self._ser.close()
             except Exception:
                 pass
-            self._ser = None
+        self._ser = None
 
     def start(self, pins: list[int], on_live=None) -> bool:
         if not self.is_open:

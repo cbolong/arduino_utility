@@ -323,10 +323,11 @@ class FlashTab(_LoggedTab):
         self.start_btn.config(state=tk.DISABLED)
         self.browse_btn.config(state=tk.DISABLED)
 
-        # If any other tab holds the serial port, close it first then proceed
-        # with flashing. The release_port_then(callback) call chains through
-        # GPIO and TDBG tabs sequentially.
-        self.app.release_port_then(except_tab=self, on_done=self._do_start)
+        # Flashing is destructive (chip erase ends the MCU's idle loop), so
+        # it can't share the persistent GPIO/TDBG/RECORD connection. Release
+        # that shared connection first, then run the one-shot flash flow on
+        # its own freshly-opened port.
+        self.app.disconnect_then(self._do_start)
 
     def _do_start(self) -> None:
         port = self.app.get_port()
@@ -484,7 +485,8 @@ class GpioTab(_LoggedTab):
     def __init__(self, parent: ttk.Notebook, app: "App") -> None:
         # Initialise persistent-worker state before super().__init__ runs
         # _build_controls (which references some of these).
-        self._session: "GpioSession | None" = None
+        # The serial connection is owned by the App now (one shared link for
+        # GPIO / TDBG / RECORD); _session is a property delegating to it.
         self._cmd_queue: queue.Queue = queue.Queue()
         self._busy = False
         self._auto_refresh_after_id: str | None = None
@@ -519,27 +521,47 @@ class GpioTab(_LoggedTab):
         # never gets used here.
         raise RuntimeError("GpioTab uses _cmd_queue, not submit_work")
 
-    def _build_controls(self, parent: ttk.Frame) -> None:
-        # Row 1: Connection status + Connect / Disconnect
-        conn_row = ttk.Frame(parent)
-        conn_row.pack(fill=tk.X)
-        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
-        self._conn_status_var = tk.StringVar(value="Disconnected")
-        self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger_dark"]
-        )
-        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
-        self._connect_btn = ttk.Button(
-            conn_row, text="Connect", command=self._on_connect
-        )
-        self._connect_btn.pack(side=tk.LEFT)
-        self._disconnect_btn = ttk.Button(
-            conn_row, text="Disconnect",
-            command=self._on_disconnect, state=tk.DISABLED,
-        )
-        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    @property
+    def _session(self):
+        """The shared GPIO session, owned by the App. None when the App-level
+        connection is closed."""
+        return self.app.gpio_session
 
-        # Row 2: Read All + Auto-refresh
+    def set_connected(self, connected: bool) -> None:
+        """Called by App when the shared connection opens/closes. Enables or
+        disables this tab's operation controls (the Connect/Disconnect
+        buttons now live at App level)."""
+        if connected:
+            self._abort_event.clear()
+            if not getattr(self, "_pin_panel_filling", False):
+                self._read_all_btn.config(state=tk.NORMAL)
+            self._auto_refresh_check.config(state=tk.NORMAL)
+            for row in self._pin_rows.values():
+                row.set_enabled(True)
+        else:
+            # Stop auto-refresh + signal any in-flight Read All to bail.
+            if self._auto_refresh_after_id is not None:
+                try:
+                    self.app.root.after_cancel(self._auto_refresh_after_id)
+                except Exception:
+                    pass
+                self._auto_refresh_after_id = None
+            self._auto_refresh_var.set(False)
+            self._abort_event.set()
+            try:
+                while True:
+                    self._cmd_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._read_all_btn.config(state=tk.DISABLED)
+            self._auto_refresh_check.config(state=tk.DISABLED)
+            for row in self._pin_rows.values():
+                row.set_enabled(False)
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        # Connection is managed at App level now (shared Connect / Disconnect
+        # under the Port row). This tab only builds its operation controls.
+        # Row: Read All + Auto-refresh
         action_row = ttk.Frame(parent)
         action_row.pack(fill=tk.X, pady=(8, 0))
         self._read_all_btn = ttk.Button(
@@ -723,130 +745,6 @@ class GpioTab(_LoggedTab):
                 self._log_callback_threadsafe(f"GPIO cmd error: {e}", "err")
             finally:
                 self._busy = False
-
-    # ---- connection handling ---------------------------------------------
-
-    def is_connected(self) -> bool:
-        return self._session is not None
-
-    def _set_conn_status(self, text: str, color: str) -> None:
-        self._conn_status_var.set(text)
-        self._conn_status_label.config(foreground=color)
-
-    def _on_connect(self) -> None:
-        if self._session is not None:
-            return
-        if self.app.any_other_tab_holding_port(self):
-            messagebox.showinfo(
-                "Busy",
-                "Another tab is holding the serial port. Disconnect it first.",
-            )
-            return
-        if self.app.any_tab_busy():
-            messagebox.showinfo(
-                "Busy",
-                "Another tab has an operation in progress. Please wait.",
-            )
-            return
-        port = self.app.get_port()
-        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
-        self._connect_btn.config(state=tk.DISABLED)
-        self.app.lock_port_entry()
-        self.app.set_status("GPIO connecting...", _COLORS["warning_dark"])
-
-        def cmd():
-            from binFileTransfer_core import GpioSession
-            session = GpioSession(self._log_callback_threadsafe, port=port)
-            success = session.open()
-            self.app.root.after(
-                0,
-                lambda: self._on_connect_done(session if success else None),
-            )
-
-        self._enqueue(cmd)
-
-    def _on_connect_done(self, session: GpioSession | None) -> None:
-        if session is None:
-            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
-            self._connect_btn.config(state=tk.NORMAL)
-            self.app.unlock_port_entry()
-            self.app.set_status("GPIO connect failed", _COLORS["danger_dark"])
-            return
-
-        self._session = session
-        self._abort_event.clear()
-        self._set_conn_status("Connected", _COLORS["success_dark"])
-        self._disconnect_btn.config(state=tk.NORMAL)
-        # Read All gates on whether the pin panel is fully built — otherwise
-        # iterating over self._pin_rows visits a partial set. The fill
-        # completion handler re-enables it when done.
-        if not getattr(self, "_pin_panel_filling", False):
-            self._read_all_btn.config(state=tk.NORMAL)
-        self._auto_refresh_check.config(state=tk.NORMAL)
-        for row in self._pin_rows.values():
-            row.set_enabled(True)
-        self.app.set_status("GPIO Connected", _COLORS["success_dark"])
-
-    def _on_disconnect(self) -> None:
-        if self._session is None:
-            return
-        self._begin_disconnect()
-        # Plain disconnect — no chained callback.
-        self._enqueue(self._do_close_session)
-
-    def _begin_disconnect(self) -> None:
-        # Stop auto-refresh before tearing down the connection.
-        if self._auto_refresh_after_id is not None:
-            try:
-                self.app.root.after_cancel(self._auto_refresh_after_id)
-            except Exception:
-                pass
-            self._auto_refresh_after_id = None
-        self._auto_refresh_var.set(False)
-        # Signal any in-flight Read All loop to bail between pins, and drop
-        # any commands still queued behind it so we don't sit through 66 ×
-        # serial timeouts before the close runs.
-        self._abort_event.set()
-        try:
-            while True:
-                self._cmd_queue.get_nowait()
-        except queue.Empty:
-            pass
-        # Disable everything that needs the session.
-        self._disconnect_btn.config(state=tk.DISABLED)
-        self._read_all_btn.config(state=tk.DISABLED)
-        self._auto_refresh_check.config(state=tk.DISABLED)
-        for row in self._pin_rows.values():
-            row.set_enabled(False)
-        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
-
-    def _do_close_session(self) -> None:
-        if self._session is not None:
-            self._session.close()
-        self.app.root.after(0, self._on_disconnect_done)
-
-    def _on_disconnect_done(self) -> None:
-        self._session = None
-        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
-        self._connect_btn.config(state=tk.NORMAL)
-        self.app.unlock_port_entry()
-        self.app.set_status("GPIO Disconnected", _COLORS["text_secondary"])
-
-    def disconnect_for_other(self, on_done) -> None:
-        """Close the GPIO session (if open) then call on_done() on the Tk
-        thread. Used by FlashTab / TdbgTab so they can take over the serial
-        port without the user manually clicking Disconnect first."""
-        if self._session is None:
-            on_done()
-            return
-        self._begin_disconnect()
-
-        def cmd():
-            self._do_close_session()
-            self.app.root.after(0, on_done)
-
-        # Replace the simple close with the chained variant.
-        self._enqueue(cmd)
 
     # ---- per-pin set / read all ------------------------------------------
 
@@ -1366,8 +1264,9 @@ def _format_duration_ns(ns: float) -> str:
 
 class TdbgTab(_LoggedTab):
     def __init__(self, parent: ttk.Notebook, app: "App") -> None:
-        # Persistent worker thread — same pattern as GpioTab.
-        self._session = None
+        # Persistent worker thread — same pattern as GpioTab. The serial
+        # connection is owned by the App; _session is a property delegating
+        # to it.
         self._cmd_queue: queue.Queue = queue.Queue()
         self._busy = False
         # Modal waveform-preview window; only one at a time.
@@ -1384,27 +1283,26 @@ class TdbgTab(_LoggedTab):
     def submit_work(self, target_callable) -> bool:
         raise RuntimeError("TdbgTab uses _cmd_queue, not submit_work")
 
-    def _build_controls(self, parent: ttk.Frame) -> None:
-        # Row 1: Connection status + Connect / Disconnect
-        conn_row = ttk.Frame(parent)
-        conn_row.pack(fill=tk.X)
-        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
-        self._conn_status_var = tk.StringVar(value="Disconnected")
-        self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger_dark"]
-        )
-        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
-        self._connect_btn = ttk.Button(
-            conn_row, text="Connect", command=self._on_connect
-        )
-        self._connect_btn.pack(side=tk.LEFT)
-        self._disconnect_btn = ttk.Button(
-            conn_row, text="Disconnect",
-            command=self._on_disconnect, state=tk.DISABLED,
-        )
-        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    @property
+    def _session(self):
+        """The shared TDBG session, owned by the App."""
+        return self.app.tdbg_session
 
-        # Row 2: Pin + Clear Log
+    def set_connected(self, connected: bool) -> None:
+        """Enable/disable TDBG operation controls when the shared App
+        connection opens/closes."""
+        if connected:
+            self._pin_combo.config(state="readonly")
+            self._send_btn.config(state=tk.NORMAL)
+            self._calib_btn.config(state=tk.NORMAL)
+        else:
+            self._pin_combo.config(state="disabled")
+            self._send_btn.config(state=tk.DISABLED)
+            self._calib_btn.config(state=tk.DISABLED)
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        # Connection managed at App level. This tab builds operation controls.
+        # Row: Pin + Clear Log
         pin_row = ttk.Frame(parent)
         pin_row.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(pin_row, text="Pin:").pack(side=tk.LEFT)
@@ -1472,101 +1370,6 @@ class TdbgTab(_LoggedTab):
             finally:
                 self._busy = False
 
-    # ---- connection -------------------------------------------------------
-
-    def is_connected(self) -> bool:
-        return self._session is not None
-
-    def _set_conn_status(self, text: str, color: str) -> None:
-        self._conn_status_var.set(text)
-        self._conn_status_label.config(foreground=color)
-
-    def _on_connect(self) -> None:
-        if self._session is not None:
-            return
-        if self.app.any_other_tab_holding_port(self):
-            messagebox.showinfo(
-                "Busy",
-                "Another tab is holding the serial port. Disconnect it first.",
-            )
-            return
-        if self.app.any_tab_busy():
-            messagebox.showinfo(
-                "Busy",
-                "Another tab has an operation in progress. Please wait.",
-            )
-            return
-        port = self.app.get_port()
-        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
-        self._connect_btn.config(state=tk.DISABLED)
-        self.app.lock_port_entry()
-        self.app.set_status("TDBG connecting...", _COLORS["warning_dark"])
-
-        def cmd():
-            from binFileTransfer_core import TdbgSession
-            session = TdbgSession(self._log_callback_threadsafe, port=port)
-            success = session.open()
-            self.app.root.after(
-                0,
-                lambda: self._on_connect_done(session if success else None),
-            )
-
-        self._enqueue(cmd)
-
-    def _on_connect_done(self, session) -> None:
-        if session is None:
-            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
-            self._connect_btn.config(state=tk.NORMAL)
-            self.app.unlock_port_entry()
-            self.app.set_status("TDBG connect failed", _COLORS["danger_dark"])
-            return
-        self._session = session
-        self._set_conn_status("Connected", _COLORS["success_dark"])
-        self._disconnect_btn.config(state=tk.NORMAL)
-        self._pin_combo.config(state="readonly")
-        self._send_btn.config(state=tk.NORMAL)
-        self._calib_btn.config(state=tk.NORMAL)
-        self.app.set_status("TDBG Connected", _COLORS["success_dark"])
-
-    def _on_disconnect(self) -> None:
-        if self._session is None:
-            return
-        self._begin_disconnect()
-        self._enqueue(self._do_close_session)
-
-    def _begin_disconnect(self) -> None:
-        self._disconnect_btn.config(state=tk.DISABLED)
-        self._send_btn.config(state=tk.DISABLED)
-        self._calib_btn.config(state=tk.DISABLED)
-        self._pin_combo.config(state="disabled")
-        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
-
-    def _do_close_session(self) -> None:
-        if self._session is not None:
-            self._session.close()
-        self.app.root.after(0, self._on_disconnect_done)
-
-    def _on_disconnect_done(self) -> None:
-        self._session = None
-        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
-        self._connect_btn.config(state=tk.NORMAL)
-        self.app.unlock_port_entry()
-        self.app.set_status("TDBG Disconnected", _COLORS["text_secondary"])
-
-    def disconnect_for_other(self, on_done) -> None:
-        """Close the TDBG session (if open) then call on_done() on Tk thread.
-        Used by FlashTab and GpioTab when they need to take the port."""
-        if self._session is None:
-            on_done()
-            return
-        self._begin_disconnect()
-
-        def cmd():
-            self._do_close_session()
-            self.app.root.after(0, on_done)
-
-        self._enqueue(cmd)
-
     # ---- send -------------------------------------------------------------
 
     def _selected_pin(self) -> int | None:
@@ -1615,7 +1418,6 @@ class TdbgTab(_LoggedTab):
         self._send_btn.config(state=tk.DISABLED)
         self._calib_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
-        self._disconnect_btn.config(state=tk.DISABLED)
         self.app.set_status("TDBG sending...", _COLORS["warning_dark"])
 
         def cmd():
@@ -1634,7 +1436,6 @@ class TdbgTab(_LoggedTab):
             self._send_btn.config(state=tk.NORMAL)
             self._calib_btn.config(state=tk.NORMAL)
             self._pin_combo.config(state="readonly")
-            self._disconnect_btn.config(state=tk.NORMAL)
         self.app.set_status(
             "TDBG sent — D23 driving" if success else "TDBG error",
             _COLORS["success_dark"] if success else _COLORS["danger_dark"],
@@ -1660,7 +1461,6 @@ class TdbgTab(_LoggedTab):
         self._send_btn.config(state=tk.DISABLED)
         self._calib_btn.config(state=tk.DISABLED)
         self._pin_combo.config(state="disabled")
-        self._disconnect_btn.config(state=tk.DISABLED)
         self.app.set_status("TDBG sending calibration...", _COLORS["warning_dark"])
 
         def cmd():
@@ -2009,7 +1809,7 @@ class RecordTab(_LoggedTab):
     MAX_PINS = 4
 
     def __init__(self, parent: ttk.Notebook, app: "App") -> None:
-        self._session = None
+        # Serial connection owned by the App; _session is a property.
         self._cmd_queue: queue.Queue = queue.Queue()
         self._busy = False
         self._recording = False
@@ -2028,27 +1828,29 @@ class RecordTab(_LoggedTab):
     def submit_work(self, target_callable) -> bool:
         raise RuntimeError("RecordTab uses _cmd_queue, not submit_work")
 
-    def _build_controls(self, parent: ttk.Frame) -> None:
-        # Row 1: Connection
-        conn_row = ttk.Frame(parent)
-        conn_row.pack(fill=tk.X)
-        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
-        self._conn_status_var = tk.StringVar(value="Disconnected")
-        self._conn_status_label = ttk.Label(
-            conn_row, textvariable=self._conn_status_var, foreground=_COLORS["danger_dark"]
-        )
-        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
-        self._connect_btn = ttk.Button(
-            conn_row, text="Connect", command=self._on_connect
-        )
-        self._connect_btn.pack(side=tk.LEFT)
-        self._disconnect_btn = ttk.Button(
-            conn_row, text="Disconnect",
-            command=self._on_disconnect, state=tk.DISABLED,
-        )
-        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
+    @property
+    def _session(self):
+        """The shared RECORD session, owned by the App."""
+        return self.app.record_session
 
-        # Row 2: 開始 / 結束 / (post-stop) waveform thumbnail / Clear Log
+    def set_connected(self, connected: bool) -> None:
+        """Enable/disable RECORD controls when the shared App connection
+        opens/closes."""
+        if connected:
+            self._refresh_start_button()   # enables 開始 if a pin is selected
+        else:
+            self._recording = False
+            self._start_btn.config(state=tk.DISABLED)
+            self._stop_btn.config(state=tk.DISABLED)
+            for row in self._pin_rows:
+                row.set_live_state(None)
+
+    def is_recording(self) -> bool:
+        return self._recording
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        # Connection managed at App level.
+        # Row: 開始 / 結束 / (post-stop) waveform thumbnail / Clear Log
         action_row = ttk.Frame(parent)
         action_row.pack(fill=tk.X, pady=(8, 0))
         self._start_btn = ttk.Button(
@@ -2146,100 +1948,6 @@ class RecordTab(_LoggedTab):
         else:
             self._add_pin_btn.config(state=tk.NORMAL)
 
-    # ---- connection -------------------------------------------------------
-
-    def is_connected(self) -> bool:
-        return self._session is not None
-
-    def _set_conn_status(self, text: str, color: str) -> None:
-        self._conn_status_var.set(text)
-        self._conn_status_label.config(foreground=color)
-
-    def _on_connect(self) -> None:
-        if self._session is not None:
-            return
-        if self.app.any_other_tab_holding_port(self):
-            messagebox.showinfo(
-                "Busy",
-                "Another tab is holding the serial port. Disconnect it first.",
-            )
-            return
-        if self.app.any_tab_busy():
-            messagebox.showinfo(
-                "Busy",
-                "Another tab has an operation in progress. Please wait.",
-            )
-            return
-        port = self.app.get_port()
-        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
-        self._connect_btn.config(state=tk.DISABLED)
-        self.app.lock_port_entry()
-        self.app.set_status("RECORD connecting...", _COLORS["warning_dark"])
-
-        def cmd():
-            from binFileTransfer_core import RecordSession
-            session = RecordSession(self._log_callback_threadsafe, port=port)
-            success = session.open()
-            self.app.root.after(
-                0,
-                lambda: self._on_connect_done(session if success else None),
-            )
-
-        self._enqueue(cmd)
-
-    def _on_connect_done(self, session) -> None:
-        if session is None:
-            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
-            self._connect_btn.config(state=tk.NORMAL)
-            self.app.unlock_port_entry()
-            self.app.set_status("RECORD connect failed", _COLORS["danger_dark"])
-            return
-        self._session = session
-        self._set_conn_status("Connected", _COLORS["success_dark"])
-        self._disconnect_btn.config(state=tk.NORMAL)
-        self._refresh_start_button()
-        self.app.set_status("RECORD Connected", _COLORS["success_dark"])
-
-    def _on_disconnect(self) -> None:
-        if self._session is None:
-            return
-        self._begin_disconnect()
-        self._enqueue(self._do_close_session)
-
-    def _begin_disconnect(self) -> None:
-        self._disconnect_btn.config(state=tk.DISABLED)
-        self._start_btn.config(state=tk.DISABLED)
-        self._stop_btn.config(state=tk.DISABLED)
-        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
-
-    def _do_close_session(self) -> None:
-        if self._session is not None:
-            self._session.close()
-        self.app.root.after(0, self._on_disconnect_done)
-
-    def _on_disconnect_done(self) -> None:
-        self._session = None
-        self._recording = False
-        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
-        self._connect_btn.config(state=tk.NORMAL)
-        for row in self._pin_rows:
-            row.set_live_state(None)
-        self._refresh_start_button()
-        self.app.unlock_port_entry()
-        self.app.set_status("RECORD Disconnected", _COLORS["text_secondary"])
-
-    def disconnect_for_other(self, on_done) -> None:
-        if self._session is None:
-            on_done()
-            return
-        self._begin_disconnect()
-
-        def cmd():
-            self._do_close_session()
-            self.app.root.after(0, on_done)
-
-        self._enqueue(cmd)
-
     # ---- start / stop -----------------------------------------------------
 
     def _refresh_start_button(self) -> None:
@@ -2275,7 +1983,9 @@ class RecordTab(_LoggedTab):
         self._recording = True
         self._start_btn.config(state=tk.DISABLED)
         self._stop_btn.config(state=tk.NORMAL)
-        self._disconnect_btn.config(state=tk.DISABLED)
+        # Gate the other tabs — RECORD's live_loop owns the serial while
+        # capturing, so GPIO/TDBG must not write to it concurrently.
+        self.app.set_recording(True)
         for row in self._pin_rows:
             row.set_combo_enabled(False)
             row.set_live_state(None)
@@ -2323,8 +2033,7 @@ class RecordTab(_LoggedTab):
         self._add_pin_btn.config(
             state=tk.NORMAL if len(self._pin_rows) < self.MAX_PINS else tk.DISABLED
         )
-        if self._session is not None:
-            self._disconnect_btn.config(state=tk.NORMAL)
+        self.app.set_recording(False)
         self._refresh_start_button()
         self.app.set_status("RECORD start failed", _COLORS["danger_dark"])
 
@@ -2350,8 +2059,7 @@ class RecordTab(_LoggedTab):
         self._add_pin_btn.config(
             state=tk.NORMAL if len(self._pin_rows) < self.MAX_PINS else tk.DISABLED
         )
-        if self._session is not None:
-            self._disconnect_btn.config(state=tk.NORMAL)
+        self.app.set_recording(False)
         self._refresh_start_button()
 
         if result is None:
@@ -2649,6 +2357,19 @@ class App:
         except tk.TclError:
             _UI_FAMILY = "TkDefaultFont"
 
+        # Single shared serial connection for the three persistent-session
+        # tabs (GPIO / TDBG / RECORD). Opened by the App-level Connect button
+        # below the Port row; the three tabs share this one serial + the lock
+        # that serialises access to it. Flash uses its own one-shot flow and
+        # requires this connection released first (its erase is destructive).
+        self._ser = None
+        self._serial_lock = threading.Lock()
+        self._connected = False
+        self._conn_busy = False
+        self.gpio_session = None
+        self.tdbg_session = None
+        self.record_session = None
+
         self.tabs: list[_LoggedTab] = []
         self._build_widgets()
         # Populate port dropdown right after widgets exist, default-selects
@@ -2674,6 +2395,29 @@ class App:
         self.port_refresh_btn.pack(side=tk.LEFT)
         # Initial scan happens after notebook is built so any error logs
         # have somewhere to go (we keep this simple and silent for now).
+
+        # Shared connection row — ONE Connect / Disconnect for the GPIO /
+        # TDBG / RECORD tabs (Flash stays independent). Sits directly under
+        # the Port row so the connection is a top-level, tab-independent
+        # state rather than three separate per-tab buttons.
+        conn_row = ttk.Frame(self.root, padding=(10, 0, 10, 6))
+        conn_row.pack(fill=tk.X)
+        ttk.Label(conn_row, text="Connection:").pack(side=tk.LEFT)
+        self._conn_status_var = tk.StringVar(value="Disconnected")
+        self._conn_status_label = ttk.Label(
+            conn_row, textvariable=self._conn_status_var,
+            foreground=_COLORS["danger_dark"],
+        )
+        self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
+        self._connect_btn = ttk.Button(
+            conn_row, text="Connect", command=self._on_app_connect,
+        )
+        self._connect_btn.pack(side=tk.LEFT)
+        self._disconnect_btn = ttk.Button(
+            conn_row, text="Disconnect", command=self._on_app_disconnect,
+            state=tk.DISABLED,
+        )
+        self._disconnect_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         # macOS-inspired Notebook style. Selected tab renders 12pt bold vs
         # unselected 10pt regular, using the resolved _UI_FAMILY (NOT the
@@ -2824,13 +2568,7 @@ class App:
         self._maybe_unlock_refresh()
 
     def _maybe_unlock_refresh(self) -> None:
-        if self.any_tab_busy():
-            return
-        if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
-            return
-        if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
-            return
-        if hasattr(self, "record_tab") and self.record_tab.is_connected():
+        if self.any_tab_busy() or self._connected or self._conn_busy:
             return
         try:
             self.port_refresh_btn.config(state=tk.NORMAL)
@@ -2842,16 +2580,9 @@ class App:
         self.port_refresh_btn.config(state=tk.DISABLED)
 
     def unlock_port_entry(self) -> None:
-        # Stay locked if another tab is busy OR if any persistent-session
-        # tab (GPIO / TDBG / RECORD) is still holding the serial connection
-        # open (would conflict with any other use until disconnected).
-        if self.any_tab_busy():
-            return
-        if hasattr(self, "gpio_tab") and self.gpio_tab.is_connected():
-            return
-        if hasattr(self, "tdbg_tab") and self.tdbg_tab.is_connected():
-            return
-        if hasattr(self, "record_tab") and self.record_tab.is_connected():
+        # Stay locked while the shared connection is open / connecting or any
+        # tab is busy — changing the port mid-connection makes no sense.
+        if self.any_tab_busy() or self._connected or self._conn_busy:
             return
         self.port_combo.config(state="readonly")
         self.port_refresh_btn.config(state=tk.NORMAL)
@@ -2863,38 +2594,123 @@ class App:
     def any_tab_busy(self) -> bool:
         return any(t.is_busy() for t in self.tabs)
 
-    def any_other_tab_holding_port(self, requesting_tab: "_LoggedTab") -> bool:
-        """True if another tab currently has the serial port open. Used by
-        GpioTab / TdbgTab / RecordTab connect to refuse if a sibling already
-        holds it."""
-        if requesting_tab is not self.gpio_tab and self.gpio_tab.is_connected():
-            return True
-        if requesting_tab is not self.tdbg_tab and self.tdbg_tab.is_connected():
-            return True
-        if requesting_tab is not self.record_tab and self.record_tab.is_connected():
-            return True
-        return False
+    # ---- shared connection (GPIO / TDBG / RECORD) ------------------------
 
-    def release_port_then(self, except_tab, on_done) -> None:
-        """Sequentially close any persistent-session tab (GPIO, TDBG, RECORD)
-        that currently holds the port, then invoke on_done() on the Tk thread.
-        FlashTab uses this before starting a flash flow."""
-        # Build a chain of releases that ends with on_done().
-        steps = []
-        if except_tab is not self.gpio_tab and self.gpio_tab.is_connected():
-            steps.append(self.gpio_tab.disconnect_for_other)
-        if except_tab is not self.tdbg_tab and self.tdbg_tab.is_connected():
-            steps.append(self.tdbg_tab.disconnect_for_other)
-        if except_tab is not self.record_tab and self.record_tab.is_connected():
-            steps.append(self.record_tab.disconnect_for_other)
+    def is_connected(self) -> bool:
+        return self._connected
 
-        def chain(idx: int):
-            if idx >= len(steps):
+    def _set_conn_status(self, text: str, color: str) -> None:
+        self._conn_status_var.set(text)
+        self._conn_status_label.config(foreground=color)
+
+    def _on_app_connect(self) -> None:
+        if self._connected or self._conn_busy:
+            return
+        if self.any_tab_busy():
+            messagebox.showinfo(
+                "Busy", "An operation is in progress. Please wait.")
+            return
+        port = self.get_port()
+        self._conn_busy = True
+        self._set_conn_status("Connecting...", _COLORS["warning_dark"])
+        self._connect_btn.config(state=tk.DISABLED)
+        self.lock_port_entry()
+        self.set_status("Connecting...", _COLORS["warning_dark"])
+
+        def work():
+            from binFileTransfer_core import open_due_link
+            ser = open_due_link(port, self.tdbg_tab._log_callback_threadsafe)
+            self.root.after(0, lambda: self._on_app_connect_done(ser))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_app_connect_done(self, ser) -> None:
+        self._conn_busy = False
+        if ser is None:
+            self._set_conn_status("Disconnected", _COLORS["danger_dark"])
+            self._connect_btn.config(state=tk.NORMAL)
+            self.unlock_port_entry()
+            self.set_status("Connect failed", _COLORS["danger_dark"])
+            return
+        from binFileTransfer_core import GpioSession, TdbgSession, RecordSession
+        self._ser = ser
+        # All three sessions BORROW the one serial and share the lock that
+        # serialises GPIO/TDBG transactions. Each logs to its own tab.
+        self.gpio_session = GpioSession(
+            self.gpio_tab._log_callback_threadsafe,
+            ser=ser, lock=self._serial_lock)
+        self.tdbg_session = TdbgSession(
+            self.tdbg_tab._log_callback_threadsafe,
+            ser=ser, lock=self._serial_lock)
+        self.record_session = RecordSession(
+            self.record_tab._log_callback_threadsafe,
+            ser=ser, lock=self._serial_lock)
+        self._connected = True
+        self._set_conn_status("Connected", _COLORS["success_dark"])
+        self._disconnect_btn.config(state=tk.NORMAL)
+        for t in (self.gpio_tab, self.tdbg_tab, self.record_tab):
+            t.set_connected(True)
+        self.set_status("Connected", _COLORS["success_dark"])
+
+    def set_recording(self, active: bool) -> None:
+        """RECORD capture is exclusive — its live_loop owns the shared serial
+        while running. Gate the GPIO and TDBG tabs' controls off during a
+        recording so their workers can't write to the port concurrently.
+        Re-enables them when recording stops (if still connected)."""
+        if not self._connected:
+            return
+        self.gpio_tab.set_connected(not active)
+        self.tdbg_tab.set_connected(not active)
+
+    def _on_app_disconnect(self) -> None:
+        self.disconnect_then(None)
+
+    def disconnect_then(self, on_done) -> None:
+        """Tear down the shared connection (used by the Disconnect button and
+        by FlashTab before a destructive flash), then call on_done() on the
+        Tk thread if given. Idempotent — safe to call when not connected."""
+        if not self._connected:
+            if on_done is not None:
                 on_done()
-                return
-            steps[idx](on_done=lambda: chain(idx + 1))
+            return
+        self._set_conn_status("Disconnecting...", _COLORS["warning_dark"])
+        self._disconnect_btn.config(state=tk.DISABLED)
+        # Disable the three tabs' controls immediately; close the serial on a
+        # transient thread (RECORD's live_loop join may take up to ~2 s).
+        for t in (self.gpio_tab, self.tdbg_tab, self.record_tab):
+            t.set_connected(False)
+        sessions = [s for s in
+                    (self.record_session, self.tdbg_session, self.gpio_session)
+                    if s is not None]
+        ser = self._ser
 
-        chain(0)
+        def work():
+            for s in sessions:
+                try:
+                    s.close()       # detaches (doesn't own ser)
+                except Exception:
+                    pass
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+            self.root.after(0, lambda: self._on_app_disconnect_done(on_done))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_app_disconnect_done(self, on_done) -> None:
+        self._ser = None
+        self.gpio_session = None
+        self.tdbg_session = None
+        self.record_session = None
+        self._connected = False
+        self._set_conn_status("Disconnected", _COLORS["danger_dark"])
+        self._connect_btn.config(state=tk.NORMAL)
+        self.unlock_port_entry()
+        self.set_status("Disconnected", _COLORS["text_secondary"])
+        if on_done is not None:
+            on_done()
 
     def _on_tab_changed(self, _event=None) -> None:
         try:
@@ -2903,27 +2719,6 @@ class App:
             return
         if selected == str(self.gpio_tab.frame):
             self.gpio_tab._ensure_pin_panel_built()
-        # Focus the Connect button of the freshly-selected tab when it's
-        # interactable, so pressing Enter immediately triggers connection
-        # without an extra mouse click. Tabs without a connect_btn (Flash)
-        # are skipped silently.
-        for tab_attr, frame_attr in (
-            ("gpio_tab", "frame"),
-            ("tdbg_tab", "frame"),
-            ("record_tab", "frame"),
-        ):
-            t = getattr(self, tab_attr, None)
-            if t is None:
-                continue
-            if selected != str(getattr(t, frame_attr)):
-                continue
-            btn = getattr(t, "_connect_btn", None)
-            if btn is not None and str(btn["state"]) == tk.NORMAL:
-                try:
-                    btn.focus_set()
-                except tk.TclError:
-                    pass
-            break
 
     def _on_close(self) -> None:
         if self.any_tab_busy():
@@ -2943,15 +2738,19 @@ class App:
                     t._close_preview()
                 except Exception:
                     pass
-        # If GPIO / TDBG / RECORD tabs still hold the serial port open,
-        # close them cleanly so the OS releases the COM port.
-        # session.close() is fast (no Due round-trip), safe to do
-        # synchronously here.
-        for tab in ("gpio_tab", "tdbg_tab", "record_tab"):
-            t = getattr(self, tab, None)
-            if t is not None and t.is_connected():
+        # Release the shared serial connection (if open) so the OS frees the
+        # COM port. Close synchronously here — sessions just detach and the
+        # serial close is fast.
+        if self._connected:
+            for s in (self.record_session, self.tdbg_session, self.gpio_session):
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            if self._ser is not None:
                 try:
-                    t._do_close_session()
+                    self._ser.close()
                 except Exception:
                     pass
         self.root.destroy()
