@@ -1050,6 +1050,24 @@ void setup() {
   // __DATE__ / __TIME__ are stamped by the compiler at every rebuild.
   Serial.println("FW: arduino_utility build " __DATE__ " " __TIME__);
 
+  // --- TEMP BOOT DIAGNOSTIC ----------------------------------------------
+  // Prove whether THIS firmware can physically drive a pin via digitalWrite
+  // at all. Runs once at boot, before any flash-bus or GPIO handling, on the
+  // onboard LED (pin 13). After upload + power-on you should see 5 clean
+  // ~150 ms blinks with no probe / GUI / commands involved:
+  //   - 5 blinks  -> digitalWrite works in our firmware; the GPIO-tab issue
+  //                  is elsewhere (command path / state after boot).
+  //   - no blinks -> digitalWrite is non-functional in our build itself,
+  //                  a fundamental build/board-config problem.
+  // (Remove once the GPIO-output issue is resolved.)
+  pinMode(LED_BUILTIN, OUTPUT);
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(150);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(150);
+  }
+
   Serial.println("Pins initial.");
   // Initial All Pins
   for (int i = 0; i < addrPinsCount; i++) pinMode(addrPins[i], OUTPUT);
