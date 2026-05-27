@@ -12,23 +12,30 @@ import threading
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
-    QHBoxLayout, QLabel, QPushButton, QScrollArea, QTabWidget, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 import gui_data as D
 import gui_theme as T
-from gui_widgets import Card, LogPane, PinGrid, WaveformView
+from gui_widgets import (
+    Card, LogPane, PinGrid, WaveformView, open_waveform_preview,
+)
 
 
 # --------------------------------------------------------------------------
 class Worker(QObject):
-    """Runs submitted callables on a dedicated thread (one per page)."""
+    """Runs submitted callables on a dedicated thread (one per page).
+
+    `on_error(msg)` (called on the worker thread) surfaces any uncaught
+    exception so it reaches the page log instead of a print() that's lost in
+    a windowed EXE. It must itself be thread-safe (the pages pass a
+    signal-emitting log)."""
     _run = Signal(object)
 
-    def __init__(self) -> None:
+    def __init__(self, on_error=None) -> None:
         super().__init__()
+        self._on_error = on_error
         self._thread = QThread()
         self.moveToThread(self._thread)
         self._run.connect(self._exec)
@@ -41,7 +48,10 @@ class Worker(QObject):
         try:
             fn()
         except Exception as e:  # never let a worker exception kill the thread
-            print("worker error:", e)
+            if self._on_error is not None:
+                self._on_error(f"背景作業錯誤：{e}")
+            else:
+                print("worker error:", e)
         finally:
             self._busy = False
 
@@ -64,7 +74,7 @@ class Page(QWidget):
     def __init__(self, app) -> None:
         super().__init__()
         self.app = app
-        self.worker = Worker()
+        self.worker = Worker(on_error=lambda msg: self.log(msg, "err"))
         self.log_pane = LogPane()
         self.logSig.connect(self.log_pane.append)
 
@@ -167,16 +177,16 @@ class FlashPage(Page):
             ok = program_firmware(path, self.log_cb, port=port)
             self.doneSig.emit(bool(ok))
 
-        self.app.set_status("Programming…", T.PALETTE["warning_dark"])
+        self.app.status("Programming…", "warn")
         self.app.lock_port(True)
         self.enqueue(work)
 
     def _on_done(self, success: bool) -> None:
         if success:
             self.log(f"{os.path.basename(self.firmware_path or '')} 燒錄成功。", "ok")
-            self.app.set_status("Success", T.PALETTE["success_dark"])
+            self.app.status("Success", "ok")
         else:
-            self.app.set_status("Error", T.PALETTE["danger_dark"])
+            self.app.status("Error", "err")
         self._start.setEnabled(True)
         self.app.lock_port(False)
 
@@ -188,7 +198,7 @@ class GpioPage(Page):
     def __init__(self, app) -> None:
         super().__init__(app)
         self._abort = threading.Event()
-        self._timer = QTimer(self)
+        self._timer = QTimer(self)   # repeating; interval set on toggle
         self._timer.timeout.connect(self._auto_tick)
 
         lay = self._frame()
@@ -205,6 +215,7 @@ class GpioPage(Page):
         self._interval.setSingleStep(0.5)
         self._interval.setValue(1.0)
         self._interval.setFixedWidth(70)
+        self._interval.valueChanged.connect(self._on_interval_changed)
         clear = QPushButton("清除紀錄")
         clear.clicked.connect(self.log_pane.clear)
         ctl.addWidget(self._read_all)
@@ -277,57 +288,30 @@ class GpioPage(Page):
 
         self.enqueue(cmd)
 
+    def _interval_ms(self) -> int:
+        return max(200, int(self._interval.value() * 1000))
+
     def _on_toggle_auto(self, on: bool) -> None:
         if on and self._session is not None:
-            self._timer.start(max(200, int(self._interval.value() * 1000)))
+            self._timer.start(self._interval_ms())   # repeating
         else:
             self._timer.stop()
+
+    def _on_interval_changed(self, _v) -> None:
+        if self._timer.isActive():
+            self._timer.setInterval(self._interval_ms())
 
     def _auto_tick(self) -> None:
         if self._session is None:
             self._timer.stop()
             return
-        # restart with the (possibly changed) interval; skip if worker busy
-        self._timer.start(max(200, int(self._interval.value() * 1000)))
+        # Skip this tick if the worker is still busy; the repeating timer
+        # will catch up on the next one (no pile-up).
         if not self.is_busy():
             self._on_read_all()
 
 
 # --------------------------------------------------------------------------
-def _cycles_to_label(cycles: float) -> str:
-    # 84 MHz Due → 1 cycle ≈ 11.9 ns
-    return D._format_duration_ns(cycles / 0.084)
-
-
-def _build_cluster_tabs(clusters, fmt_axis, fmt_pulse,
-                        unit_per_cluster=None) -> QWidget:
-    """Return a QTabWidget (or single scroll area) of WaveformViews."""
-    if len(clusters) == 1:
-        return _scroll_wave(clusters[0])
-    tabs = QTabWidget()
-    for i, view in enumerate(clusters):
-        tabs.addTab(_scroll_wave(view), f"段 {i + 1}")
-    return tabs
-
-
-def _scroll_wave(view: WaveformView) -> QScrollArea:
-    sa = QScrollArea()
-    sa.setWidgetResizable(False)
-    sa.setFrameShape(QFrame.NoFrame)
-    sa.setWidget(view)
-    return sa
-
-
-class _PreviewDialog(QDialog):
-    def __init__(self, title: str, content: QWidget, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(880, 360)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.addWidget(content)
-
-
 class TdbgPage(Page):
     doneSig = Signal(bool)
 
@@ -421,7 +405,7 @@ class TdbgPage(Page):
 
     def _play(self, pin, initial, events, dur, status) -> None:
         self._lock(True)
-        self.app.set_status(status, T.PALETTE["warning_dark"])
+        self.app.status(status, "warn")
 
         def cmd():
             sess = self._session
@@ -438,26 +422,19 @@ class TdbgPage(Page):
     def _on_send_done(self, success: bool) -> None:
         if self._session is not None:
             self._lock(False)
-        self.app.set_status(
-            "TDBG sent" if success else "TDBG error",
-            T.PALETTE["success_dark"] if success else T.PALETTE["danger_dark"])
+        self.app.status("TDBG sent" if success else "TDBG error",
+                        "ok" if success else "err")
 
     def _open_preview(self) -> None:
         try:
             initial, events = D._ensure_builtin_parsed()
         except Exception:
             return
-        clusters = D._split_into_clusters(initial, events)
-        views = []
-        for _start, c_init, c_events in clusters:
-            total = sum(d for d, _ in c_events) or 1
-            ppu = max(0.01, 760 / total)
-            v = WaveformView()
-            v.set_full([("", c_init, c_events)], ppu, total / 8.0,
-                       _cycles_to_label, _cycles_to_label)
-            views.append(v)
-        content = _build_cluster_tabs(views, _cycles_to_label, _cycles_to_label)
-        _PreviewDialog("TDBG 波形", content, self).exec()
+        clusters = [
+            [("", c_init, c_events)]
+            for _start, c_init, c_events in D._split_into_clusters(initial, events)
+        ]
+        open_waveform_preview(self, "TDBG 波形", clusters, D.format_cycles)
 
 
 # --------------------------------------------------------------------------
@@ -623,7 +600,7 @@ class RecordPage(Page):
         for r in self._rows:
             r.set_combo_enabled(False)
             r.set_live_state(None)
-        self.app.set_status("RECORD recording…", T.PALETTE["warning_dark"])
+        self.app.status("RECORD recording…", "warn")
 
         pin_to_row = {r.selected_pin(): r for r in self._rows
                       if r.selected_pin() is not None}
@@ -657,13 +634,13 @@ class RecordPage(Page):
             r.set_combo_enabled(self._connected)
         self._sync_row_controls()
         self._refresh_start()
-        self.app.set_status("RECORD start failed", T.PALETTE["danger_dark"])
+        self.app.status("RECORD start failed", "err")
 
     def _on_stop(self) -> None:
         if not self._recording:
             return
         self._stop.setEnabled(False)
-        self.app.set_status("RECORD stopping…", T.PALETTE["warning_dark"])
+        self.app.status("RECORD stopping…", "warn")
 
         def cmd():
             sess = self._session
@@ -682,7 +659,7 @@ class RecordPage(Page):
         self._sync_row_controls()
         self._refresh_start()
         if result is None:
-            self.app.set_status("RECORD stop error", T.PALETTE["danger_dark"])
+            self.app.status("RECORD stop error", "err")
             return
         pins, events = result
         self._recorded = (pins, events)
@@ -690,11 +667,10 @@ class RecordPage(Page):
             self._draw_thumb(pins, events)
             self._thumb.setVisible(True)
             total_us = sum(d for d, _ in events)
-            self.app.set_status(
-                f"RECORD done: {len(events)} edges, {total_us/1000:.3f} ms",
-                T.PALETTE["success_dark"])
+            self.app.status(
+                f"RECORD done: {len(events)} edges, {total_us/1000:.3f} ms", "ok")
         else:
-            self.app.set_status("RECORD done: no edges", T.PALETTE["warning_dark"])
+            self.app.status("RECORD done: no edges", "warn")
 
     def _draw_thumb(self, pins, events) -> None:
         p0 = pins[0]
@@ -709,14 +685,8 @@ class RecordPage(Page):
         if not events:
             return
         # one trace per pin; x in microseconds
-        total = sum(d for d, _ in events) or 1
-        ppu = max(0.05, 760 / total)
         traces = []
         for p in pins:
             ev = [(d, 1 if st.get(p) else 0) for d, st in events]
-            initial = ev[0][1] if ev else 0
-            traces.append((f"D{p}", initial, ev))
-        v = WaveformView()
-        fmt = lambda us: D._format_duration_ns(us * 1000)
-        v.set_full(traces, ppu, total / 8.0, fmt, fmt)
-        _PreviewDialog("錄製波形", _scroll_wave(v), self).exec()
+            traces.append((f"D{p}", ev[0][1] if ev else 0, ev))
+        open_waveform_preview(self, "錄製波形", [traces], D.format_us, min_ppu=0.05)

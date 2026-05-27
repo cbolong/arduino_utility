@@ -457,3 +457,16 @@ def _format_duration_ns(ns: float) -> str:
     if ns < 1_000_000_000:
         return f"{ns / 1_000_000:.3f} ms"
     return f"{ns / 1_000_000_000:.3f} s"
+
+
+# Single source of truth for the two time-unit → label conversions the
+# waveform views need (was duplicated as _cycles_to_label + an inline
+# `lambda us: _format_duration_ns(us*1000)`).
+def format_cycles(cycles: float) -> str:
+    """Due cycles → label (84 MHz → 1 cycle ≈ 11.9 ns)."""
+    return _format_duration_ns(cycles / 0.084)
+
+
+def format_us(us: float) -> str:
+    """Microseconds → label."""
+    return _format_duration_ns(us * 1000)

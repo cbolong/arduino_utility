@@ -279,15 +279,16 @@ def open_due_link(
     return _open_and_wait_idle(port, log, handshake_timeout_s)
 
 
-class GpioSession:
-    """Persistent GPIO session over one open serial port.
+class _Session:
+    """Shared lifecycle for the GPIO / TDBG / RECORD sessions.
 
-    Lifecycle: construct with port + log, call open() to connect (~2 s Due
-    reset wait), then call set_pin / read_pin as many times as needed (each
-    ~5 ms over UART), finally close(). open()/close() are idempotent.
-
-    Not thread-safe internally — callers must serialise set_pin / read_pin
-    onto a single worker thread (the GUI does this with a per-tab cmd queue).
+    Holds the (optionally borrowed) serial handle + access lock and provides
+    the identical open() / close() / is_open the three classes used to
+    duplicate. When `ser` is supplied the session BORROWS the App's shared
+    serial — it neither opens nor closes it (the App owns the lifecycle).
+    `lock` serialises serial access across the sessions that share one port.
+    Both default to None for the standalone (own-the-port) lifecycle the
+    CLI / tests still use.
     """
 
     def __init__(
@@ -297,16 +298,11 @@ class GpioSession:
         port: str | None = None,
         handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
         ser: "serial.Serial | None" = None,
-        lock: "threading.Lock | None" = None,
+        lock=None,
     ) -> None:
         self._log = log
         self._port = port
         self._handshake_timeout_s = handshake_timeout_s
-        # When `ser` is supplied the session BORROWS the App's shared
-        # serial — it neither opens nor closes it (the App owns the
-        # lifecycle). `lock` serialises serial access across the GPIO /
-        # TDBG sessions that share one port. Both default to None for the
-        # standalone (own-the-port) lifecycle the CLI / tests still use.
         self._ser: serial.Serial | None = ser
         self._owns_ser = ser is None
         self._lock = lock
@@ -333,6 +329,29 @@ class GpioSession:
             except Exception:
                 pass
         self._ser = None
+
+    def _check_crc16(self, host_crc: int, mcu_crc: int) -> bool:
+        """Log + return False on CRC-16 mismatch, True when equal. Shared by
+        TdbgSession.load and RecordSession.stop (both CRC-16/CCITT-FALSE)."""
+        if mcu_crc != host_crc:
+            self._log(
+                f"CRC mismatch: host=0x{host_crc:04X} mcu=0x{mcu_crc:04X}", "err",
+            )
+            return False
+        return True
+
+
+class GpioSession(_Session):
+    """Persistent GPIO session over one open serial port.
+
+    Lifecycle: construct with port + log, call open() to connect (~2 s Due
+    reset wait), then call set_pin / read_pin as many times as needed (each
+    ~5 ms over UART), finally close(). open()/close() are idempotent.
+
+    Not thread-safe internally — callers must serialise set_pin / read_pin
+    onto a single worker thread (the GUI does this with a per-tab cmd queue).
+    Lifecycle (__init__ / open / close / is_open) is inherited from _Session.
+    """
 
     def set_pin(self, pin: int, mode: str, value: str | None = None) -> bool:
         if not self.is_open:
@@ -660,7 +679,7 @@ def tdbg_retime_for_engine(
     return out, scale
 
 
-class TdbgSession:
+class TdbgSession(_Session):
     """Persistent TDBG session — same lifecycle pattern as GpioSession.
 
     Workflow:
@@ -674,48 +693,8 @@ class TdbgSession:
         s.close()
 
     Not thread-safe; serialise calls on a single worker thread (GUI does).
+    Lifecycle (__init__ / open / close / is_open) is inherited from _Session.
     """
-
-    def __init__(
-        self,
-        log: LogCallback,
-        *,
-        port: str | None = None,
-        handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
-        ser: "serial.Serial | None" = None,
-        lock: "threading.Lock | None" = None,
-    ) -> None:
-        self._log = log
-        self._port = port
-        self._handshake_timeout_s = handshake_timeout_s
-        # See GpioSession.__init__ — `ser` borrows the App's shared serial,
-        # `lock` serialises access against the other shared-port sessions.
-        self._ser: serial.Serial | None = ser
-        self._owns_ser = ser is None
-        self._lock = lock
-
-    @property
-    def is_open(self) -> bool:
-        return self._ser is not None
-
-    def open(self) -> bool:
-        if self.is_open:
-            return True
-        if not self._owns_ser:
-            return self._ser is not None
-        ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
-        if ser is None:
-            return False
-        self._ser = ser
-        return True
-
-    def close(self) -> None:
-        if self._ser is not None and self._owns_ser:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-        self._ser = None
 
     def load(
         self,
@@ -800,11 +779,7 @@ class TdbgSession:
         except (IndexError, ValueError):
             self._log(f"malformed TDBG_LOADED reply: {reply!r}", "err")
             return False
-        if mcu_crc != expected_crc:
-            self._log(
-                f"CRC mismatch: host=0x{expected_crc:04X} mcu=0x{mcu_crc:04X}",
-                "err",
-            )
+        if not self._check_crc16(expected_crc, mcu_crc):
             return False
         self._log(f"recv: {reply} (CRC OK)", "ok")
         return True
@@ -966,7 +941,7 @@ def parse_record_blob(
     return out
 
 
-class RecordSession:
+class RecordSession(_Session):
     """Persistent recording session — same lifecycle as TdbgSession.
 
     Workflow:
@@ -986,19 +961,16 @@ class RecordSession:
         port: str | None = None,
         handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
         ser: "serial.Serial | None" = None,
-        lock: "threading.Lock | None" = None,
+        lock=None,
     ) -> None:
-        self._log = log
-        self._port = port
-        self._handshake_timeout_s = handshake_timeout_s
-        # See GpioSession.__init__ — `ser` borrows the App's shared serial.
+        super().__init__(
+            log, port=port, handshake_timeout_s=handshake_timeout_s,
+            ser=ser, lock=lock,
+        )
         # RECORD is exclusive while recording (its live_loop owns the port,
         # and the App disables the other tabs' actions during a recording),
         # so `lock` is accepted for API symmetry but RECORD's own start/stop
         # transactions don't contend with GPIO/TDBG in practice.
-        self._ser: serial.Serial | None = ser
-        self._owns_ser = ser is None
-        self._lock = lock
         self._pins: list[int] = []
         self._on_live = None
         self._live_thread: threading.Thread | None = None
@@ -1011,33 +983,18 @@ class RecordSession:
         self._stop_handoff_lock = threading.Lock()
         self._handed_off = threading.Event()
 
-    @property
-    def is_open(self) -> bool:
-        return self._ser is not None
-
-    def open(self) -> bool:
-        if self.is_open:
-            return True
-        if not self._owns_ser:
-            return self._ser is not None
-        ser = _open_and_wait_idle(self._port, self._log, self._handshake_timeout_s)
-        if ser is None:
-            return False
-        self._ser = ser
-        return True
-
     def close(self) -> None:
-        # Make sure live thread is wound up first.
+        # Wind the live thread up first, then let _Session.close() drop the
+        # serial. join() is bounded; if it expires the daemon thread is left
+        # to die with the process — surface that as a warning rather than
+        # silently orphaning it.
         self._live_stop.set()
         if self._live_thread is not None:
             self._live_thread.join(timeout=2.0)
+            if self._live_thread.is_alive():
+                self._log("RECORD live thread did not exit within 2s", "warn")
             self._live_thread = None
-        if self._ser is not None and self._owns_ser:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-        self._ser = None
+        super().close()
 
     def start(self, pins: list[int], on_live=None) -> bool:
         if not self.is_open:
@@ -1185,8 +1142,10 @@ class RecordSession:
             expected = count * RECORD_EVENT_BYTES
             saved_timeout = self._ser.timeout
             self._ser.timeout = 5.0
-            blob = self._ser.read(expected)
-            self._ser.timeout = saved_timeout
+            try:
+                blob = self._ser.read(expected)
+            finally:
+                self._ser.timeout = saved_timeout
             if len(blob) != expected:
                 self._log(
                     f"short blob read: got {len(blob)}/{expected}", "err",
@@ -1204,11 +1163,7 @@ class RecordSession:
             return None
         # Re-use TDBG's CRC-16/CCITT-FALSE.
         host_crc = tdbg_crc16(blob) if blob else 0
-        if mcu_crc != host_crc:
-            self._log(
-                f"CRC mismatch: host=0x{host_crc:04X} mcu=0x{mcu_crc:04X}",
-                "err",
-            )
+        if not self._check_crc16(host_crc, mcu_crc):
             return None
         self._log(f"recv: {line} (CRC OK)", "ok")
 

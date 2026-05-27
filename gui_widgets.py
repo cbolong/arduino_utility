@@ -8,10 +8,11 @@ from __future__ import annotations
 import html
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit,
-    QPushButton, QRadioButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QButtonGroup, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 import gui_theme as T
@@ -251,8 +252,10 @@ class WaveformView(QWidget):
     """Logic-analyzer-style square-wave renderer on a dark canvas.
 
     Traces: list of (label, initial_state, events) where events are
-    [(delta_units, new_state), ...]. `px_per_unit` maps time-units to pixels.
-    Used both as a tiny thumbnail (no axis/labels) and as the full preview.
+    [(delta_units, new_state), ...]. Geometry is computed ONCE per data load
+    (set_full / set_thumbnail) into cached QPainterPaths + a label list, so
+    repaints (scroll / resize / expose) stay cheap even for 4096-edge
+    captures — the previous version recomputed every segment on every paint.
     """
     clicked = Signal()
 
@@ -262,117 +265,139 @@ class WaveformView(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._traces: list[tuple[str, int, list]] = []
-        self._ppu = 0.1
-        self._left = 60
-        self._right = 30
-        self._tick_step = 0.0
-        self._fmt_axis = lambda u: f"{u:g}"
-        self._fmt_pulse = None
-        self._thumb = False
-        self.setStyleSheet(f"background: {T.PALETTE['canvas_bg']}; border-radius: 6px;")
+        self._wave = QPainterPath()
+        self._axis = QPainterPath()
+        self._texts: list[tuple[int, int, str, str]] = []  # x, y, text, colorkey
+        self.setStyleSheet(
+            f"background: {T.PALETTE['canvas_bg']}; border-radius: 6px;")
 
-    # -- configuration ------------------------------------------------------
+    # -- configuration (rebuilds the cached geometry) -----------------------
     def set_thumbnail(self, initial: int, events: list, n: int = 6) -> None:
-        self._thumb = True
-        self._left = 2
-        self._right = 2
-        self._traces = [("", initial, events[:n])]
         self.setFixedSize(26, 26)
+        self._build_thumb(initial, events[:n])
         self.update()
 
     def set_full(self, traces: list, px_per_unit: float, tick_step: float,
                  fmt_axis, fmt_pulse=None) -> None:
-        self._thumb = False
-        self._traces = traces
-        self._ppu = px_per_unit
-        self._tick_step = tick_step
-        self._fmt_axis = fmt_axis
-        self._fmt_pulse = fmt_pulse
-        self._left = 60
         total = max((sum(d for d, _ in ev) for _, _, ev in traces), default=0)
-        width = int(self._left + total * px_per_unit + self._right)
+        width = int(60 + total * px_per_unit + 30)
         height = self.TOP_PAD + len(traces) * self.ROW_H + self.AXIS_H
         self.setMinimumSize(max(width, 760), height)
         self.resize(max(width, 760), height)
+        self._build_full(traces, px_per_unit, tick_step, fmt_axis, fmt_pulse)
         self.update()
 
-    # -- painting -----------------------------------------------------------
+    # -- one-time geometry build --------------------------------------------
+    def _build_thumb(self, initial: int, events: list) -> None:
+        self._wave = QPainterPath()
+        self._axis = QPainterPath()
+        self._texts = []
+        left = right = 2
+        y_top, y_low = 4, self.height() - 5
+        step = (self.width() - left - right) / max(1, len(events))
+        x = left
+        y = y_top if initial else y_low
+        self._wave.moveTo(x, y)
+        for _, ns in events:
+            nx = x + step
+            self._wave.lineTo(nx, y)
+            ny = y_top if ns else y_low
+            if ny != y:
+                self._wave.lineTo(nx, ny)
+            x, y = nx, ny
+        self._wave.lineTo(self.width() - right, y)
+
+    def _build_full(self, traces, ppu, tick_step, fmt_axis, fmt_pulse) -> None:
+        self._wave = QPainterPath()
+        self._axis = QPainterPath()
+        self._texts = []
+        left = 60
+        for i, (label, initial, events) in enumerate(traces):
+            row_top = self.TOP_PAD + i * self.ROW_H
+            y_top = row_top + 14
+            y_low = row_top + self.ROW_H - 24
+            if label:
+                self._texts.append((4, y_top + 10, label, "axis"))
+            x = left
+            y = y_top if initial else y_low
+            self._wave.moveTo(x, y)
+            for delta, ns in events:
+                nx = x + delta * ppu
+                self._wave.lineTo(nx, y)
+                if i == 0 and fmt_pulse and delta > 0 and (nx - x) > 24:
+                    self._texts.append(
+                        (int((x + nx) / 2 - 24), y_top - 4, fmt_pulse(delta), "label"))
+                ny = y_top if ns else y_low
+                if ny != y:
+                    self._wave.lineTo(nx, ny)
+                x, y = nx, ny
+            self._wave.lineTo(x + 8, y)
+        if tick_step and tick_step > 0:
+            axis_y = self.height() - self.AXIS_H + 6
+            total_px = self.width() - left - 30
+            self._axis.moveTo(left, axis_y)
+            self._axis.lineTo(self.width() - 30, axis_y)
+            u = 0.0
+            while u * ppu <= total_px:
+                tx = int(left + u * ppu)
+                self._axis.moveTo(tx, axis_y)
+                self._axis.lineTo(tx, axis_y + 4)
+                self._texts.append((tx + 2, axis_y + 16, fmt_axis(u), "axis"))
+                u += tick_step
+
+    # -- painting (cheap: draw cached paths + texts) ------------------------
     def mousePressEvent(self, _e) -> None:
         self.clicked.emit()
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
         p.fillRect(self.rect(), QColor(T.PALETTE["canvas_bg"]))
-        if not self._traces:
-            return
-        orange = QColor(T.PALETTE["wave_orange"])
-        if self._thumb:
-            self._paint_trace(p, self._traces[0], y_top=4,
-                              y_low=self.height() - 5, ppu=None, pen=orange)
-            return
+        p.setPen(QPen(QColor(T.PALETTE["wave_orange"]), 2))
+        p.drawPath(self._wave)
+        if not self._axis.isEmpty():
+            p.setPen(QPen(QColor(T.PALETTE["axis_text"])))
+            p.drawPath(self._axis)
+        for x, y, text, key in self._texts:
+            color = (T.PALETTE["wave_label"] if key == "label"
+                     else T.PALETTE["axis_text"])
+            p.setPen(QPen(QColor(color)))
+            p.drawText(x, y, text)
 
-        for i, tr in enumerate(self._traces):
-            row_top = self.TOP_PAD + i * self.ROW_H
-            y_top = row_top + 14
-            y_low = row_top + self.ROW_H - 24
-            if tr[0]:
-                p.setPen(QPen(QColor(T.PALETTE["axis_text"])))
-                p.drawText(4, y_top + 10, tr[0])
-            self._paint_trace(p, tr, y_top, y_low, self._ppu, orange,
-                              draw_pulse=(i == 0))
-        self._paint_axis(p)
 
-    def _paint_trace(self, p, trace, y_top, y_low, ppu, pen, draw_pulse=False):
-        _, initial, events = trace
-        p.setPen(QPen(pen, 2))
-        if ppu is None:  # thumbnail: uniform spacing
-            usable = self.width() - self._left - self._right
-            n = max(1, len(events))
-            step = usable / n
-            x = self._left
-            state = initial
-            y = y_top if state else y_low
-            for _, ns in events:
-                nx = x + step
-                p.drawLine(int(x), int(y), int(nx), int(y))
-                ny = y_top if ns else y_low
-                if ny != y:
-                    p.drawLine(int(nx), int(y), int(nx), int(ny))
-                x, y = nx, ny
-            p.drawLine(int(x), int(y), int(self.width() - self._right), int(y))
-            return
+def _scroll_wave(view: WaveformView) -> QScrollArea:
+    sa = QScrollArea()
+    sa.setWidgetResizable(False)
+    sa.setFrameShape(QFrame.NoFrame)
+    sa.setWidget(view)
+    return sa
 
-        x = self._left
-        state = initial
-        y = y_top if state else y_low
-        label_pen = QPen(QColor(T.PALETTE["wave_label"]))
-        for delta, ns in events:
-            nx = x + delta * ppu
-            p.setPen(QPen(pen, 2))
-            p.drawLine(int(x), int(y), int(nx), int(y))
-            if draw_pulse and self._fmt_pulse and delta > 0 and (nx - x) > 24:
-                p.setPen(label_pen)
-                p.drawText(int((x + nx) / 2 - 24), y_top - 4, self._fmt_pulse(delta))
-            ny = y_top if ns else y_low
-            if ny != y:
-                p.setPen(QPen(pen, 2))
-                p.drawLine(int(nx), int(y), int(nx), int(ny))
-            x, y = nx, ny
-        p.setPen(QPen(pen, 2))
-        p.drawLine(int(x), int(y), int(x + 8), int(y))
 
-    def _paint_axis(self, p):
-        if self._tick_step <= 0:
-            return
-        axis_y = self.height() - self.AXIS_H + 6
-        p.setPen(QPen(QColor(T.PALETTE["axis_text"])))
-        p.drawLine(self._left, axis_y, self.width() - self._right, axis_y)
-        total_px = self.width() - self._left - self._right
-        u = 0.0
-        while u * self._ppu <= total_px:
-            tx = int(self._left + u * self._ppu)
-            p.drawLine(tx, axis_y, tx, axis_y + 4)
-            p.drawText(tx + 2, axis_y + 16, self._fmt_axis(u))
-            u += self._tick_step
+def open_waveform_preview(parent, title: str, clusters: list, fmt,
+                          min_ppu: float = 0.01) -> None:
+    """Modal waveform preview shared by the TDBG and RECORD pages.
+
+    `clusters` is a list of clusters; each cluster is a list of traces
+    (label, initial_state, events). One scrollable WaveformView per cluster
+    (multiple clusters → one tab each). `fmt` maps a time-unit value to a
+    label string (e.g. gui_data.format_cycles / format_us).
+    """
+    views = []
+    for traces in clusters:
+        total = max((sum(d for d, _ in ev) for _, _, ev in traces), default=0) or 1
+        ppu = max(min_ppu, 760 / total)
+        v = WaveformView()
+        v.set_full(traces, ppu, total / 8.0, fmt, fmt)
+        views.append(v)
+    if len(views) == 1:
+        content = _scroll_wave(views[0])
+    else:
+        content = QTabWidget()
+        for i, v in enumerate(views):
+            content.addTab(_scroll_wave(v), f"段 {i + 1}")
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(880, 360)
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.addWidget(content)
+    dlg.exec()
