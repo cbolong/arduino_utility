@@ -2465,6 +2465,11 @@ class App:
         # no white "box" on the selected tab:
         #   unselected -> blue text (regular)
         #   selected   -> black text (bold), same 11pt size, same background
+        # The selected/focused tab in clam draws a border + focus rectangle
+        # (the "box" the user saw). Matching bordercolor / lightcolor /
+        # darkcolor / focuscolor to the fill removes that box entirely, so the
+        # tab geometry is identical in every state — only the text colour and
+        # weight change.
         style.configure(
             "TNotebook.Tab",
             padding=[16, 8],
@@ -2472,6 +2477,10 @@ class App:
             background=_COLORS["surface_2"],
             foreground=_COLORS["accent"],
             borderwidth=0,
+            bordercolor=_COLORS["surface_2"],
+            lightcolor=_COLORS["surface_2"],
+            darkcolor=_COLORS["surface_2"],
+            focuscolor=_COLORS["surface_2"],
         )
         style.map(
             "TNotebook.Tab",
@@ -2483,6 +2492,12 @@ class App:
                 ("selected", _COLORS["text_primary"]),
                 ("active",   _COLORS["accent_dark"]),
             ],
+            bordercolor=[("selected", _COLORS["surface_2"]),
+                         ("active",   _COLORS["surface_2"])],
+            lightcolor=[("selected", _COLORS["surface_2"]),
+                        ("active",   _COLORS["surface_2"])],
+            darkcolor=[("selected", _COLORS["surface_2"]),
+                       ("active",   _COLORS["surface_2"])],
             font=[("selected", font_tab_sel)],
             expand=[("selected", [0, 0, 0, 0])],
         )
