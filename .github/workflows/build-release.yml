@@ -71,14 +71,15 @@ jobs:
         run: |
           # --onefile chosen for distribution simplicity (single .exe, no
           # surrounding folder). Trade-off: cold-start unpacks runtime to
-          # %TEMP% on every launch (~5-10 s). The startup-side optimisations
-          # in binFileTransferGui.py (lazy imports, background port scan,
-          # lazy GPIO panel) still apply once the bootloader hands control
-          # to Python.
+          # %TEMP% on every launch — larger / slower now that the GUI is
+          # PySide6/Qt (~60 MB EXE). PyInstaller's bundled PySide6 hook
+          # collects the Qt platform plugin automatically. tkinter is no
+          # longer used, so exclude it to trim the bundle.
           pyinstaller --noconfirm --onefile --windowed --clean \
             --name SST39FlashProgrammer \
             --collect-submodules serial \
             --hidden-import serial.tools.list_ports_windows \
+            --exclude-module tkinter \
             --noupx \
             --icon assets/icon.ico \
             --add-data "assets/icon.ico;assets" \
