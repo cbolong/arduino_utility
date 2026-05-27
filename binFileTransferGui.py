@@ -296,7 +296,8 @@ class FlashTab(_LoggedTab):
         row2 = ttk.Frame(parent)
         row2.pack(fill=tk.X, pady=(8, 0))
         self.start_btn = ttk.Button(
-            row2, text="Start Programming", command=self._on_start, state=tk.DISABLED
+            row2, text="Start Programming", command=self._on_start,
+            state=tk.DISABLED, style="Accent.TButton",
         )
         self.start_btn.pack(side=tk.LEFT)
         self.clear_btn = ttk.Button(row2, text="Clear Log", command=self._clear_log)
@@ -1343,6 +1344,7 @@ class TdbgTab(_LoggedTab):
         self._draw_thumbnail()
         self._send_btn = ttk.Button(
             card, text="送出", command=self._on_send, state=tk.DISABLED,
+            style="Accent.TButton",
         )
         self._send_btn.pack(side=tk.LEFT)
         # Calibration pattern — four bursts at 100/200/500/1000-cycle deltas
@@ -1862,6 +1864,7 @@ class RecordTab(_LoggedTab):
         action_row.pack(fill=tk.X, pady=(8, 0))
         self._start_btn = ttk.Button(
             action_row, text="開始", command=self._on_start, state=tk.DISABLED,
+            style="Accent.TButton",
         )
         self._start_btn.pack(side=tk.LEFT)
         self._stop_btn = ttk.Button(
@@ -2418,6 +2421,7 @@ class App:
         self._conn_status_label.pack(side=tk.LEFT, padx=(6, 12))
         self._connect_btn = ttk.Button(
             conn_row, text="Connect", command=self._on_app_connect,
+            style="Accent.TButton",
         )
         self._connect_btn.pack(side=tk.LEFT)
         self._disconnect_btn = ttk.Button(
@@ -2438,39 +2442,113 @@ class App:
             style.theme_use("clam")
         except tk.TclError:
             pass
+
+        # Font tuples are built HERE (not at module scope) because _UI_FAMILY
+        # is only resolved to a real family in __init__ above; at import time
+        # it is still the placeholder "TkDefaultFont", which is invalid as a
+        # tuple family name and falls back to an ugly default.
+        font_base = (_UI_FAMILY, 10)
+        font_tab = (_UI_FAMILY, 11)
+        font_tab_sel = (_UI_FAMILY, 11, "bold")
+
+        # Global default font for every ttk widget — single source of truth so
+        # labels / buttons / entries all share one clean family + size.
+        style.configure(".", font=font_base)
+
         style.configure(
             "TNotebook",
             background=_COLORS["surface_2"],
             borderwidth=0,
             tabmargins=[2, 4, 2, 0],
         )
+        # Flat tabs, differentiated by COLOUR + WEIGHT only — no size jump and
+        # no white "box" on the selected tab:
+        #   unselected -> blue text (regular)
+        #   selected   -> black text (bold), same 11pt size, same background
         style.configure(
             "TNotebook.Tab",
             padding=[16, 8],
-            font=(_UI_FAMILY, 10),
+            font=font_tab,
             background=_COLORS["surface_2"],
-            foreground=_COLORS["text_secondary"],
+            foreground=_COLORS["accent"],
             borderwidth=0,
         )
         style.map(
             "TNotebook.Tab",
             background=[
-                ("selected", _COLORS["window_bg"]),
-                ("active",   _COLORS["surface_hover"]),
+                ("selected", _COLORS["surface_2"]),
+                ("active",   _COLORS["surface_2"]),
             ],
             foreground=[
-                ("selected", _COLORS["accent"]),
-                ("active",   _COLORS["text_primary"]),
+                ("selected", _COLORS["text_primary"]),
+                ("active",   _COLORS["accent_dark"]),
             ],
-            font=[("selected", (_UI_FAMILY, 12, "bold"))],
+            font=[("selected", font_tab_sel)],
             expand=[("selected", [0, 0, 0, 0])],
         )
 
+        # Flat buttons — strip clam's 3D bevel (lightcolor/darkcolor drive the
+        # bevel highlight/shadow; matching them to the fill removes it) and the
+        # dotted focus ring (focuscolor). Hover/pressed give subtle feedback.
+        style.configure(
+            "TButton",
+            font=font_base,
+            background=_COLORS["surface_2"],
+            foreground=_COLORS["text_primary"],
+            bordercolor=_COLORS["separator"],
+            lightcolor=_COLORS["surface_2"],
+            darkcolor=_COLORS["surface_2"],
+            focuscolor=_COLORS["surface_2"],
+            relief="flat",
+            borderwidth=1,
+            padding=[12, 6],
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("pressed",  _COLORS["separator"]),
+                ("active",   _COLORS["surface_hover"]),
+                ("disabled", _COLORS["surface_2"]),
+            ],
+            foreground=[("disabled", _COLORS["text_disabled"])],
+            lightcolor=[("active", _COLORS["surface_hover"])],
+            darkcolor=[("active", _COLORS["surface_hover"])],
+        )
+
+        # Primary-action button — solid accent fill, white text, no bevel.
+        # Applied to the one main action per tab (Connect / Start Programming /
+        # 送出 / 開始).
+        style.configure(
+            "Accent.TButton",
+            font=(_UI_FAMILY, 10, "bold"),
+            background=_COLORS["accent"],
+            foreground="#ffffff",
+            bordercolor=_COLORS["accent"],
+            lightcolor=_COLORS["accent"],
+            darkcolor=_COLORS["accent"],
+            focuscolor=_COLORS["accent"],
+            relief="flat",
+            borderwidth=0,
+            padding=[12, 6],
+        )
+        style.map(
+            "Accent.TButton",
+            background=[
+                ("pressed",  _COLORS["accent_dark"]),
+                ("active",   _COLORS["accent_dark"]),
+                ("disabled", _COLORS["text_disabled"]),
+            ],
+            foreground=[("disabled", "#ffffff")],
+            lightcolor=[("active", _COLORS["accent_dark"])],
+            darkcolor=[("active", _COLORS["accent_dark"])],
+        )
+
         # Disabled-state foreground — _COLORS["text_disabled"] was defined
-        # but never applied. Without this, disabled buttons / labels are
+        # but never applied. Without this, disabled labels / entries are
         # rendered with the default (full-strength) foreground, making it
-        # hard to tell whether a control is interactive.
-        for w in ("TButton", "TLabel", "TEntry", "TCombobox", "TRadiobutton"):
+        # hard to tell whether a control is interactive. (TButton handles its
+        # own disabled state above.)
+        for w in ("TLabel", "TEntry", "TCombobox", "TRadiobutton"):
             style.map(w, foreground=[("disabled", _COLORS["text_disabled"])])
 
         self.notebook = ttk.Notebook(self.root)
