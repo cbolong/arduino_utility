@@ -133,7 +133,7 @@ python binFileTransfer.py --file ./builds/v1.2.bin --timeout 60
 ```bash
 python binFileTransferGui.py
 ```
-或從 GitHub Releases 下載 `SST39FlashProgrammer.exe`（Windows 單檔執行）。
+或從 GitHub Releases 下載 `Arduino_Utility.exe`（Windows 單檔執行）。
 
 > 啟動速度：onefile bootloader 每次都會把 Python runtime 解壓到 `%TEMP%`，冷啟動約 5–10 秒，這是用「單檔可攜」換來的代價。Python runtime 一進去之後仍然有做 lazy import / 背景掃 port / GPIO 面板 lazy build 等優化，所以視窗本身會很快出現；只是 bootloader 解壓那一段沒辦法省。
 
@@ -378,14 +378,14 @@ FILE_NAME = "firmware.bin"   # 預設值，可被 --file 覆蓋
 - Tag 格式：`build-YYYYMMDD-HHMMSS-<7位commit sha>`
 - Release 名稱：`Auto build build-YYYYMMDD-HHMMSS-<sha>`
 - 內文：commit SHA + commit message
-- Asset：`SST39FlashProgrammer.exe`
+- Asset：`Arduino_Utility.exe`
 - `make_latest: true` → 每次新 build 自動取代上一次的 Latest 標記
 
 PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免上游升版突然壞掉。
 
 ### EXE 是 self-contained 的（給接到 EXE 的人）
 
-`SST39FlashProgrammer.exe` 直接 build 在 Windows runner 上，**單檔可執行，不用裝 Python、不用裝 Visual C++ Redist、不用 pip**。Build 內含：
+`Arduino_Utility.exe` 直接 build 在 Windows runner 上，**單檔可執行，不用裝 Python、不用裝 Visual C++ Redist、不用 pip**。Build 內含：
 - Python 3.12 直譯器
 - `tkinter` GUI runtime（標準庫，PyInstaller 自動包入）
 - `pyserial` + Windows COM port enumeration backend（用 `--collect-submodules serial` + `--hidden-import serial.tools.list_ports_windows` 強制納入，避免 PyInstaller 漏掉動態載入的子模組）
@@ -418,7 +418,7 @@ build 時 workflow 會動態產生 `version.txt` 並用 `--version-file` 嵌進 
 
 每次 build 結束後會清理：
 - 撈出所有 `build-*` 開頭的 release，按 `publishedAt` 排序
-- 第 5 個（含）以後的 release 上的 `SST39FlashProgrammer.exe` asset 會被刪掉（順便也把曾經短暫嘗試過的 `SST39FlashProgrammer.zip` 一起清，避免遺留資產）
+- 第 5 個（含）以後的 release 上的 `Arduino_Utility.exe` asset 會被刪掉（也一併清掉舊名 `SST39FlashProgrammer.exe` 與曾經短暫嘗試過的 `SST39FlashProgrammer.zip`，避免遺留資產）
 - **Release notes、tag、source code zip 都保留**，方便回顧 commit 歷史
 - 你手動發的 semver release（例如 `v0.1.0`）**不會被碰**，因為 prefix 不符
 

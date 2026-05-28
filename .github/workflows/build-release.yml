@@ -59,8 +59,8 @@ jobs:
                   StringStruct(u'CompanyName', u'cbolong'),
                   StringStruct(u'FileDescription', u'Arduino應用軟體'),
                   StringStruct(u'FileVersion', u'${ver_str}'),
-                  StringStruct(u'InternalName', u'SST39FlashProgrammer'),
-                  StringStruct(u'OriginalFilename', u'SST39FlashProgrammer.exe'),
+                  StringStruct(u'InternalName', u'Arduino_Utility'),
+                  StringStruct(u'OriginalFilename', u'Arduino_Utility.exe'),
                   StringStruct(u'ProductName', u'Arduino應用軟體'),
                   StringStruct(u'ProductVersion', u'${ver_str}')])]),
               VarFileInfo([VarStruct(u'Translation', [1033, 1200])])])
@@ -76,7 +76,7 @@ jobs:
           # collects the Qt platform plugin automatically. tkinter is no
           # longer used, so exclude it to trim the bundle.
           pyinstaller --noconfirm --onefile --windowed --clean \
-            --name SST39FlashProgrammer \
+            --name Arduino_Utility \
             --collect-submodules serial \
             --hidden-import serial.tools.list_ports_windows \
             --exclude-module tkinter \
@@ -117,7 +117,7 @@ jobs:
           body: ${{ steps.tag.outputs.title }}
           prerelease: false
           make_latest: "true"
-          files: dist/SST39FlashProgrammer.exe
+          files: dist/Arduino_Utility.exe
 
       - name: Prune old auto-build assets, keep latest 4
         shell: bash
@@ -131,10 +131,10 @@ jobs:
           | while read -r tag; do
               [ -z "$tag" ] && continue
               echo "Pruning auto-build assets from $tag"
-              # Match both the current .exe name and the short-lived .zip
-              # bundle from the onedir experiment so any leftover assets
-              # also get cleaned up.
+              # Match the current .exe name plus the legacy names (the old
+              # SST39FlashProgrammer.exe and the short-lived onedir .zip) so
+              # leftover assets on older releases still get cleaned up.
               gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-                --json assets --jq '.assets[] | select(.name=="SST39FlashProgrammer.exe" or .name=="SST39FlashProgrammer.zip") | .name' \
+                --json assets --jq '.assets[] | select(.name=="Arduino_Utility.exe" or .name=="SST39FlashProgrammer.exe" or .name=="SST39FlashProgrammer.zip") | .name' \
               | xargs -r -I{} gh release delete-asset "$tag" "{}" --repo "$GITHUB_REPOSITORY" --yes
             done
