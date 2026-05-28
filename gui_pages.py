@@ -313,11 +313,12 @@ class GpioPage(Page):
 
 # --------------------------------------------------------------------------
 class TdbgPage(Page):
-    doneSig = Signal(bool)
+    # (success, preset_n) marshalled back to the GUI thread.
+    doneSig = Signal(bool, int)
 
     def __init__(self, app) -> None:
         super().__init__(app)
-        self.doneSig.connect(self._on_send_done)
+        self.doneSig.connect(self._on_done)
 
         lay = self._frame()
         card = Card("TDBG 波形回放")
@@ -325,116 +326,68 @@ class TdbgPage(Page):
         row.addWidget(QLabel("輸出腳位"))
         self._combo = _pin_combo()
         self._combo.setEnabled(False)
-        self._combo.setFixedWidth(160)
+        self._combo.setFixedWidth(180)
         row.addWidget(self._combo)
-        self._send = QPushButton("送出")
-        self._send.setObjectName("accent")
-        self._send.setEnabled(False)
-        self._send.clicked.connect(self._on_send)
-        self._calib = QPushButton("校準")
-        self._calib.setEnabled(False)
-        self._calib.clicked.connect(self._on_calib)
-        self._thumb = WaveformView()
-        self._thumb.setCursor(Qt.PointingHandCursor)
-        self._thumb.clicked.connect(self._open_preview)
-        row.addWidget(self._send)
-        row.addWidget(self._calib)
-        row.addWidget(self._thumb)
         row.addStretch(1)
         clear = QPushButton("清除紀錄")
         clear.clicked.connect(self.log_pane.clear)
         row.addWidget(clear)
         card.body.addLayout(row)
-        hint = QLabel("點縮圖可放大檢視內建波形（多段以分頁顯示）。")
+
+        btn_row = QHBoxLayout()
+        self._btns: list[QPushButton] = []
+        for n in (1, 2, 3):
+            b = QPushButton(f"TDBG{n}")
+            b.setObjectName("accent")
+            b.setEnabled(False)
+            b.clicked.connect(lambda _checked=False, k=n: self._on_preset(k))
+            self._btns.append(b)
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        card.body.addLayout(btn_row)
+
+        hint = QLabel("選輸出腳位後，按 TDBG1/2/3 即一鍵送出對應波形。")
         hint.setObjectName("Muted")
         card.body.addWidget(hint)
         lay.addWidget(card)
         lay.addWidget(self.log_pane, 1)
-
-        try:
-            i, e = D._ensure_builtin_parsed()
-            self._thumb.set_thumbnail(i, e)
-        except Exception:
-            pass
 
     @property
     def _session(self):
         return self.app.tdbg_session
 
     def set_connected(self, connected: bool) -> None:
-        self._send.setEnabled(connected)
-        self._calib.setEnabled(connected)
         self._combo.setEnabled(connected)
+        for b in self._btns:
+            b.setEnabled(connected)
 
-    def _lock(self, locked: bool) -> None:
-        self._send.setEnabled(not locked)
-        self._calib.setEnabled(not locked)
-        self._combo.setEnabled(not locked)
+    def _set_busy(self, busy: bool) -> None:
+        self._combo.setEnabled(not busy)
+        for b in self._btns:
+            b.setEnabled(not busy)
 
-    def _on_send(self) -> None:
+    def _on_preset(self, n: int) -> None:
         if self._session is None:
             return
         pin = _combo_pin(self._combo)
         if pin is None:
             self.log("請先選擇輸出腳位。", "warn")
             return
-        try:
-            initial, events = D._ensure_builtin_parsed()
-        except ValueError as e:
-            self.log(f"內建波形解析失敗：{e}", "err")
-            return
-        from binFileTransfer_core import DUE_CPU_HZ, tdbg_retime_for_engine
-        orig = sum(d for d, _ in events) / DUE_CPU_HZ
-        events, scale = tdbg_retime_for_engine(events)
-        dur = sum(d for d, _ in events) / DUE_CPU_HZ
-        if scale != 1.0:
-            self.log(f"已重定時：{scale:.2f}×（{orig*1000:.0f}ms → {dur*1000:.0f}ms）", "info")
-        self._play(pin, initial, events, dur, "TDBG sending…")
-
-    def _on_calib(self) -> None:
-        if self._session is None:
-            return
-        pin = _combo_pin(self._combo)
-        if pin is None:
-            self.log("請先選擇輸出腳位。", "warn")
-            return
-        from binFileTransfer_core import DUE_CPU_HZ, tdbg_calibration_pattern
-        initial, events = tdbg_calibration_pattern()
-        dur = sum(d for d, _ in events) / DUE_CPU_HZ
-        self._play(pin, initial, events, dur, "TDBG sending calibration…")
-
-    def _play(self, pin, initial, events, dur, status) -> None:
-        self._lock(True)
-        self.app.status(status, "warn")
+        self._set_busy(True)
+        self.app.status(f"TDBG{n} sending…", "warn")
 
         def cmd():
             sess = self._session
-            if sess is None:
-                self.doneSig.emit(False)
-                return
-            ok = sess.load(pin=pin, initial_state=initial, events=events)
-            if ok:
-                ok = sess.play(iterations=1, total_duration_s=dur)
-            self.doneSig.emit(bool(ok))
+            ok = sess.send_preset(n, pin) if sess is not None else False
+            self.doneSig.emit(bool(ok), n)
 
         self.enqueue(cmd)
 
-    def _on_send_done(self, success: bool) -> None:
+    def _on_done(self, success: bool, n: int) -> None:
         if self._session is not None:
-            self._lock(False)
-        self.app.status("TDBG sent" if success else "TDBG error",
+            self._set_busy(False)
+        self.app.status(f"TDBG{n} sent" if success else f"TDBG{n} error",
                         "ok" if success else "err")
-
-    def _open_preview(self) -> None:
-        try:
-            initial, events = D._ensure_builtin_parsed()
-        except Exception:
-            return
-        clusters = [
-            [("", c_init, c_events)]
-            for _start, c_init, c_events in D._split_into_clusters(initial, events)
-        ]
-        open_waveform_preview(self, "TDBG 波形", clusters, D.format_cycles)
 
 
 # --------------------------------------------------------------------------

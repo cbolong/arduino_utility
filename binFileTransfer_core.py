@@ -457,6 +457,7 @@ MCU_TDBG_PLAY_STARTED = "TDBG_PLAY_STARTED"
 MCU_TDBG_PLAY_DONE = "TDBG_PLAY_DONE"
 MCU_TDBG_STOPPED = "TDBG_STOPPED"
 MCU_TDBG_ERROR_PREFIX = "TDBG_ERROR"
+MCU_TDBG_PRESET_OK_PREFIX = "TDBG_PRESET_OK"   # reply to "TDBG_PRESET <n> <pin>"
 
 
 def tdbg_crc16(data: bytes) -> int:
@@ -828,6 +829,31 @@ class TdbgSession(_Session):
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
             self._ser.flush()
         return True
+
+    def send_preset(self, n: int, pin: int) -> bool:
+        """Fire one of the three hard-coded MCU preset waveforms (TDBG1/2/3)
+        on `pin`. The MCU bit-bangs the fixed pattern and replies
+        TDBG_PRESET_OK <n>. Returns True on that ack, False otherwise."""
+        if not self.is_open:
+            self._log("TDBG session not open.", "err")
+            return False
+        if n not in (1, 2, 3):
+            self._log(f"Invalid preset: {n} (1..3)", "err")
+            return False
+        if not (0 <= pin <= 65):
+            self._log(f"Invalid pin: {pin}", "err")
+            return False
+        cmd = f"TDBG_PRESET {n} {pin}"
+        with _serial_guard(self._lock):
+            self._log(f"send: {cmd}", "info")
+            self._ser.write(f"{cmd}\n".encode("UTF-8"))
+            self._ser.flush()
+            reply = _read_line(self._ser, self._log, 5.0)
+        if reply and reply.startswith(MCU_TDBG_PRESET_OK_PREFIX):
+            self._log(f"recv: {reply}", "ok")
+            return True
+        self._log(f"recv: {reply or '(no reply)'} (expected TDBG_PRESET_OK)", "err")
+        return False
 
     def _drain_stale(self, max_lines: int = 16) -> None:
         """Drain any leftover lines the MCU sent after a previous

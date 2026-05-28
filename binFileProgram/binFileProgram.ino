@@ -822,6 +822,256 @@ void handleTdbgPlay(const String& cmd) {
 
 
 // ----------------------------------------------------------------------------
+// TDBG fixed-preset bit-bang — ports the user's standalone 3-waveform sketch.
+// Three hard-coded 64-bit "passwords" are streamed NRZ on a host-chosen pin
+// using direct PIO register writes + nop-calibrated ~333 ns bit periods, with
+// interrupts off for the ~50-100 us burst. Frame = 32-cycle clock preamble +
+// 4-bit 0b0011 + 64 data bits (MSB-first) + 4-bit 0b0001, idle HIGH. Unlike
+// the TC playback engine above, the bit sequences are fully unrolled so the
+// per-bit timing is deterministic (no loop overhead). The output port/mask are
+// passed in (resolved from the selected pin) so the macros below reference the
+// enclosing function's `port` / `mask` locals.
+//   TDBG_PRESET <n> <pin>   (n=1..3, pin=0..65)  -> "TDBG_PRESET_OK <n>"
+//                                                or "TDBG_ERROR <why>"
+// ----------------------------------------------------------------------------
+#define TPP_D()    __asm__ __volatile__ ("nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop")
+#define TPP_HIGH() (port->PIO_SODR = mask)
+#define TPP_LOW()  (port->PIO_CODR = mask)
+#define TPP_CY()   do { TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D(); } while (0)
+
+void sendTdbgPreset1(Pio* port, uint32_t mask) {
+  noInterrupts();
+  // 32-cycle clock preamble
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  // preamble 0b0011
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  // 64-bit data 0x6B5AED75DAD6B7AD (MSB-first nibbles)
+  // h6 (0110)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hE (1110)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h7 (0111)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h6 (0110)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h7 (0111)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // postamble 0b0001
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  TPP_HIGH();   // idle HIGH
+  interrupts();
+}
+
+void sendTdbgPreset2(Pio* port, uint32_t mask) {
+  noInterrupts();
+  // 32-cycle clock preamble
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  // preamble 0b0011
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  // 64-bit data 0x6B5AED75DAD6B7AB (MSB-first nibbles)
+  // h6 (0110)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hE (1110)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h7 (0111)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h6 (0110)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h7 (0111)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // postamble 0b0001
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  TPP_HIGH();   // idle HIGH
+  interrupts();
+}
+
+void sendTdbgPreset3(Pio* port, uint32_t mask) {
+  noInterrupts();
+  // 32-cycle clock preamble
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY(); TPP_CY();
+  // preamble 0b0011
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  // 64-bit data 0x6B5AED75DAD6B7D5 (MSB-first nibbles)
+  // h6 (0110)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hE (1110)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h7 (0111)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hA (1010)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h6 (0110)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  // hB (1011)
+  TPP_HIGH(); TPP_D(); TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h7 (0111)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  // hD (1101)
+  TPP_HIGH(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // h5 (0101)
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  TPP_LOW(); TPP_D(); TPP_HIGH(); TPP_D();
+  // postamble 0b0001
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_LOW(); TPP_D();
+  TPP_HIGH(); TPP_D();
+  TPP_HIGH();   // idle HIGH
+  interrupts();
+}
+
+void handleTdbgPreset(const String& cmd) {
+  // "TDBG_PRESET <n> <pin>"
+  int p1 = cmd.indexOf(' ');
+  int p2 = (p1 >= 0) ? cmd.indexOf(' ', p1 + 1) : -1;
+  if (p1 < 0 || p2 < 0) { Serial.println("TDBG_ERROR bad_format"); return; }
+  int n = cmd.substring(p1 + 1, p2).toInt();
+  int pin = cmd.substring(p2 + 1).toInt();
+  if (pin < 0 || pin > 65) { Serial.println("TDBG_ERROR bad_pin"); return; }
+  if (n < 1 || n > 3)      { Serial.println("TDBG_ERROR bad_preset"); return; }
+  Pio* port = g_APinDescription[pin].pPort;
+  uint32_t mask = g_APinDescription[pin].ulPin;
+  if (port == NULL || mask == 0) { Serial.println("TDBG_ERROR no_pio"); return; }
+  pinMode(pin, OUTPUT);
+  port->PIO_SODR = mask;   // idle HIGH before the burst
+  if (n == 1)      sendTdbgPreset1(port, mask);
+  else if (n == 2) sendTdbgPreset2(port, mask);
+  else             sendTdbgPreset3(port, mask);
+  Serial.print("TDBG_PRESET_OK "); Serial.println(n);
+}
+
+
+
+// ----------------------------------------------------------------------------
 // RECORD (live waveform capture) — interrupt-driven multi-pin recorder. Only
 // active during the pre-erase idle window (same gating as GPIO / TDBG).
 //
@@ -1115,6 +1365,8 @@ void setup() {
         handleTdbgLoad(input);
       } else if (input == "TDBG_PLAY" || input.startsWith("TDBG_PLAY_LOOP ")) {
         handleTdbgPlay(input);
+      } else if (input.startsWith("TDBG_PRESET ")) {
+        handleTdbgPreset(input);
       } else if (input.startsWith("RECORD_START")) {
         handleRecordStart(input);
       } else if (input == "RECORD_STOP") {

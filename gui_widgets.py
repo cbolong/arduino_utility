@@ -379,7 +379,7 @@ def open_waveform_preview(parent, title: str, clusters: list, fmt,
     `clusters` is a list of clusters; each cluster is a list of traces
     (label, initial_state, events). One scrollable WaveformView per cluster
     (multiple clusters → one tab each). `fmt` maps a time-unit value to a
-    label string (e.g. gui_data.format_cycles / format_us).
+    label string (e.g. gui_data.format_us).
     """
     views = []
     for traces in clusters:
