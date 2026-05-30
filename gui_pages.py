@@ -184,7 +184,14 @@ class FlashPage(Page):
     def _on_done(self, success: bool) -> None:
         if success:
             self.log(f"{os.path.basename(self.firmware_path or '')} 燒錄成功。", "ok")
-            self.app.status("Success", "ok")
+            # The erase ended the MCU's idle loop; GPIO/TDBG/RECORD won't
+            # respond again until the Due is reset and the shared
+            # connection is re-opened. Spell that out — pressing Connect
+            # alone won't help, and the previous flow gave no cue.
+            self.log("按 Due 板上的 reset 鈕 + 再按 Connect 才能繼續使用 "
+                     "GPIO / TDBG / 波形錄製。", "info")
+            self.app.status("Success — reset Due to use GPIO/TDBG/RECORD",
+                            "ok")
         else:
             self.app.status("Error", "err")
         self._start.setEnabled(True)

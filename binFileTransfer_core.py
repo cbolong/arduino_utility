@@ -1161,6 +1161,14 @@ class RecordSession(_Session):
         except (IndexError, ValueError):
             self._log(f"malformed RECORD_DATA: {line!r}", "err")
             return None
+        # Bound the count BEFORE allocating `count * RECORD_EVENT_BYTES` of
+        # serial-read buffer. A garbled or version-mismatched MCU reply
+        # could otherwise ask the host to allocate gigabytes.
+        if not 0 <= count <= RECORD_MAX_EVENTS:
+            self._log(
+                f"RECORD_DATA count {count} out of range "
+                f"(0..{RECORD_MAX_EVENTS})", "err")
+            return None
         self._log(f"recv: {line}", "ok")
 
         blob = b""
