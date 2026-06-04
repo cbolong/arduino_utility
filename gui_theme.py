@@ -152,6 +152,12 @@ QPushButton#seg:checked {{ background: {p['accent']}; color: #ffffff;
 QPushButton#seg:disabled {{ color: {p['text_disabled']};
                             background: {p['surface_2']};
                             border-color: {p['separator']}; }}
+/* INPUT pins are read-only: the checked segment shows the read level in
+   green (read indicator) rather than the blue drive colour. The extra
+   attribute selector outranks :disabled, so it stays green while the
+   buttons are non-interactive. */
+QPushButton#seg[readmode="true"]:checked {{ background: {p['success_dark']};
+                            color: #ffffff; border-color: {p['success_dark']}; }}
 
 /* ---- inputs ---- */
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{

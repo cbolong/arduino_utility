@@ -167,14 +167,10 @@ class PinRow(QWidget):
             b.toggled.connect(self._on_value_changed)
             seg.addWidget(b)
         lay.addLayout(seg)
-
-        lay.addSpacing(8)
-        lay.addWidget(QLabel("讀:"))
-        self._read = QLabel("??")
-        self._read.setFixedWidth(40)
-        self._read.setStyleSheet(f"color: {T.PALETTE['text_secondary']};")
-        lay.addWidget(self._read)
         lay.addStretch(1)
+        # Default mode is INPUT, so the segment starts in read-indicator
+        # (green-when-checked) styling rather than drive (blue) styling.
+        self._apply_readmode()
 
     def _refresh_mode_btn(self, enabled: bool) -> None:
         if not enabled:
@@ -184,11 +180,38 @@ class PinRow(QWidget):
         self._mode_btn.setText("OUT" if self._mode == "OUTPUT" else "IN")
         self._mode_btn.setEnabled(True)
 
+    def _apply_readmode(self) -> None:
+        """Toggle the segment between drive styling (blue when checked, in
+        OUTPUT mode) and read-indicator styling (green when checked, in INPUT
+        mode) by flipping the `readmode` dynamic property the QSS keys off.
+        Property selectors don't re-evaluate on their own — repolish."""
+        read = self._mode == "INPUT"
+        for b in (self._high, self._low):
+            if b.property("readmode") != read:
+                b.setProperty("readmode", read)
+                b.style().unpolish(b)
+                b.style().polish(b)
+
+    def _set_checked(self, high: bool, low: bool) -> None:
+        """Set the two segments' checked state programmatically without
+        emitting a drive command (echoes, read indicators, clears)."""
+        self._suppress = True
+        try:
+            self._grp.setExclusive(False)
+            self._high.setChecked(high)
+            self._low.setChecked(low)
+            self._grp.setExclusive(True)
+        finally:
+            self._suppress = False
+
     def set_enabled(self, enabled: bool) -> None:
         self._refresh_mode_btn(enabled)
         out = enabled and self._mode == "OUTPUT"
         self._high.setEnabled(out)
         self._low.setEnabled(out)
+        if not enabled:
+            self._set_checked(False, False)   # clear indicator on disconnect
+        self._apply_readmode()
 
     def _on_mode_click(self) -> None:
         self._mode = "INPUT" if self._mode == "OUTPUT" else "OUTPUT"
@@ -196,15 +219,10 @@ class PinRow(QWidget):
         out = self._mode == "OUTPUT"
         self._high.setEnabled(out)
         self._low.setEnabled(out)
-        if not out:
-            self._suppress = True
-            try:
-                self._grp.setExclusive(False)
-                self._high.setChecked(False)
-                self._low.setChecked(False)
-                self._grp.setExclusive(True)
-            finally:
-                self._suppress = False
+        # Start the new mode clean: drop any prior blue drive / green read so
+        # OUTPUT waits for a click and INPUT waits for the read that follows.
+        self._set_checked(False, False)
+        self._apply_readmode()
         self.setRequested.emit(self.pin, self._mode, None)
 
     def _on_value_changed(self, checked: bool) -> None:
@@ -214,10 +232,12 @@ class PinRow(QWidget):
         self.setRequested.emit(self.pin, "OUTPUT", value)
 
     def set_read_value(self, value: str) -> None:
-        self._read.setText(value)
-        color = (T.PALETTE["success_dark"] if value == "HIGH"
-                 else T.PALETTE["text_primary"])
-        self._read.setStyleSheet(f"color: {color};")
+        """INPUT mode: light the matching segment green to show the read
+        level. OUTPUT mode: the segment already shows the driven value (blue),
+        so the drive echo is a no-op."""
+        if self._mode != "INPUT":
+            return
+        self._set_checked(value == "HIGH", value == "LOW")
 
 
 class PinGrid(QScrollArea):
