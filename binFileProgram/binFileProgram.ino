@@ -1382,6 +1382,14 @@ void setup() {
         handleRecordStart(input);
       } else if (input == "RECORD_STOP") {
         handleRecordStop();
+      } else if (input == "ARDUINO_PING") {
+        // Fast-connect probe: host opens the port with DTR held low (no
+        // bootloader reset) and pings to check whether a sketch is already
+        // running. Only reply when not mid-RECORD; otherwise the stray
+        // ARDUINO_ERASE_READY would land in the host's live-reader thread.
+        if (!recordActive) {
+          Serial.println(strEraseReady);
+        }
       }
       // Unknown lines silently ignored.
     }

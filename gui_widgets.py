@@ -163,14 +163,16 @@ class PinRow(QWidget):
             b.setObjectName("seg")
             b.setCheckable(True)
             b.setProperty("side", side)
+            # Default mode is INPUT → readmode=True. Setting the property
+            # BEFORE addWidget lets the first polish (during show) pick it
+            # up naturally, so we skip 132 explicit unpolish/polish calls
+            # across the 66-row grid.
+            b.setProperty("readmode", True)
             b.setEnabled(False)
             b.toggled.connect(self._on_value_changed)
             seg.addWidget(b)
         lay.addLayout(seg)
         lay.addStretch(1)
-        # Default mode is INPUT, so the segment starts in read-indicator
-        # (green-when-checked) styling rather than drive (blue) styling.
-        self._apply_readmode()
 
     def _refresh_mode_btn(self, enabled: bool) -> None:
         if not enabled:

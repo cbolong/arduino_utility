@@ -237,10 +237,11 @@ class MainWindow(QMainWindow):
         if self._any_busy():
             self.status("忙碌中，請稍候", "warn")
             return
-        # Force-build the connectable pages so open_due_link logging and the
-        # sessions created in _on_connect_done have live targets.
-        for i in (1, 2, 3):
-            self._ensure_page(i)
+        # Pages 1-3 stay lazy: late-built pages inherit live state via
+        # _ensure_page(), and connect-handshake log goes to the status bar
+        # via _connect_log_cb. Sessions are wired to per-page log callbacks
+        # that resolve lazily so a page that isn't built yet doesn't block
+        # the connection or pin the worker to the GUI thread.
         port = self.get_port()
         self._conn_busy = True
         self._set_conn("連線中…", T.PALETTE["warning_dark"])
@@ -250,10 +251,25 @@ class MainWindow(QMainWindow):
 
         def work():
             from binFileTransfer_core import open_due_link
-            ser = open_due_link(port, self.tdbg_page.log_cb)
+            ser = open_due_link(port, self._connect_log_cb)
             self.connDoneSig.emit(ser)
 
         self._conn_worker.submit(work)
+
+    def _connect_log_cb(self, msg: str, level: str = "info") -> None:
+        """Connect-handshake log sink. Routes to the status bar so the open
+        flow doesn't depend on any page being built."""
+        self.status(msg, level)
+
+    def _page_log_cb(self, attr: str):
+        """Build a log callback that resolves the target page lazily — pages
+        are built on first navigation, so sessions created at connect time
+        must not capture a None page reference at construction."""
+        def cb(*args, **kwargs):
+            pg = getattr(self, attr, None)
+            if pg is not None:
+                pg.log_cb(*args, **kwargs)
+        return cb
 
     def _on_connect_done(self, ser) -> None:
         self._conn_busy = False
@@ -266,11 +282,11 @@ class MainWindow(QMainWindow):
         from binFileTransfer_core import GpioSession, RecordSession, TdbgSession
         self._ser = ser
         self.gpio_session = GpioSession(
-            self.gpio_page.log_cb, ser=ser, lock=self._serial_lock)
+            self._page_log_cb("gpio_page"), ser=ser, lock=self._serial_lock)
         self.tdbg_session = TdbgSession(
-            self.tdbg_page.log_cb, ser=ser, lock=self._serial_lock)
+            self._page_log_cb("tdbg_page"), ser=ser, lock=self._serial_lock)
         self.record_session = RecordSession(
-            self.record_page.log_cb, ser=ser, lock=self._serial_lock)
+            self._page_log_cb("record_page"), ser=ser, lock=self._serial_lock)
         self._connected = True
         self._set_conn("已連線", T.PALETTE["success_dark"])
         self.disconnect_btn.setEnabled(True)

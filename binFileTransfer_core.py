@@ -22,6 +22,11 @@ TARGET_VID = 0x2341
 TARGET_PID = 0x003D
 
 DEFAULT_HANDSHAKE_TIMEOUT_S = 30.0
+# Fast-connect ping timeout: how long to wait for ARDUINO_ERASE_READY after
+# sending ARDUINO_PING on a no-reset open. Long enough to cover one Serial
+# tick + USB CDC round-trip, short enough that a non-responsive board falls
+# back to the reset path quickly.
+FAST_PING_TIMEOUT_S = 0.5
 
 MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
@@ -233,17 +238,50 @@ def _open_and_wait_idle(
 ) -> serial.Serial | None:
     """Open the Due, wait until it emits ARDUINO_ERASE_READY (i.e. the MCU
     is sitting in its pre-erase idle loop), and return the open serial.
-    Returns None on failure (caller still owns nothing)."""
+    Returns None on failure (caller still owns nothing).
+
+    Fast path first: hold DTR/RTS low across open() so the Due's 16U2 doesn't
+    pulse the reset line, then probe with ARDUINO_PING. A sketch already in
+    its idle loop replies within ms, skipping the ~1.5-2 s bootloader wait.
+    On miss (no sketch, or sketch too old to know about PING), close and
+    reopen with default DTR=True to force a reset and fall back to the
+    original handshake wait."""
     if port is None:
         port = _find_arduino_port()
         if port is None:
             log("Arduino Device not found.", "err")
             return None
     log(f"Arduino Found : {port}.", "ok")
+
+    try:
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = BAUD
+        ser.timeout = 0.1
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+    except serial.SerialException as e:
+        log(f"Serial open error: {e}", "err")
+        return None
+
+    try:
+        ser.reset_input_buffer()
+    except Exception:
+        pass
+    ser.write(b"ARDUINO_PING\n")
+    if _wait_for_line(
+        ser, MCU_ERASE_READY, log, FAST_PING_TIMEOUT_S, quiet=True
+    ):
+        log("Fast connect (no reset).", "ok")
+        return ser
+
+    log("Fast ping timed out, falling back to reset…", "wait")
+    ser.close()
     try:
         ser = serial.Serial(port, BAUD, timeout=0.1)
     except serial.SerialException as e:
-        log(f"Serial open error: {e}", "err")
+        log(f"Serial reopen error: {e}", "err")
         return None
     if not _wait_for_line(ser, MCU_ERASE_READY, log, handshake_timeout_s):
         ser.close()
