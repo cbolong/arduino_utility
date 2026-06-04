@@ -623,14 +623,17 @@ class RecordPage(Page):
             return
         pins, events = result
         self._recorded = (pins, events)
-        if events:
-            self._draw_thumb(pins, events)
-            self._thumb.setVisible(True)
-            total_us = sum(d for d, _ in events)
-            self.app.status(
-                f"RECORD done: {len(events)} edges, {total_us/1000:.3f} ms", "ok")
+        self._draw_thumb(pins, events)
+        self._thumb.setVisible(True)
+        total_us = sum(d for d, _ in events)
+        # events[0] is the seed sample injected by the MCU at RECORD_START,
+        # not a real transition — back it out of the user-facing edge count.
+        edge_count = max(0, len(events) - 1)
+        if edge_count == 0:
+            self.app.status("RECORD done: no edges (level held constant)", "warn")
         else:
-            self.app.status("RECORD done: no edges", "warn")
+            self.app.status(
+                f"RECORD done: {edge_count} edges, {total_us/1000:.3f} ms", "ok")
 
     def _draw_thumb(self, pins, events) -> None:
         p0 = pins[0]
@@ -642,8 +645,6 @@ class RecordPage(Page):
         if not self._recorded:
             return
         pins, events = self._recorded
-        if not events:
-            return
         # one trace per pin; x in microseconds
         traces = []
         for p in pins:

@@ -1185,8 +1185,19 @@ void handleRecordStart(const String& cmd) {
   recordEventCount = 0;
   recordOverflow = false;
   tdbgEnableDwt();              // ensure DWT->CYCCNT runs
-  recordCurrentMask = recordSampleMask();
+  uint8_t initMask = recordSampleMask();
+  recordCurrentMask = initMask;
   recordPrevCycles = DWT->CYCCNT;
+  // Seed event with delta=0 so the host always has at least one sample to
+  // render — a pin that never toggles would otherwise yield RECORD_DATA 0
+  // and the GUI would have no initial level to anchor the trace.
+  {
+    uint32_t zero = 0;
+    uint8_t* p = recordBuf;
+    memcpy(p, &zero, sizeof(zero));
+    p[4] = initMask;
+    recordEventCount = 1;
+  }
   recordActive = true;
   for (uint8_t i = 0; i < n; i++) {
     attachInterrupt(digitalPinToInterrupt(pins[i]), recordIsrs[i], CHANGE);
