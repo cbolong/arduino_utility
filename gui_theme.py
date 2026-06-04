@@ -132,6 +132,27 @@ QPushButton#accent:disabled {{ background: {p['text_disabled']}; color: #ffffff;
 /* compact toggle/secondary buttons inside dense rows */
 QPushButton#chip {{ padding: 3px 8px; border-radius: 5px; font-size: 12px; }}
 
+/* segmented [HIGH|LOW] toggle used per GPIO PinRow. Two checkable buttons
+   sit flush (sub-layout spacing=0); we round only the outer corners and
+   suppress the left button's right border so they read as one control.
+   Selected segment fills with the accent colour. */
+QPushButton#seg {{
+    padding: 3px 10px; font-size: 12px; min-width: 40px;
+    background: {p['surface_2']}; color: {p['text_secondary']};
+    border: 1px solid {p['separator']}; border-radius: 0;
+}}
+QPushButton#seg:hover:!checked {{ background: {p['surface_hover']}; }}
+QPushButton#seg[side="left"]  {{ border-top-left-radius: 5px;
+                                 border-bottom-left-radius: 5px;
+                                 border-right: none; }}
+QPushButton#seg[side="right"] {{ border-top-right-radius: 5px;
+                                 border-bottom-right-radius: 5px; }}
+QPushButton#seg:checked {{ background: {p['accent']}; color: #ffffff;
+                           border-color: {p['accent']}; }}
+QPushButton#seg:disabled {{ color: {p['text_disabled']};
+                            background: {p['surface_2']};
+                            border-color: {p['separator']}; }}
+
 /* ---- inputs ---- */
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{
     background: {p['card_bg']}; border: 1px solid {p['separator']};

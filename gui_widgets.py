@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -115,7 +115,7 @@ class LogPane(QPlainTextEdit):
 # GPIO pin grid
 # --------------------------------------------------------------------------
 class PinRow(QWidget):
-    """label | OUT/IN toggle | HIGH/LOW radios | Read value.
+    """label | OUT/IN toggle | [HIGH|LOW] segmented toggle | Read value.
 
     Emits setRequested(pin, mode, value) — value is "HIGH"/"LOW" for an
     OUTPUT drive, or None for a bare mode switch (mirrors the old contract).
@@ -143,17 +143,30 @@ class PinRow(QWidget):
         self._mode_btn.clicked.connect(self._on_mode_click)
         lay.addWidget(self._mode_btn)
 
-        self._high = QRadioButton("HIGH")
-        self._low = QRadioButton("LOW")
+        # Segmented [HIGH|LOW]: two checkable QPushButtons in an exclusive
+        # QButtonGroup. Sub-layout with spacing=0 so they render as a single
+        # connected control; QSS rounds the outer corners and removes the
+        # left button's right border. The QButtonGroup contract (toggled
+        # signal, isChecked / setChecked, setExclusive) is identical to the
+        # previous QRadioButton pair, so _on_mode_click and _on_value_changed
+        # work unchanged.
+        seg = QHBoxLayout()
+        seg.setContentsMargins(0, 0, 0, 0)
+        seg.setSpacing(0)
+        self._high = QPushButton("HIGH")
+        self._low = QPushButton("LOW")
         self._grp = QButtonGroup(self)
         self._grp.setExclusive(True)
         self._grp.addButton(self._high)
         self._grp.addButton(self._low)
-        for r in (self._high, self._low):
-            r.setEnabled(False)
-            r.toggled.connect(self._on_value_changed)
-        lay.addWidget(self._high)
-        lay.addWidget(self._low)
+        for b, side in ((self._high, "left"), (self._low, "right")):
+            b.setObjectName("seg")
+            b.setCheckable(True)
+            b.setProperty("side", side)
+            b.setEnabled(False)
+            b.toggled.connect(self._on_value_changed)
+            seg.addWidget(b)
+        lay.addLayout(seg)
 
         lay.addSpacing(8)
         lay.addWidget(QLabel("讀:"))
