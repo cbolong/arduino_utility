@@ -438,6 +438,16 @@ def _scroll_wave(view: WaveformView) -> QScrollArea:
     return sa
 
 
+# Visible canvas width the preview fits a capture into at zoom 1.0 (dialog
+# width minus margins/scrollbar). The whole recording lands inside the window
+# by default — slow, human-speed captures used to blow up to hundreds of
+# thousands of px at the old `max(min_ppu, ...)` floor and only the first
+# ~16 ms (the initial level) was ever visible.
+_PREVIEW_VIEW_W = 820
+_ZOOM_STEP = 1.6
+_ZOOM_MAX = 256.0
+
+
 def open_waveform_preview(parent, title: str, clusters: list, fmt,
                           min_ppu: float = 0.01) -> None:
     """Modal waveform preview shared by the TDBG and RECORD pages.
@@ -446,24 +456,84 @@ def open_waveform_preview(parent, title: str, clusters: list, fmt,
     (label, initial_state, events). One scrollable WaveformView per cluster
     (multiple clusters → one tab each). `fmt` maps a time-unit value to a
     label string (e.g. gui_data.format_us).
+
+    Each view fits its whole capture into the window at zoom 1.0; the
+    ＋ / － / 整體 toolbar rescales the active view horizontally so dense
+    bursts (or sub-pixel edges inside a long idle) can be inspected.
+    `min_ppu` is retained for call-site compatibility but no longer floors
+    the fit — fitting the whole capture is the default.
     """
-    views = []
+    views = []           # WaveformView, parallel to tab order
     for traces in clusters:
-        total = max((sum(d for d, _ in ev) for _, _, ev in traces), default=0) or 1
-        ppu = max(min_ppu, 760 / total)
+        total = max((sum(d for d, _ in ev) for _, _, ev in traces),
+                    default=0) or 1
         v = WaveformView()
-        v.set_full(traces, ppu, total / 8.0, fmt, fmt)
+        # Stash render state on the view so the toolbar can rebuild it.
+        v._wf_traces = traces
+        v._wf_total = total
+        # set_full reserves 60 px (label gutter) + 30 px (right pad); subtract
+        # them so the trace itself fits the window at zoom 1.0.
+        v._wf_fit_ppu = max(_PREVIEW_VIEW_W - 90, 1) / total
+        v._wf_fmt = fmt
+        v._wf_zoom = 1.0
+        _render_wave(v)
         views.append(v)
+
     if len(views) == 1:
         content = _scroll_wave(views[0])
+
+        def active_view():
+            return views[0]
     else:
         content = QTabWidget()
         for i, v in enumerate(views):
             content.addTab(_scroll_wave(v), f"段 {i + 1}")
+
+        def active_view():
+            return views[content.currentIndex()]
+
     dlg = QDialog(parent)
     dlg.setWindowTitle(title)
-    dlg.resize(880, 360)
+    dlg.resize(880, 400)
     lay = QVBoxLayout(dlg)
     lay.setContentsMargins(10, 10, 10, 10)
-    lay.addWidget(content)
+    lay.setSpacing(8)
+
+    bar = QHBoxLayout()
+    zoom_out = QPushButton("－ 縮小"); zoom_out.setObjectName("chip")
+    zoom_in = QPushButton("＋ 放大"); zoom_in.setObjectName("chip")
+    zoom_fit = QPushButton("⤢ 整體"); zoom_fit.setObjectName("chip")
+    zoom_lbl = QLabel("1.0×")
+    zoom_lbl.setObjectName("Muted")
+
+    def refresh_label():
+        zoom_lbl.setText(f"{active_view()._wf_zoom:.2g}×")
+
+    def apply_zoom(factor=None, fit=False):
+        v = active_view()
+        if fit:
+            v._wf_zoom = 1.0
+        else:
+            v._wf_zoom = min(_ZOOM_MAX, max(1.0, v._wf_zoom * factor))
+        _render_wave(v)
+        refresh_label()
+
+    zoom_out.clicked.connect(lambda: apply_zoom(1.0 / _ZOOM_STEP))
+    zoom_in.clicked.connect(lambda: apply_zoom(_ZOOM_STEP))
+    zoom_fit.clicked.connect(lambda: apply_zoom(fit=True))
+    for w in (zoom_out, zoom_in, zoom_fit, zoom_lbl):
+        bar.addWidget(w)
+    bar.addStretch(1)
+    lay.addLayout(bar)
+    lay.addWidget(content, 1)
+    if isinstance(content, QTabWidget):
+        content.currentChanged.connect(lambda _i: refresh_label())
     dlg.exec()
+
+
+def _render_wave(v: "WaveformView") -> None:
+    """(Re)build a preview view's geometry at its current zoom. Ticks scale
+    with zoom so ~8 land across the visible window at any magnification."""
+    ppu = v._wf_fit_ppu * v._wf_zoom
+    tick_step = (v._wf_total / 8.0) / v._wf_zoom
+    v.set_full(v._wf_traces, ppu, tick_step, v._wf_fmt, v._wf_fmt)
