@@ -40,6 +40,7 @@ PALETTE = {
     "canvas_bg":      "#1a1a1a",
     "wave_orange":    "#ff9933",
     "wave_label":     "#ffe680",
+    "wave_grid":      "#3a3a3a",
     "axis_text":      "#888888",
 }
 

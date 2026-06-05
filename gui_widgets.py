@@ -332,6 +332,7 @@ class WaveformView(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._wave = QPainterPath()
+        self._grid = QPainterPath()   # HIGH/LOW reference rails (full view only)
         self._axis = QPainterPath()
         self._texts: list[tuple[int, int, str, str]] = []  # x, y, text, colorkey
         self.setStyleSheet(
@@ -356,6 +357,7 @@ class WaveformView(QWidget):
     # -- one-time geometry build --------------------------------------------
     def _build_thumb(self, initial: int, events: list) -> None:
         self._wave = QPainterPath()
+        self._grid = QPainterPath()   # no rails in the tiny thumbnail
         self._axis = QPainterPath()
         self._texts = []
         left = right = 2
@@ -375,15 +377,26 @@ class WaveformView(QWidget):
 
     def _build_full(self, traces, ppu, tick_step, fmt_axis, fmt_pulse) -> None:
         self._wave = QPainterPath()
+        self._grid = QPainterPath()
         self._axis = QPainterPath()
         self._texts = []
         left = 60
+        rail_right = self.width() - 30
         for i, (label, initial, events) in enumerate(traces):
             row_top = self.TOP_PAD + i * self.ROW_H
             y_top = row_top + 14
             y_low = row_top + self.ROW_H - 24
+            # HIGH / LOW reference rails (dashed, dim) so a flat trace is
+            # unambiguous — the orange line resting on a rail tells the level.
+            self._grid.moveTo(left, y_top)
+            self._grid.lineTo(rail_right, y_top)
+            self._grid.moveTo(left, y_low)
+            self._grid.lineTo(rail_right, y_low)
+            self._texts.append((46, y_top + 4, "1", "rail"))
+            self._texts.append((46, y_low + 4, "0", "rail"))
             if label:
-                self._texts.append((4, y_top + 10, label, "axis"))
+                self._texts.append(
+                    (4, (y_top + y_low) // 2 + 4, label, "axis"))
             x = left
             y = y_top if initial else y_low
             self._wave.moveTo(x, y)
@@ -418,6 +431,10 @@ class WaveformView(QWidget):
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(T.PALETTE["canvas_bg"]))
+        # Rails first so the signal line sits on top of them.
+        if not self._grid.isEmpty():
+            p.setPen(QPen(QColor(T.PALETTE["wave_grid"]), 1, Qt.DashLine))
+            p.drawPath(self._grid)
         p.setPen(QPen(QColor(T.PALETTE["wave_orange"]), 2))
         p.drawPath(self._wave)
         if not self._axis.isEmpty():
