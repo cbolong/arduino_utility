@@ -335,12 +335,21 @@ class WaveformView(QWidget):
         self._grid = QPainterPath()   # HIGH/LOW reference rails (full view only)
         self._axis = QPainterPath()
         self._texts: list[tuple[int, int, str, str]] = []  # x, y, text, colorkey
+        # Click-drag panning (full view only): when the canvas is wider than
+        # the scroll viewport, hold the left button and drag to scroll. _scroll
+        # is the enclosing QScrollArea, wired by _scroll_wave().
+        self._scroll = None
+        self._pannable = False
+        self._pan_origin = None
+        self._pan_h0 = 0
+        self._pan_v0 = 0
         self.setStyleSheet(
             f"background: {T.PALETTE['canvas_bg']}; border-radius: 6px;")
 
     # -- configuration (rebuilds the cached geometry) -----------------------
     def set_thumbnail(self, initial: int, events: list, n: int = 6) -> None:
         self.setFixedSize(26, 26)
+        self._pannable = False
         self._build_thumb(initial, events[:n])
         self.update()
 
@@ -351,6 +360,8 @@ class WaveformView(QWidget):
         height = self.TOP_PAD + len(traces) * self.ROW_H + self.AXIS_H
         self.setMinimumSize(max(width, 760), height)
         self.resize(max(width, 760), height)
+        self._pannable = True
+        self.setCursor(Qt.OpenHandCursor)   # affordance: drag to pan
         self._build_full(traces, px_per_unit, tick_step, fmt_axis, fmt_pulse)
         self.update()
 
@@ -424,9 +435,33 @@ class WaveformView(QWidget):
                 self._texts.append((tx + 2, axis_y + 16, fmt_axis(u), "axis"))
                 u += tick_step
 
+    # -- interaction --------------------------------------------------------
+    def mousePressEvent(self, e) -> None:
+        # Thumbnail: a click opens the preview. Full view: left-drag pans the
+        # scroll area (global coords, since scrolling repositions this widget
+        # under the cursor).
+        if not self._pannable:
+            self.clicked.emit()
+            return
+        if e.button() == Qt.LeftButton and self._scroll is not None:
+            self._pan_origin = e.globalPosition().toPoint()
+            self._pan_h0 = self._scroll.horizontalScrollBar().value()
+            self._pan_v0 = self._scroll.verticalScrollBar().value()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e) -> None:
+        if self._pan_origin is None:
+            return
+        delta = e.globalPosition().toPoint() - self._pan_origin
+        self._scroll.horizontalScrollBar().setValue(self._pan_h0 - delta.x())
+        self._scroll.verticalScrollBar().setValue(self._pan_v0 - delta.y())
+
+    def mouseReleaseEvent(self, _e) -> None:
+        if self._pan_origin is not None:
+            self._pan_origin = None
+            self.setCursor(Qt.OpenHandCursor)
+
     # -- painting (cheap: draw cached paths + texts) ------------------------
-    def mousePressEvent(self, _e) -> None:
-        self.clicked.emit()
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
@@ -452,6 +487,7 @@ def _scroll_wave(view: WaveformView) -> QScrollArea:
     sa.setWidgetResizable(False)
     sa.setFrameShape(QFrame.NoFrame)
     sa.setWidget(view)
+    view._scroll = sa   # let the view drive these scrollbars while panning
     return sa
 
 
