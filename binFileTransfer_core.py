@@ -1236,7 +1236,23 @@ class RecordSession(_Session):
 
         line = next_line()
         if line is None or not line.startswith(MCU_RECORD_DONE_PREFIX):
-            self._log(f"recv: {line or '(none)'} (expected RECORD_DONE)", "err")
+            # Symptom seen in the field: line arrives as "RD_DONE <hex>",
+            # i.e. the leading "REC" of "RECORD_DONE" was consumed elsewhere.
+            # Two suspects: (a) MCU under-sent the blob, so our ser.read(N)
+            # ate the missing bytes off the front of RECORD_DONE; or
+            # (b) the live thread didn't fully drain and stole bytes during
+            # the blob. The blob tail tells them apart — if it ends in
+            # ASCII "REC" / "RECO" etc, it's (a); if it's normal-looking
+            # event bytes, it's (b). Log enough on both to diagnose without
+            # needing another reproduction.
+            tail = blob[-12:].hex(" ") if blob else "(no blob)"
+            queued_now = list(queued)
+            self._log(
+                f"recv: {line or '(none)'} (expected RECORD_DONE)", "err")
+            self._log(
+                f"  diag: blob_len={len(blob)} expected={count*RECORD_EVENT_BYTES}"
+                f" tail_hex='{tail}' queued_after={queued_now!r}",
+                "err")
             return None
         try:
             mcu_crc = int(line.split()[1], 16)

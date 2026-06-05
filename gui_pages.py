@@ -588,7 +588,17 @@ class RecordPage(Page):
             if sess is None:
                 self.failSig.emit()
                 return
-            ok = sess.start(pins, on_live=on_live)
+            try:
+                ok = sess.start(pins, on_live=on_live)
+            except Exception as e:
+                # A raised exception (e.g. WriteFile PermissionError when the
+                # USB CDC handle goes stale) used to escape into Worker's
+                # generic handler and leave the UI stuck in _recording=True
+                # because failSig never fired. Surface it as a normal start
+                # failure so the page resets.
+                self.log(f"RECORD start exception: {e}", "err")
+                self.failSig.emit()
+                return
             if not ok:
                 self.failSig.emit()
 
@@ -621,7 +631,15 @@ class RecordPage(Page):
             if sess is None:
                 self.stopSig.emit(None)
                 return
-            self.stopSig.emit(sess.stop())
+            try:
+                result = sess.stop()
+            except Exception as e:
+                # Mirror _on_start: an exception during stop (e.g. mid-blob
+                # USB hiccup) must still route through _on_stop_done so
+                # _recording is cleared and the UI re-enables.
+                self.log(f"RECORD stop exception: {e}", "err")
+                result = None
+            self.stopSig.emit(result)
 
         self.enqueue(cmd)
 
