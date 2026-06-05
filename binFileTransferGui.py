@@ -40,6 +40,7 @@ class MainWindow(QMainWindow):
     connDoneSig = Signal(object)
     disDoneSig = Signal(object)
     portsSig = Signal(list, str)
+    statusSig = Signal(str, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
         self.connDoneSig.connect(self._on_connect_done)
         self.disDoneSig.connect(self._on_disconnect_done)
         self.portsSig.connect(self._apply_ports)
+        self.statusSig.connect(self.status)
 
         self._build_ui()
         self._refresh_ports()
@@ -257,9 +259,11 @@ class MainWindow(QMainWindow):
         self._conn_worker.submit(work)
 
     def _connect_log_cb(self, msg: str, level: str = "info") -> None:
-        """Connect-handshake log sink. Routes to the status bar so the open
-        flow doesn't depend on any page being built."""
-        self.status(msg, level)
+        """Connect-handshake log sink. open_due_link runs on the connect
+        worker thread, so this MUST marshal to the GUI thread via a queued
+        signal rather than touch the status-bar widget directly — calling
+        self.status() from the worker thread freezes/crashes Qt."""
+        self.statusSig.emit(msg, level)
 
     def _page_log_cb(self, attr: str):
         """Build a log callback that resolves the target page lazily — pages
