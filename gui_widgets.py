@@ -115,12 +115,14 @@ class LogPane(QPlainTextEdit):
 # GPIO pin grid
 # --------------------------------------------------------------------------
 class PinRow(QWidget):
-    """label | OUT/IN toggle | [HIGH|LOW] segmented toggle | Read value.
+    """[●] label | OUT/IN toggle | [HIGH|LOW] segmented toggle | Read value.
 
     Emits setRequested(pin, mode, value) — value is "HIGH"/"LOW" for an
     OUTPUT drive, or None for a bare mode switch (mirrors the old contract).
+    Emits readRequested(pin) when the leading read dot is clicked.
     """
     setRequested = Signal(int, str, object)
+    readRequested = Signal(int)
 
     def __init__(self, label: str, pin: int, parent=None) -> None:
         super().__init__(parent)
@@ -131,6 +133,18 @@ class PinRow(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(2, 1, 2, 1)
         lay.setSpacing(6)
+
+        # Leading read dot: click to GPIO_READ this one pin. The dot's fill
+        # also doubles as the latest-known level indicator (high=green solid,
+        # low=grey hollow, none=pale hollow when not yet read this session).
+        self._read_btn = QPushButton()
+        self._read_btn.setObjectName("readdot")
+        self._read_btn.setFixedSize(16, 16)
+        self._read_btn.setEnabled(False)
+        self._read_btn.setProperty("level", "none")
+        self._read_btn.clicked.connect(
+            lambda: self.readRequested.emit(self.pin))
+        lay.addWidget(self._read_btn)
 
         name = QLabel(label)
         name.setFixedWidth(40)
@@ -206,13 +220,24 @@ class PinRow(QWidget):
         finally:
             self._suppress = False
 
+    def _set_dot_level(self, level: str) -> None:
+        """Tri-state the leading read dot: 'high' / 'low' / 'none'. Mirrors
+        the unpolish/polish pattern from _apply_readmode — QSS attribute
+        selectors don't re-evaluate on their own."""
+        if self._read_btn.property("level") != level:
+            self._read_btn.setProperty("level", level)
+            self._read_btn.style().unpolish(self._read_btn)
+            self._read_btn.style().polish(self._read_btn)
+
     def set_enabled(self, enabled: bool) -> None:
         self._refresh_mode_btn(enabled)
         out = enabled and self._mode == "OUTPUT"
         self._high.setEnabled(out)
         self._low.setEnabled(out)
+        self._read_btn.setEnabled(enabled)
         if not enabled:
             self._set_checked(False, False)   # clear indicator on disconnect
+            self._set_dot_level("none")
         self._apply_readmode()
 
     def _on_mode_click(self) -> None:
@@ -224,6 +249,7 @@ class PinRow(QWidget):
         # Start the new mode clean: drop any prior blue drive / green read so
         # OUTPUT waits for a click and INPUT waits for the read that follows.
         self._set_checked(False, False)
+        self._set_dot_level("none")
         self._apply_readmode()
         self.setRequested.emit(self.pin, self._mode, None)
 
@@ -234,9 +260,11 @@ class PinRow(QWidget):
         self.setRequested.emit(self.pin, "OUTPUT", value)
 
     def set_read_value(self, value: str) -> None:
-        """INPUT mode: light the matching segment green to show the read
-        level. OUTPUT mode: the segment already shows the driven value (blue),
-        so the drive echo is a no-op."""
+        """Update the leading dot to reflect the last-read level (works in
+        either mode). INPUT mode additionally lights the matching segment
+        green; OUTPUT mode leaves the segment alone since it already shows
+        the driven value in blue."""
+        self._set_dot_level("high" if value == "HIGH" else "low")
         if self._mode != "INPUT":
             return
         self._set_checked(value == "HIGH", value == "LOW")
@@ -244,8 +272,10 @@ class PinRow(QWidget):
 
 class PinGrid(QScrollArea):
     """Scrollable 2-column grid of 66 PinRows (column-major: D0-D32 / D33-D65).
-    Emits setRequested(pin, mode, value) bubbled up from rows."""
+    Emits setRequested(pin, mode, value) and readRequested(pin) bubbled up
+    from the rows."""
     setRequested = Signal(int, str, object)
+    readRequested = Signal(int)
     ROWS_PER_COL = 33
 
     def __init__(self, pins: list[tuple[str, int]], parent=None) -> None:
@@ -261,6 +291,7 @@ class PinGrid(QScrollArea):
         for idx, (label, pin) in enumerate(pins):
             row = PinRow(label, pin)
             row.setRequested.connect(self.setRequested.emit)
+            row.readRequested.connect(self.readRequested.emit)
             self.rows[pin] = row
             grid.addWidget(row, idx % self.ROWS_PER_COL,
                            idx // self.ROWS_PER_COL)

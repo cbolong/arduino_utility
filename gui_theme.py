@@ -159,6 +159,25 @@ QPushButton#seg:disabled {{ color: {p['text_disabled']};
 QPushButton#seg[readmode="true"]:checked {{ background: {p['success_dark']};
                             color: #ffffff; border-color: {p['success_dark']}; }}
 
+/* Per-row read dot at the start of each PinRow. 16×16 square + radius 8 =
+   circle. Tri-state via the dynamic `level` property: high = filled green,
+   low = grey hollow, none = pale hollow (not yet read this session). */
+QPushButton#readdot {{
+    border: 1px solid {p['separator']}; border-radius: 8px;
+    background: transparent; padding: 0;
+    min-width: 16px; min-height: 16px;
+    max-width: 16px; max-height: 16px;
+}}
+QPushButton#readdot:hover {{ border-color: {p['accent']}; }}
+QPushButton#readdot[level="high"] {{ background: {p['success_dark']};
+                                     border-color: {p['success_dark']}; }}
+QPushButton#readdot[level="low"]  {{ background: transparent;
+                                     border-color: {p['text_secondary']}; }}
+QPushButton#readdot[level="none"] {{ background: transparent;
+                                     border-color: {p['separator']}; }}
+QPushButton#readdot:disabled {{ background: transparent;
+                                border-color: {p['text_disabled']}; }}
+
 /* ---- inputs ---- */
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{
     background: {p['card_bg']}; border: 1px solid {p['separator']};

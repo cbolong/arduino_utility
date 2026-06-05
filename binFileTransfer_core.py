@@ -27,6 +27,9 @@ DEFAULT_HANDSHAKE_TIMEOUT_S = 30.0
 # tick + USB CDC round-trip, short enough that a non-responsive board falls
 # back to the reset path quickly.
 FAST_PING_TIMEOUT_S = 0.5
+# GPIO_READ round-trip is sub-millisecond when the MCU is in its idle loop;
+# 1 s is plenty and keeps a non-responding pin from stalling Read All.
+GPIO_READ_TIMEOUT_S = 1.0
 
 MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
@@ -432,7 +435,7 @@ class GpioSession(_Session):
         with _serial_guard(self._lock):
             self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
-            reply = _read_line(self._ser, self._log, 5.0)
+            reply = _read_line(self._ser, self._log, GPIO_READ_TIMEOUT_S)
         if reply and reply.startswith(GPIO_VALUE_PREFIX):
             # Format: "GPIO_VALUE <pin> <0|1>"
             parts = reply.split()

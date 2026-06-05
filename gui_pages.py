@@ -236,6 +236,7 @@ class GpioPage(Page):
 
         self._grid = PinGrid(D.GPIO_PINS)
         self._grid.setRequested.connect(self._on_pin_set)
+        self._grid.readRequested.connect(self._on_pin_read)
         card.body.addWidget(self._grid, 1)
         lay.addWidget(card, 1)
 
@@ -276,6 +277,19 @@ class GpioPage(Page):
                     v = sess.read_pin(pin)
                     if v is not None:
                         self.readSig.emit(pin, v)
+
+        self.enqueue(cmd)
+
+    def _on_pin_read(self, pin: int) -> None:
+        if self._session is None:
+            self.log(f"尚未連線，無法讀取 D{pin}", "warn")
+            return
+
+        def cmd():
+            sess = self._session
+            v = sess.read_pin(pin) if sess is not None else None
+            if v is not None:
+                self.readSig.emit(pin, v)
 
         self.enqueue(cmd)
 
