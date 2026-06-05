@@ -50,9 +50,15 @@ def _find_arduino_port() -> str | None:
 
 
 def _wait_for_line(
-    ser: serial.Serial, expected: str, log: LogCallback, timeout_s: float
+    ser: serial.Serial, expected: str, log: LogCallback, timeout_s: float,
+    *, quiet: bool = False
 ) -> bool:
-    log(f"handshake wait     : {expected}", "wait")
+    """Wait until `expected` is seen on the wire. `quiet=True` suppresses the
+    "handshake wait" intro and the timeout error — pass it from the fast
+    connect probe, where a timeout is the expected miss that falls back to
+    the reset path, not an error to surface."""
+    if not quiet:
+        log(f"handshake wait     : {expected}", "wait")
     deadline = time.monotonic() + timeout_s
     while True:
         if ser.in_waiting > 0:
@@ -66,10 +72,11 @@ def _wait_for_line(
             if line:
                 log(f"MCU: {line}", "info")
         if time.monotonic() > deadline:
-            log(
-                f"Timeout after {timeout_s:.1f}s waiting for: {expected}",
-                "err",
-            )
+            if not quiet:
+                log(
+                    f"Timeout after {timeout_s:.1f}s waiting for: {expected}",
+                    "err",
+                )
             return False
         time.sleep(0.01)
 

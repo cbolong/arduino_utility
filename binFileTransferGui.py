@@ -91,9 +91,10 @@ class MainWindow(QMainWindow):
         right_lay.addWidget(self._build_header())
 
         # Lazy page construction — only the page navigated to is built (the
-        # GPIO 66-row grid is the heavy one), so startup is near-instant.
-        # Connectable pages are also force-built on Connect so sessions /
-        # logging have a target. _ensure_page() fills these in.
+        # GPIO 66-row grid is the heavy one), so startup is near-instant AND
+        # Connect doesn't freeze the GUI thread building three pages. Sessions
+        # use lazy-resolving log callbacks (_page_log_cb) and a late-built
+        # page inherits the live connection via _ensure_page().
         self.stack = QStackedWidget()
         self._page_factories = [
             lambda: FlashPage(self),
