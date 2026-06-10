@@ -178,6 +178,10 @@ class FlashPage(Page):
             self.doneSig.emit(bool(ok))
 
         self.app.status("Programming…", "warn")
+        # The shared link was just released (program_firmware owns the port
+        # for the duration), so the sidebar would read 未連線 mid-flash —
+        # technically true but alarming. Show what's actually happening.
+        self.app._set_conn("燒錄中…", T.PALETTE["warning_dark"])
         self.app.lock_port(True)
         self.enqueue(work)
 
@@ -194,6 +198,9 @@ class FlashPage(Page):
                             "ok")
         else:
             self.app.status("Error", "err")
+        # Flash is done either way and the shared link really is closed now —
+        # restore the true indicator (matches _on_disconnect_done).
+        self.app._set_conn("未連線", T.PALETTE["danger_dark"])
         self._start.setEnabled(True)
         self.app.lock_port(False)
 
