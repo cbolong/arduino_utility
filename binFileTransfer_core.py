@@ -131,6 +131,16 @@ def program_firmware(
             ser.write(f"{MCU_ERASE_TRIGGER}\n".encode("UTF-8"))
 
             if not _wait_for_line(ser, MCU_READY_TO_START, log, handshake_timeout_s):
+                # The most common refusal is the chip-detect gate: the MCU
+                # replies ARDUINO_ERROR when its (re-)probe still reads no
+                # recognised SST ID off the bus.
+                log(
+                    "提示: MCU 拒絕燒錄，通常是未偵測到 Flash 晶片。請檢查晶片"
+                    " 3.3V 供電與 CE/OE/WE/位址/資料接線、移除佔用匯流排腳位的"
+                    "測試跳線(如 D22=A18)，修正後直接再按一次「開始燒錄」即可"
+                    "(韌體會重新偵測，不必拔插)。",
+                    "warn",
+                )
                 return False
 
             with open(firmware_path, "rb") as f:

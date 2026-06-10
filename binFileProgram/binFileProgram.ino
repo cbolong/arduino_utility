@@ -159,11 +159,17 @@ void readSoftwareID() {
   writeByte(0x5555, 0xF0);
   delayMicroseconds(10);
   
+  // Set on success (not only cleared on failure) so the function is
+  // re-entrant: the erase-trigger gate re-probes after a failed boot-time
+  // detect, e.g. when the chip was wired up after boot or a fast-connect
+  // (no reset) carried a stale result across sessions.
   if ((r_vendorID == vendorID) && (r_deviceID == deviceID_SST39SF010)) {
     Serial.println("SST39SF010 detected!!");
+    gChipDetected = true;
   }
   else if ((r_vendorID == vendorID) && (r_deviceID == deviceID_SST39LF010)) {
     Serial.println("SST39LF010/SST39VF010 detected!!");
+    gChipDetected = true;
   }
   else {
     Serial.println("EEPROM ID ERROR (TDBG/GPIO/RECORD will still work; "
@@ -1360,6 +1366,12 @@ void setup() {
       input.trim();
 
       if (input == strEraseTrigger) {
+        if (!gChipDetected) {
+          // Re-probe before refusing: the chip may have been (re)wired
+          // since boot, and a fast-connect (no reset) keeps the stale
+          // boot-time result alive across host sessions.
+          readSoftwareID();
+        }
         if (!gChipDetected) {
           // FLASH mode requires a recognised SST chip on the bus.
           // Refuse the trigger and stay in the idle loop so the user
