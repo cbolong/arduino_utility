@@ -48,10 +48,16 @@ class Worker(QObject):
         try:
             fn()
         except Exception as e:  # never let a worker exception kill the thread
-            if self._on_error is not None:
-                self._on_error(f"背景作業錯誤：{e}")
-            else:
-                print("worker error:", e)
+            # on_error itself can raise (page being torn down mid-callback,
+            # log sink gone, etc). Catching that prevents the exception from
+            # killing the worker thread and stranding _busy True.
+            try:
+                if self._on_error is not None:
+                    self._on_error(f"背景作業錯誤：{type(e).__name__}: {e}")
+                else:
+                    print("worker error:", e)
+            except Exception:
+                pass
         finally:
             self._busy = False
 
@@ -173,9 +179,15 @@ class FlashPage(Page):
         path = self.firmware_path
 
         def work():
-            from binFileTransfer_core import program_firmware
-            ok = program_firmware(path, self.log_cb, port=port)
-            self.doneSig.emit(bool(ok))
+            # Always emit doneSig — Worker._exec would swallow any exception
+            # from program_firmware, leaving _start permanently disabled and
+            # the port locked. Guard with try/finally so _on_done always runs.
+            ok = False
+            try:
+                from binFileTransfer_core import program_firmware
+                ok = bool(program_firmware(path, self.log_cb, port=port))
+            finally:
+                self.doneSig.emit(ok)
 
         self.app.status("Programming…", "warn")
         # The shared link was just released (program_firmware owns the port
@@ -412,8 +424,12 @@ class TdbgPage(Page):
         self.enqueue(cmd)
 
     def _on_done(self, success: bool, n: int) -> None:
-        if self._session is not None:
-            self._set_busy(False)
+        # Clear busy unconditionally and then reapply the real connection
+        # state. Previously this was gated on self._session is not None,
+        # which permanently locked the buttons when a TDBG send raced a
+        # Disconnect (session became None before _on_done arrived).
+        self._set_busy(False)
+        self.set_connected(self._session is not None)
         self.app.status(f"TDBG{n} sent" if success else f"TDBG{n} error",
                         "ok" if success else "err")
 
@@ -572,16 +588,24 @@ class RecordPage(Page):
         if not pins:
             self.log("請至少選一個 pin。", "warn")
             return
-        self._recording = True
-        self._start.setEnabled(False)
-        self._stop.setEnabled(True)
-        self._add_btn.setEnabled(False)
-        self._thumb.setVisible(False)
-        self.app.set_recording(True)
-        for r in self._rows:
-            r.set_combo_enabled(False)
-            r.set_live_state(None)
-        self.app.status("RECORD recording…", "warn")
+        # Lock-step: any exception in the synchronous state-set block must
+        # roll back to "not recording" — otherwise _recording is stuck True
+        # and the UI is frozen with no path to recover.
+        try:
+            self._recording = True
+            self._start.setEnabled(False)
+            self._stop.setEnabled(True)
+            self._add_btn.setEnabled(False)
+            self._thumb.setVisible(False)
+            self.app.set_recording(True)
+            for r in self._rows:
+                r.set_combo_enabled(False)
+                r.set_live_state(None)
+            self.app.status("RECORD recording…", "warn")
+        except Exception as e:
+            self.log(f"RECORD start setup failed: {e}", "err")
+            self.failSig.emit()
+            return
 
         pin_to_row = {r.selected_pin(): r for r in self._rows
                       if r.selected_pin() is not None}

@@ -323,17 +323,23 @@ class MainWindow(QMainWindow):
         ser = self._ser
 
         def work():
-            for s in sessions:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-            self.disDoneSig.emit(on_done)
+            # Any exception inside this worker must NOT swallow disDoneSig —
+            # otherwise the caller (e.g. FlashPage._do_start chained off
+            # disconnect_then) never runs, _start stays disabled, port stays
+            # locked. Guard with try/finally so the signal always fires.
+            try:
+                for s in sessions:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+            finally:
+                self.disDoneSig.emit(on_done)
 
         self._conn_worker.submit(work)
 

@@ -1187,10 +1187,26 @@ class RecordSession(_Session):
             self._log("timeout waiting for RECORD_STOPPED", "err")
             self._live_stop.set()
             self._live_thread.join(timeout=2.0)
+            stuck = self._live_thread.is_alive()
             self._live_thread = None
+            if stuck:
+                # Live thread won't die — it's still holding self._ser. Mark
+                # the session broken so is_open returns False and the user is
+                # forced into a clean reconnect, instead of the next stop()
+                # racing the orphan for the port.
+                self._log("RECORD live thread did not exit within 2s — "
+                          "marking session broken; please disconnect + "
+                          "reconnect to recover.", "warn")
+                self._ser = None
             return None
         self._live_stop.set()
         self._live_thread.join(timeout=2.0)
+        if self._live_thread.is_alive():
+            self._log("RECORD live thread did not exit within 2s — "
+                      "marking session broken.", "warn")
+            self._live_thread = None
+            self._ser = None
+            return None
         self._live_thread = None
 
         with self._stop_handoff_lock:
