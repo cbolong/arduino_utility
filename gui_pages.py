@@ -30,13 +30,15 @@ class Worker(QObject):
 
     `on_error(msg)` (called on the worker thread) surfaces any uncaught
     exception so it reaches the page log instead of a print() that's lost in
-    a windowed EXE. It must itself be thread-safe (the pages pass a
-    signal-emitting log)."""
+    a windowed EXE. `on_failure(detail, traceback_str)` (optional) lets a
+    page register a state-reset hook — see `_register_failure_handler` on
+    Page. Both must be thread-safe (pages pass signal-emitting callbacks)."""
     _run = Signal(object)
 
-    def __init__(self, on_error=None) -> None:
+    def __init__(self, on_error=None, on_failure=None) -> None:
         super().__init__()
         self._on_error = on_error
+        self._on_failure = on_failure
         self._thread = QThread()
         self.moveToThread(self._thread)
         self._run.connect(self._exec)
@@ -49,14 +51,23 @@ class Worker(QObject):
         try:
             fn()
         except Exception as e:  # never let a worker exception kill the thread
-            # on_error itself can raise (page being torn down mid-callback,
-            # log sink gone, etc). Catching that prevents the exception from
-            # killing the worker thread and stranding _busy True.
+            import traceback
+            detail = f"{type(e).__name__}: {e}"
+            tb = traceback.format_exc(limit=3)
+            # on_error / on_failure themselves can raise (page being torn
+            # down mid-callback, log sink gone, etc). Catching that prevents
+            # the exception from killing the worker thread and stranding
+            # _busy True.
             try:
                 if self._on_error is not None:
-                    self._on_error(f"背景作業錯誤：{type(e).__name__}: {e}")
+                    self._on_error(f"背景作業錯誤：{detail}\n{tb}")
                 else:
-                    print("worker error:", e)
+                    print("worker error:", detail, "\n", tb)
+            except Exception:
+                pass
+            try:
+                if self._on_failure is not None:
+                    self._on_failure(detail, tb)
             except Exception:
                 pass
         finally:
@@ -75,15 +86,30 @@ class Worker(QObject):
 
 # --------------------------------------------------------------------------
 class Page(QWidget):
-    """Common scaffold: a worker, a colour log pane, thread-safe logging."""
+    """Common scaffold: a worker, a colour log pane, thread-safe logging.
+
+    Subclasses can override `_on_worker_failure(detail, tb)` to reset their
+    own state when a worker job raises — covers the family of bugs where a
+    sync state-set followed by enqueue() leaves the page wedged if the
+    worker raises before it can emit its done/fail signal."""
     logSig = Signal(str, str)
+    workerFailSig = Signal(str, str)   # detail, traceback — queued to GUI
 
     def __init__(self, app) -> None:
         super().__init__()
         self.app = app
-        self.worker = Worker(on_error=lambda msg: self.log(msg, "err"))
+        self.worker = Worker(
+            on_error=lambda msg: self.log(msg, "err"),
+            on_failure=lambda d, tb: self.workerFailSig.emit(d, tb),
+        )
         self.log_pane = LogPane()
         self.logSig.connect(self.log_pane.append)
+        self.workerFailSig.connect(self._on_worker_failure)
+
+    def _on_worker_failure(self, detail: str, tb: str) -> None:
+        """Default: no-op. Subclasses override to reset transient state
+        (busy flags, button enable/disable) when a worker raises."""
+        pass
 
     # thread-safe — emit queues onto the GUI thread
     def log(self, message: str, level: str = "info") -> None:
@@ -196,6 +222,18 @@ class FlashPage(Page):
         self.app._set_conn("燒錄中…", T.PALETTE["warning_dark"])
         self.app.lock_port(True)
         self.enqueue(work)
+
+    def _on_worker_failure(self, detail: str, tb: str) -> None:
+        # Safety net: if work() somehow doesn't reach its try/finally,
+        # this still re-enables _start and unlocks the port so the page
+        # never wedges. doneSig already does this in normal failures.
+        if not self._start.isEnabled():
+            self._start.setEnabled(True)
+            self.app.lock_port(False)
+            try:
+                self.app._set_conn("未連線", T.PALETTE["danger_dark"])
+            except Exception:
+                pass
 
     def _on_done(self, success: bool) -> None:
         if success:
@@ -433,6 +471,12 @@ class TdbgPage(Page):
         self.app.status(f"TDBG{n} sent" if success else f"TDBG{n} error",
                         "ok" if success else "err")
 
+    def _on_worker_failure(self, detail: str, tb: str) -> None:
+        # Safety net: clear busy and re-apply real connection state, even
+        # if the worker job died before reaching doneSig.
+        self._set_busy(False)
+        self.set_connected(self._session is not None)
+
 
 # --------------------------------------------------------------------------
 class _RecordPinRow(QWidget):
@@ -650,6 +694,12 @@ class RecordPage(Page):
         self._sync_row_controls()
         self._refresh_start()
         self.app.status("RECORD start failed", "err")
+
+    def _on_worker_failure(self, detail: str, tb: str) -> None:
+        # Safety net: if the start/stop worker dies before its try/except,
+        # roll back the recording UI so the page is usable again.
+        if self._recording:
+            self._on_fail()
 
     def _on_stop(self) -> None:
         if not self._recording:

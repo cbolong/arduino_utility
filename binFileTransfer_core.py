@@ -416,6 +416,25 @@ class _Session:
             return False
         return True
 
+    def _transact(
+        self, cmd: str, *, timeout_s: float = COMMAND_TIMEOUT_S,
+        flush: bool = False,
+    ) -> str | None:
+        """Send `cmd` and return one reply line (stripped). None on timeout.
+
+        Implements the GPIO/TDBG/RECORD single-command round-trip: log
+        `send:`, write `cmd\\n` (optionally flush — the SAM3X USB CDC needs
+        flush() for short commands to avoid Tx buffering), wait one line,
+        and let the caller parse the reply. Log emit lives OUTSIDE the
+        serial-guard so a queued Qt log handler can never deadlock the
+        critical section."""
+        self._log(f"send: {cmd}", "info")
+        with _serial_guard(self._lock):
+            self._ser.write(f"{cmd}\n".encode("UTF-8"))
+            if flush:
+                self._ser.flush()
+            return _read_line(self._ser, self._log, timeout_s)
+
 
 class GpioSession(_Session):
     """Persistent GPIO session over one open serial port.
@@ -443,14 +462,7 @@ class GpioSession(_Session):
         cmd = f"GPIO_SET {pin} {mode}"
         if value is not None:
             cmd += f" {value}"
-        # Log emits outside the serial-guard lock — emitting a queued Qt
-        # signal while holding the lock is safe today (signal is async) but
-        # would deadlock the moment someone wires a synchronous handler.
-        # Keep only the real serial I/O inside the critical section.
-        self._log(f"send: {cmd}", "info")
-        with _serial_guard(self._lock):
-            self._ser.write(f"{cmd}\n".encode("UTF-8"))
-            reply = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
+        reply = self._transact(cmd)
         if reply == GPIO_OK:
             self._log(f"recv: {reply}", "ok")
             return True
@@ -464,10 +476,7 @@ class GpioSession(_Session):
             return None
 
         cmd = f"GPIO_READ {pin}"
-        self._log(f"send: {cmd}", "info")
-        with _serial_guard(self._lock):
-            self._ser.write(f"{cmd}\n".encode("UTF-8"))
-            reply = _read_line(self._ser, self._log, GPIO_READ_TIMEOUT_S)
+        reply = self._transact(cmd, timeout_s=GPIO_READ_TIMEOUT_S)
         if reply and reply.startswith(GPIO_VALUE_PREFIX):
             # Format: "GPIO_VALUE <pin> <0|1>"
             parts = reply.split()
@@ -927,11 +936,7 @@ class TdbgSession(_Session):
             self._log(f"Invalid pin: {pin}", "err")
             return False
         cmd = f"TDBG_PRESET {n} {pin}"
-        self._log(f"send: {cmd}", "info")
-        with _serial_guard(self._lock):
-            self._ser.write(f"{cmd}\n".encode("UTF-8"))
-            self._ser.flush()
-            reply = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
+        reply = self._transact(cmd, flush=True)
         if reply and reply.startswith(MCU_TDBG_PRESET_OK_PREFIX):
             self._log(f"recv: {reply}", "ok")
             return True
