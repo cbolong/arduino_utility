@@ -31,6 +31,20 @@ FAST_PING_TIMEOUT_S = 0.5
 # 1 s is plenty and keeps a non-responding pin from stalling Read All.
 GPIO_READ_TIMEOUT_S = 1.0
 
+# Centralised timeouts — previously these were scattered as bare 5.0 / 0.25 /
+# 0.1 / 2.0 magic numbers across every session. Names make tuning safer and
+# the next reader doesn't have to reverse-engineer "why 0.15".
+POLL_SLEEP_S        = 0.01  # serial in_waiting poll slice
+SERIAL_TIMEOUT_S    = 0.1   # default pyserial read timeout (per-call)
+COMMAND_TIMEOUT_S   = 5.0   # single-command reply (GPIO_SET, TDBG_PRESET, …)
+BLOB_READ_TIMEOUT_S = 5.0   # raw ser.read(N) for TDBG/RECORD blobs
+PLAY_WAIT_SLICE_S   = 0.25  # TDBG / RECORD live-loop poll slice
+STOP_DRAIN_TIMEOUT_S = 0.5  # TDBG stop drain deadline
+STOP_DRAIN_SLICE_S   = 0.15 # per-slice _read_line inside the stop drain
+THREAD_JOIN_TIMEOUT_S = 2.0 # daemon thread join wait
+RECORD_HANDOFF_TIMEOUT_S = 5.0  # wait for live thread to park RECORD_STOPPED
+RECORD_STOP_DRAIN_TIMEOUT_S = 10.0  # post-blob line drain budget
+
 MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
 MCU_READY_TO_START = "ARDUINO_READY_TO_RECEIVED_DATA"
@@ -81,7 +95,7 @@ def _wait_for_line(
                     "err",
                 )
             return False
-        time.sleep(0.01)
+        time.sleep(POLL_SLEEP_S)
 
 
 def program_firmware(
@@ -123,7 +137,7 @@ def program_firmware(
         return False
 
     try:
-        with serial.Serial(port, BAUD, timeout=0.1) as ser:
+        with serial.Serial(port, BAUD, timeout=SERIAL_TIMEOUT_S) as ser:
             if not _wait_for_line(ser, MCU_ERASE_READY, log, handshake_timeout_s):
                 return False
 
@@ -250,7 +264,7 @@ def _read_line(
             if not quiet:
                 log(f"Timeout after {timeout_s:.1f}s waiting for MCU reply", "err")
             return None
-        time.sleep(0.01)
+        time.sleep(POLL_SLEEP_S)
 
 
 def _open_and_wait_idle(
@@ -277,7 +291,7 @@ def _open_and_wait_idle(
         ser = serial.Serial()
         ser.port = port
         ser.baudrate = BAUD
-        ser.timeout = 0.1
+        ser.timeout = SERIAL_TIMEOUT_S
         ser.dtr = False
         ser.rts = False
         ser.open()
@@ -299,7 +313,7 @@ def _open_and_wait_idle(
     log("Fast ping timed out, falling back to reset…", "wait")
     ser.close()
     try:
-        ser = serial.Serial(port, BAUD, timeout=0.1)
+        ser = serial.Serial(port, BAUD, timeout=SERIAL_TIMEOUT_S)
     except serial.SerialException as e:
         log(f"Serial reopen error: {e}", "err")
         return None
@@ -384,8 +398,12 @@ class _Session:
         if self._ser is not None and self._owns_ser:
             try:
                 self._ser.close()
-            except Exception:
-                pass
+            except Exception as e:
+                # close() is best-effort, but silently dropping the failure
+                # masks file-handle leaks that accumulate over long-running
+                # connect/disconnect cycles. Log as warn (recoverable) so
+                # it shows up in the user's log without alarming them.
+                self._log(f"close failed: {type(e).__name__}: {e}", "warn")
         self._ser = None
 
     def _check_crc16(self, host_crc: int, mcu_crc: int) -> bool:
@@ -425,10 +443,14 @@ class GpioSession(_Session):
         cmd = f"GPIO_SET {pin} {mode}"
         if value is not None:
             cmd += f" {value}"
+        # Log emits outside the serial-guard lock — emitting a queued Qt
+        # signal while holding the lock is safe today (signal is async) but
+        # would deadlock the moment someone wires a synchronous handler.
+        # Keep only the real serial I/O inside the critical section.
+        self._log(f"send: {cmd}", "info")
         with _serial_guard(self._lock):
-            self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
-            reply = _read_line(self._ser, self._log, 5.0)
+            reply = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
         if reply == GPIO_OK:
             self._log(f"recv: {reply}", "ok")
             return True
@@ -442,8 +464,8 @@ class GpioSession(_Session):
             return None
 
         cmd = f"GPIO_READ {pin}"
+        self._log(f"send: {cmd}", "info")
         with _serial_guard(self._lock):
-            self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
             reply = _read_line(self._ser, self._log, GPIO_READ_TIMEOUT_S)
         if reply and reply.startswith(GPIO_VALUE_PREFIX):
@@ -637,11 +659,14 @@ def parse_acute_txt(
 
 
 def tdbg_pack_events(events: list[tuple[int, int]]) -> bytes:
-    """Serialise (delta, state) pairs into the wire format the MCU expects."""
+    """Serialise (delta, state) pairs into the wire format the MCU expects.
+    Pre-allocates the buffer instead of `out += pack(...)` per event, which
+    would reallocate up to TDBG_MAX_EVENTS (4096) times for a full capture."""
     import struct
-    out = bytearray()
-    for delta, state in events:
-        out += struct.pack("<IB", delta & 0xFFFFFFFF, state & 0x01)
+    out = bytearray(len(events) * TDBG_EVENT_BYTES)
+    packer = struct.Struct("<IB").pack_into
+    for i, (delta, state) in enumerate(events):
+        packer(out, i * TDBG_EVENT_BYTES, delta & 0xFFFFFFFF, state & 0x01)
     return bytes(out)
 
 
@@ -800,9 +825,9 @@ class TdbgSession(_Session):
             # abort produces before starting the LOAD handshake.
             self._ser.write(b"TDBG_STOP\n")
             self._ser.flush()
-            _stop_deadline = time.monotonic() + 0.5
+            _stop_deadline = time.monotonic() + STOP_DRAIN_TIMEOUT_S
             while time.monotonic() < _stop_deadline:
-                line = _read_line(self._ser, self._log, 0.15, quiet=True)
+                line = _read_line(self._ser, self._log, STOP_DRAIN_SLICE_S, quiet=True)
                 if line is None:
                     break
                 self._log(f"drained: {line}", "info")
@@ -811,7 +836,7 @@ class TdbgSession(_Session):
             self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
 
-            ready = _read_line(self._ser, self._log, 5.0)
+            ready = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
             if ready != MCU_TDBG_READY:
                 self._log(f"recv: {ready or '(no reply)'} (expected TDBG_READY)", "err")
                 return False
@@ -882,8 +907,8 @@ class TdbgSession(_Session):
             cmd = "TDBG_PLAY"
         else:
             cmd = f"TDBG_PLAY_LOOP {iterations}"
+        self._log(f"send: {cmd}", "info")
         with _serial_guard(self._lock):
-            self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
             self._ser.flush()
         return True
@@ -902,11 +927,11 @@ class TdbgSession(_Session):
             self._log(f"Invalid pin: {pin}", "err")
             return False
         cmd = f"TDBG_PRESET {n} {pin}"
+        self._log(f"send: {cmd}", "info")
         with _serial_guard(self._lock):
-            self._log(f"send: {cmd}", "info")
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
             self._ser.flush()
-            reply = _read_line(self._ser, self._log, 5.0)
+            reply = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
         if reply and reply.startswith(MCU_TDBG_PRESET_OK_PREFIX):
             self._log(f"recv: {reply}", "ok")
             return True
@@ -1074,7 +1099,7 @@ class RecordSession(_Session):
         # silently orphaning it.
         self._live_stop.set()
         if self._live_thread is not None:
-            self._live_thread.join(timeout=2.0)
+            self._live_thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
             if self._live_thread.is_alive():
                 self._log("RECORD live thread did not exit within 2s", "warn")
             self._live_thread = None
@@ -1106,7 +1131,7 @@ class RecordSession(_Session):
         self._log(f"send: {cmd}", "info")
         self._ser.write(f"{cmd}\n".encode("UTF-8"))
 
-        reply = _read_line(self._ser, self._log, 5.0)
+        reply = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
         if reply != MCU_RECORD_STARTED:
             if reply and reply.startswith(MCU_RECORD_ERROR_PREFIX):
                 self._log(f"recv: {reply}", "err")
@@ -1130,7 +1155,7 @@ class RecordSession(_Session):
             # Same polling pattern as _await_play_done — empty slices are
             # the normal idle state while waiting for the next RECORD_LIVE,
             # not real errors. Suppress the timeout log.
-            line = _read_line(self._ser, self._log, 0.25, quiet=True)
+            line = _read_line(self._ser, self._log, PLAY_WAIT_SLICE_S, quiet=True)
             if line is None:
                 continue
             if line.startswith(MCU_RECORD_LIVE_PREFIX):
@@ -1183,10 +1208,10 @@ class RecordSession(_Session):
 
         # Wait briefly for the live thread to capture the first non-LIVE line
         # (typically RECORD_STOPPED). Then drain the rest ourselves.
-        if not self._handed_off.wait(timeout=5.0):
+        if not self._handed_off.wait(timeout=RECORD_HANDOFF_TIMEOUT_S):
             self._log("timeout waiting for RECORD_STOPPED", "err")
             self._live_stop.set()
-            self._live_thread.join(timeout=2.0)
+            self._live_thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
             stuck = self._live_thread.is_alive()
             self._live_thread = None
             if stuck:
@@ -1200,7 +1225,7 @@ class RecordSession(_Session):
                 self._ser = None
             return None
         self._live_stop.set()
-        self._live_thread.join(timeout=2.0)
+        self._live_thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
         if self._live_thread.is_alive():
             self._log("RECORD live thread did not exit within 2s — "
                       "marking session broken.", "warn")
@@ -1215,7 +1240,7 @@ class RecordSession(_Session):
 
         # Build a small re-source that yields the queued lines first then
         # falls back to fresh _read_line calls.
-        def next_line(timeout=10.0) -> str | None:
+        def next_line(timeout=RECORD_STOP_DRAIN_TIMEOUT_S) -> str | None:
             if queued:
                 return queued.pop(0)
             return _read_line(self._ser, self._log, timeout)
@@ -1249,7 +1274,7 @@ class RecordSession(_Session):
         if count > 0:
             expected = count * RECORD_EVENT_BYTES
             saved_timeout = self._ser.timeout
-            self._ser.timeout = 5.0
+            self._ser.timeout = BLOB_READ_TIMEOUT_S
             try:
                 blob = self._ser.read(expected)
             finally:

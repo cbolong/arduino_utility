@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 import gui_data as D
 import gui_theme as T
+from binFileTransfer_core import program_firmware
 from gui_widgets import (
     Card, LogPane, PinGrid, WaveformView, open_waveform_preview,
 )
@@ -184,7 +185,6 @@ class FlashPage(Page):
             # the port locked. Guard with try/finally so _on_done always runs.
             ok = False
             try:
-                from binFileTransfer_core import program_firmware
                 ok = bool(program_firmware(path, self.log_cb, port=port))
             finally:
                 self.doneSig.emit(ok)

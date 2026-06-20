@@ -21,6 +21,9 @@ from PySide6.QtWidgets import (
 )
 
 import gui_theme as T
+from binFileTransfer_core import (
+    GpioSession, RecordSession, TdbgSession, open_due_link,
+)
 from gui_pages import FlashPage, GpioPage, RecordPage, TdbgPage, Worker
 from gui_widgets import Sidebar
 
@@ -253,7 +256,6 @@ class MainWindow(QMainWindow):
         self.status("Connecting…", "warn")
 
         def work():
-            from binFileTransfer_core import open_due_link
             ser = open_due_link(port, self._connect_log_cb)
             self.connDoneSig.emit(ser)
 
@@ -284,7 +286,6 @@ class MainWindow(QMainWindow):
             self.lock_port(False)
             self.status("Connect failed", "err")
             return
-        from binFileTransfer_core import GpioSession, RecordSession, TdbgSession
         self._ser = ser
         self.gpio_session = GpioSession(
             self._page_log_cb("gpio_page"), ser=ser, lock=self._serial_lock)
