@@ -133,6 +133,34 @@ def main():
                  timeout=3.0), "R7: connect button stuck after failed connect"
     print("R7: failed connect leaves 連線 clickable: OK")
 
+    # R8: mashing 連線 while a connect is in flight must not start a second
+    # handshake — _conn_busy gates re-entry.
+    calls = []
+
+    def slow_open(port, log):
+        calls.append(1)
+        time.sleep(0.2)
+        return FakeSerial()
+
+    core.open_due_link = slow_open
+    gui.open_due_link = slow_open
+    win._on_connect()
+    win._on_connect()   # immediate second click
+    win._on_connect()   # and a third
+    assert drain(app, lambda: win._connected, timeout=3.0)
+    assert len(calls) == 1, f"R8: {len(calls)} handshakes started by mashing"
+    print("R8: connect mash gated to a single handshake: OK")
+
+    # R9: RECORD page dedups the same pin picked in two rows.
+    rec = win._ensure_page(3)
+    rec.set_connected(True)
+    rec._add_row()
+    rec._rows[0].combo.setCurrentIndex(1)
+    rec._rows[1].combo.setCurrentIndex(1)   # same pin as row 0
+    pins = rec._selected_pins()
+    assert len(pins) == 1, f"R9: duplicate pin not dedup'd: {pins}"
+    print("R9: duplicate RECORD pin rows dedup to one: OK")
+
     win.close()
     app.processEvents()
 

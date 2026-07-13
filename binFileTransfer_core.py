@@ -47,6 +47,12 @@ RECORD_STOP_DRAIN_TIMEOUT_S = 10.0  # post-blob line drain budget
 
 MCU_ERASE_READY = "ARDUINO_ERASE_READY"
 MCU_ERASE_TRIGGER = "ARDUINO_ERASE_TRIGGER"
+# Host→MCU bare commands (no argument). Named so each string exists exactly
+# once — TDBG_STOP in particular is sent from two different code paths and
+# a typo in one of them would silently break only that path.
+HOST_PING_CMD = b"ARDUINO_PING\n"
+HOST_TDBG_STOP_CMD = b"TDBG_STOP\n"
+HOST_RECORD_STOP_CMD = b"RECORD_STOP\n"
 MCU_READY_TO_START = "ARDUINO_READY_TO_RECEIVED_DATA"
 MCU_RECEIVED_LINE_RESPONSE = "ARDUINO_RECEIVED_LINE_DONE"
 MCU_VERIFY_REQUEST = "ARDUINO_VERIFY_REQUEST"   # host sends "<sentinel> <hex>"
@@ -303,7 +309,7 @@ def _open_and_wait_idle(
         ser.reset_input_buffer()
     except Exception:
         pass
-    ser.write(b"ARDUINO_PING\n")
+    ser.write(HOST_PING_CMD)
     if _wait_for_line(
         ser, MCU_ERASE_READY, log, FAST_PING_TIMEOUT_S, quiet=True
     ):
@@ -832,7 +838,7 @@ class TdbgSession(_Session):
             # idle loop just ignores TDBG_STOP (no reply), so this is a
             # harmless no-op. Drain the TDBG_STOPPED / TDBG_PLAY_DONE the
             # abort produces before starting the LOAD handshake.
-            self._ser.write(b"TDBG_STOP\n")
+            self._ser.write(HOST_TDBG_STOP_CMD)
             self._ser.flush()
             _stop_deadline = time.monotonic() + STOP_DRAIN_TIMEOUT_S
             while time.monotonic() < _stop_deadline:
@@ -986,7 +992,7 @@ class TdbgSession(_Session):
             if stop_event is not None and stop_event.is_set() and not sent_stop:
                 self._log("send: TDBG_STOP", "info")
                 try:
-                    self._ser.write(b"TDBG_STOP\n")
+                    self._ser.write(HOST_TDBG_STOP_CMD)
                 except Exception as e:
                     self._log(f"failed to send TDBG_STOP: {e}", "err")
                 sent_stop = True
@@ -1209,7 +1215,7 @@ class RecordSession(_Session):
             return None
 
         self._log("send: RECORD_STOP", "info")
-        self._ser.write(b"RECORD_STOP\n")
+        self._ser.write(HOST_RECORD_STOP_CMD)
 
         # Wait briefly for the live thread to capture the first non-LIVE line
         # (typically RECORD_STOPPED). Then drain the rest ourselves.
