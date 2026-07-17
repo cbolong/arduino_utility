@@ -132,6 +132,7 @@ Implementation details that look like they could be simplified but can't:
 | Total size | `EXPECTED_CHUNKS` × `CHUNK_SIZE` | `FILE_SIZE_SUPPORT` |
 | Handshake strings | `strEraseReady` … `strError` (9 of them, incl. `strVerifyRequest` / `strTransferDone`) | `MCU_ERASE_READY` … `MCU_ERROR` |
 | Fast-connect ping | `"ARDUINO_PING"` in the idle dispatcher (replies `strEraseReady` when not recording) | `HOST_PING_CMD` in `_open_and_wait_idle` |
+| Verify block report | `"ARDUINO_VERIFY_BLOCKS"` + 32×8-hex in `verifyRomCrc32` (mismatch only, before `strError`) | `MCU_VERIFY_BLOCKS_PREFIX`, parsed by `_diagnose_verify_failure` |
 | GPIO strings | inline string literals in `handleGpioSet/Read` | inline literals in `GpioSession` |
 | TDBG strings | inline literals in `handleTdbgLoad/Play` | `MCU_TDBG_*` constants in `TdbgSession` |
 | TDBG preset | `TDBG_PRESET <n> <pin>` / `TDBG_PRESET_OK <n>` in `handleTdbgPreset` | `TdbgSession.send_preset` / `MCU_TDBG_PRESET_OK_PREFIX` |

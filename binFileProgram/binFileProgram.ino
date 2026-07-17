@@ -1270,26 +1270,45 @@ uint32_t crc32_update(uint32_t crc, uint8_t byte) {
   return crc;
 }
 
-// Sweep 0..FILE_SIZE_SUPPORT-1, return CRC32 of the ROM contents.
-// Uses readByte; FILE_SIZE_SUPPORT must equal the host's
-// FILE_SIZE_SUPPORT for the comparison to be meaningful.
-uint32_t computeRomCrc32() {
+// Sweep 0..FILE_SIZE_SUPPORT-1, return CRC32 of the ROM contents and fill
+// blockCrcs[EXPECTED_CHUNKS] with an independent CRC32 per 4 KB block.
+// One CRC over 128 KB says "something is wrong"; the per-block CRCs say
+// WHERE, and their repetition pattern distinguishes an address-line fault
+// (blocks repeat with a period) from transfer corruption (isolated block)
+// from a marginal chip (scattered blocks). Uses readByte; FILE_SIZE_SUPPORT
+// must equal the host's FILE_SIZE_SUPPORT for the comparison to be
+// meaningful.
+uint32_t computeRomCrc32(uint32_t* blockCrcs) {
   uint32_t crc = 0xFFFFFFFFUL;
   const uint32_t romSize = 128UL * 1024UL;
+  uint32_t blk = 0xFFFFFFFFUL;
+  uint32_t blkIdx = 0;
   for (uint32_t addr = 0; addr < romSize; addr++) {
-    crc = crc32_update(crc, readByte(addr));
+    uint8_t b = readByte(addr);
+    crc = crc32_update(crc, b);
+    blk = crc32_update(blk, b);
+    if ((addr & (CHUNK_SIZE - 1)) == (CHUNK_SIZE - 1)) {
+      if (blockCrcs != NULL && blkIdx < EXPECTED_CHUNKS) {
+        blockCrcs[blkIdx] = blk ^ 0xFFFFFFFFUL;
+      }
+      blkIdx++;
+      blk = 0xFFFFFFFFUL;
+    }
   }
   return crc ^ 0xFFFFFFFFUL;
 }
 
 // Parse the hex argument from "ARDUINO_VERIFY_REQUEST <hex>" then verify.
-// Replies strVerifyOK on match; on mismatch falls through to strError + halt.
+// Replies strVerifyOK on match; on mismatch emits the per-block CRC report
+// (ARDUINO_VERIFY_BLOCKS <32 x 8-hex>) so the host can localise the damage,
+// then falls through to strError + halt.
 void verifyRomCrc32(uint32_t expectedCrc) {
   Serial.print("Verifying ROM CRC32 (expected=0x");
   Serial.print(expectedCrc, HEX);
   Serial.println(") ...");
+  static uint32_t blockCrcs[EXPECTED_CHUNKS];
   unsigned long t0 = millis();
-  uint32_t actualCrc = computeRomCrc32();
+  uint32_t actualCrc = computeRomCrc32(blockCrcs);
   unsigned long t1 = millis();
   // Reuse the read+compare timing slots to record verify cost in summary.
   t_read_total_ms += (t1 - t0);
@@ -1302,6 +1321,15 @@ void verifyRomCrc32(uint32_t expectedCrc) {
   if (actualCrc == expectedCrc) {
     Serial.println(strVerifyOK);
   } else {
+    // Per-block report BEFORE strError: a new host captures it while
+    // waiting for the verdict; an old host just logs it as MCU chatter.
+    Serial.print("ARDUINO_VERIFY_BLOCKS");
+    for (uint32_t i = 0; i < EXPECTED_CHUNKS; i++) {
+      char hexbuf[10];
+      snprintf(hexbuf, sizeof(hexbuf), " %08lX", (unsigned long)blockCrcs[i]);
+      Serial.print(hexbuf);
+    }
+    Serial.println();
     while (!Serial);
     Serial.println(strError);
     while (1) {}

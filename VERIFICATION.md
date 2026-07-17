@@ -25,7 +25,10 @@
 | 小於 128KB 的檔 | 補 0 到 128KB 再燒 | 自動 C10(1000B 檔) |
 | 空檔 / 不存在 / >128KB | 本地拒絕,不碰序列埠 | 自動(`program_firmware` 前置檢查;C10 家族) |
 | 晶片未偵測(ID 0x0) | MCU 重探一次→仍無→`ARDUINO_ERROR`;host 顯示可行動提示 | 自動 `test_core_protocol C11`;重探本體 HIL |
-| CRC 驗證失敗 | 回 False、Error 狀態、按鈕恢復 | 自動 `test_core_protocol C12` |
+| CRC 驗證失敗(舊 sketch,無區塊回報) | 失敗 + 通用提示(升級 .ino 可得定位) | 自動 `test_core_protocol C12` |
+| CRC 失敗 — 單一區塊損毀 | 區塊差異表點名該區塊 + 「傳輸損毀」診斷 | 自動 C13 |
+| CRC 失敗 — 64KB 週期重複(位址線卡住) | 診斷指名 A16/Due D24 | 自動 C14 |
+| 補頁位元組 | 不足 128KB 補 0xFF(leave-erased,可暴露 erase 不完全) | 自動 C15 |
 | 燒錄中側欄狀態 | 「燒錄中…」→ 結束回「未連線」 | 自動 `test_smoke_gui S9` |
 | 燒錄前有 GPIO/TDBG 連線 | 先釋放共用連線再開始 | 自動 S9(disconnect_then 鏈) |
 | 燒錄後想用 GPIO/TDBG/RECORD | 需按 Due RESET + 重新連線(訊息有提示) | HIL |

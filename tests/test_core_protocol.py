@@ -106,12 +106,15 @@ def test_record_parse():
 
 class FlashMcu(FakeSerial):
     """Scripted MCU for the full flash flow. Behaviour flags let individual
-    tests break specific steps."""
+    tests break specific steps. `chip_blocks` (list of 32 CRC32s) simulates
+    the new ARDUINO_VERIFY_BLOCKS report on a CRC mismatch; None models an
+    old sketch that never sends it."""
 
-    def __init__(self, refuse_erase=False, bad_crc=False):
+    def __init__(self, refuse_erase=False, bad_crc=False, chip_blocks=None):
         super().__init__(preload=b"ARDUINO_ERASE_READY\r\n")
         self.refuse_erase = refuse_erase
         self.bad_crc = bad_crc
+        self.chip_blocks = chip_blocks
         self.chunks = 0
 
     def write(self, data):
@@ -123,8 +126,14 @@ class FlashMcu(FakeSerial):
             else:
                 self.buf += b"ARDUINO_READY_TO_RECEIVED_DATA\r\n"
         elif text.startswith("ARDUINO_VERIFY_REQUEST"):
-            self.buf += (b"ARDUINO_ERROR\r\n" if self.bad_crc
-                         else b"ARDUINO_VERIFY_OK\r\n")
+            if self.bad_crc:
+                if self.chip_blocks is not None:
+                    line = "ARDUINO_VERIFY_BLOCKS " + " ".join(
+                        f"{c:08X}" for c in self.chip_blocks)
+                    self.buf += line.encode() + b"\r\n"
+                self.buf += b"ARDUINO_ERROR\r\n"
+            else:
+                self.buf += b"ARDUINO_VERIFY_OK\r\n"
         elif text.startswith("ARDUINO_TRANSFER_DONE_SIGNAL"):
             self.buf += b"ARDUINO_DATA_COMPLETED\r\n"
         elif len(data) == core.CHUNK_SIZE:
@@ -179,7 +188,65 @@ def test_flash_bad_crc():
     log, entries = collecting_log()
     ok = _with_flash_mcu(FlashMcu(bad_crc=True), log)
     assert ok is False
-    print("C12: flash CRC mismatch fails cleanly: OK")
+    # Old sketch (no blocks line) → the fallback hint must appear.
+    assert any("舊版 .ino" in m for _, m in entries), \
+        [m for _, m in entries][-3:]
+    print("C12: flash CRC mismatch (old sketch) fails with hint: OK")
+
+
+def _host_block_crcs():
+    """Per-4KB CRCs of the exact padded image _with_flash_mcu programs:
+    1000 bytes of 0xA5 + 0xFF padding to 128 KB."""
+    import zlib
+    padded = (b"\xA5" * 1000) + b"\xFF" * (core.FILE_SIZE_SUPPORT - 1000)
+    return [
+        zlib.crc32(padded[i * core.CHUNK_SIZE:(i + 1) * core.CHUNK_SIZE])
+        & 0xFFFFFFFF
+        for i in range(core.FILE_SIZE_SUPPORT // core.CHUNK_SIZE)
+    ]
+
+
+def test_flash_verify_blocks_localised():
+    # One corrupted block (block 5) → the diff names it and the diagnosis
+    # points at transfer corruption.
+    log, entries = collecting_log()
+    chip = _host_block_crcs()
+    chip[5] ^= 0xDEADBEEF
+    ok = _with_flash_mcu(FlashMcu(bad_crc=True, chip_blocks=chip), log)
+    assert ok is False
+    msgs = [m for _, m in entries]
+    assert any("1/32" in m and "區塊5" in m.replace(" ", "") for m in msgs), \
+        msgs[-4:]
+    assert any("傳輸中損毀" in m for m in msgs), msgs[-4:]
+    print("C13: single bad block localised + transit diagnosis: OK")
+
+
+def test_flash_verify_blocks_aliasing():
+    # A16 stuck: chip content repeats with a 16-block (64 KB) period —
+    # both halves hold the SECOND half's data. Diagnosis must implicate
+    # A16 / Due D24.
+    log, entries = collecting_log()
+    host = _host_block_crcs()
+    chip = host[16:] + host[16:]
+    ok = _with_flash_mcu(FlashMcu(bad_crc=True, chip_blocks=chip), log)
+    assert ok is False
+    msgs = [m for _, m in entries]
+    assert any("A16" in m and "D24" in m for m in msgs), msgs[-4:]
+    print("C14: 64KB-period aliasing pattern → A16/D24 diagnosis: OK")
+
+
+def test_flash_padding_is_ff():
+    # The padded tail must be 0xFF (leave-erased), not 0x00 — chunk 1
+    # carries the 0xA5 payload + the first padding bytes.
+    log, entries = collecting_log()
+    mcu = FlashMcu()
+    ok = _with_flash_mcu(mcu, log)
+    assert ok is True
+    first_chunk = next(w for w in mcu.written if len(w) == core.CHUNK_SIZE)
+    assert first_chunk[:1000] == b"\xA5" * 1000
+    assert first_chunk[1000:] == b"\xFF" * (core.CHUNK_SIZE - 1000), \
+        "padding must be 0xFF"
+    print("C15: padding bytes are 0xFF: OK")
 
 
 if __name__ == "__main__":
@@ -191,4 +258,7 @@ if __name__ == "__main__":
     test_flash_happy()
     test_flash_refusal()
     test_flash_bad_crc()
+    test_flash_verify_blocks_localised()
+    test_flash_verify_blocks_aliasing()
+    test_flash_padding_is_ff()
     print("PASS test_core_protocol")

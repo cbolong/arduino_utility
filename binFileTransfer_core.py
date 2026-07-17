@@ -57,6 +57,10 @@ MCU_READY_TO_START = "ARDUINO_READY_TO_RECEIVED_DATA"
 MCU_RECEIVED_LINE_RESPONSE = "ARDUINO_RECEIVED_LINE_DONE"
 MCU_VERIFY_REQUEST = "ARDUINO_VERIFY_REQUEST"   # host sends "<sentinel> <hex>"
 MCU_VERIFY_OK = "ARDUINO_VERIFY_OK"
+# On CRC mismatch the sketch reports 32 per-4KB-block CRC32s on one line
+# ("ARDUINO_VERIFY_BLOCKS <8-hex> x32") before ARDUINO_ERROR, letting the
+# host localise the damage. Optional: an old sketch simply never sends it.
+MCU_VERIFY_BLOCKS_PREFIX = "ARDUINO_VERIFY_BLOCKS"
 MCU_TRANSFER_DONE_SIGNAL = "ARDUINO_TRANSFER_DONE_SIGNAL"
 MCU_TRANSFER_COMPLETED = "ARDUINO_DATA_COMPLETED"
 MCU_ERROR = "ARDUINO_ERROR"
@@ -102,6 +106,129 @@ def _wait_for_line(
                 )
             return False
         time.sleep(POLL_SLEEP_S)
+
+
+def _wait_verify(
+    ser: serial.Serial, log: LogCallback, timeout_s: float
+) -> tuple[bool, str | None]:
+    """Wait for the verify verdict. Returns (ok, blocks_line) where
+    blocks_line is the captured ARDUINO_VERIFY_BLOCKS payload on failure
+    (None when the sketch predates the feature or on timeout)."""
+    log(f"handshake wait     : {MCU_VERIFY_OK}", "wait")
+    blocks_line = None
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode(errors="ignore").strip()
+            if line == MCU_VERIFY_OK:
+                log(f"handshake received : {MCU_VERIFY_OK}", "ok")
+                return True, None
+            if line == MCU_ERROR:
+                log("MCU ERROR!!", "err")
+                return False, blocks_line
+            if line.startswith(MCU_VERIFY_BLOCKS_PREFIX):
+                blocks_line = line
+                continue          # capture silently; the diff replaces it
+            if line:
+                log(f"MCU: {line}", "info")
+        if time.monotonic() > deadline:
+            log(f"Timeout after {timeout_s:.1f}s waiting for: {MCU_VERIFY_OK}",
+                "err")
+            return False, blocks_line
+        time.sleep(POLL_SLEEP_S)
+
+
+# addrPins[] index → Due pin, for the address bits the block-period heuristic
+# can implicate (block stride 4/8/16 = 16/32/64 KB = A14/A15/A16). Mirrors
+# the addrPins[] table in binFileProgram.ino — keep in sync.
+_ADDR_BIT_TO_DUE_PIN = {14: 29, 15: 26, 16: 24}
+
+
+def _diagnose_verify_failure(
+    padded: bytes, blocks_line: str | None, log: LogCallback
+) -> None:
+    """Turn a CRC mismatch from an opaque failure into a located one.
+
+    Compares the MCU's per-4KB-block CRCs against the host file's and looks
+    for the tell-tale patterns:
+      - blocks repeating with period 2^k  → address line A(k+12) stuck
+        (write + its Data#-poll readback are self-consistent through the
+        fault, so programming "succeeds"; only the full sweep sees aliasing)
+      - one isolated bad block            → data corrupted in transit
+        (the chunk stream has no wire-level checksum; the MCU faithfully
+        programs — and Data#-polls against — whatever bytes arrived)
+      - scattered / widespread bad blocks → marginal chip (e.g. a 5 V
+        SST39SF010 running at 3.3 V) or erase/read-path trouble
+    """
+    if not blocks_line:
+        log(
+            "提示: CRC 不符但韌體未回報區塊資訊(舊版 .ino)。請重新上傳最新"
+            " binFileProgram.ino 後重試，即可得到逐區塊定位。可能原因:"
+            "位址線接觸不良/殘留跳線(D22=A18、D24=A16)、傳輸損毀、"
+            "或晶片為 5V 件(SF010)跑在 3.3V。",
+            "warn",
+        )
+        return
+    try:
+        chip = [int(t, 16) for t in blocks_line.split()[1:]]
+    except ValueError:
+        log(f"malformed VERIFY_BLOCKS line: {blocks_line!r}", "err")
+        return
+    n = FILE_SIZE_SUPPORT // CHUNK_SIZE
+    if len(chip) != n:
+        log(f"VERIFY_BLOCKS count {len(chip)} != {n}", "err")
+        return
+
+    host = [
+        zlib.crc32(padded[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]) & 0xFFFFFFFF
+        for i in range(n)
+    ]
+    bad = [i for i in range(n) if chip[i] != host[i]]
+    if not bad:
+        log("區塊 CRC 全部相符但總 CRC 不符 — 不應發生，請回報。", "err")
+        return
+
+    ranges = []
+    s = bad[0]
+    for a, b in zip(bad, bad[1:] + [None]):
+        if b != a + 1:
+            ranges.append(f"0x{s*CHUNK_SIZE:05X}-0x{(a+1)*CHUNK_SIZE-1:05X}"
+                          + (f" (區塊{s})" if s == a else f" (區塊{s}-{a})"))
+            s = b
+    log(f"區塊比對: {len(bad)}/{n} 個 4KB 區塊不符 → " + ", ".join(ranges),
+        "err")
+
+    # Address-line aliasing: chip content repeats with period `stride` blocks.
+    for stride, bit in ((16, 16), (8, 15), (4, 14)):
+        if all(chip[i] == chip[i + stride] for i in range(n - stride)):
+            pin = _ADDR_BIT_TO_DUE_PIN[bit]
+            log(
+                f"診斷: 晶片內容以 {stride*CHUNK_SIZE//1024} KB 為週期重複 → "
+                f"位址線 A{bit}(Due D{pin})疑似卡住/短路。逐位元組寫入驗證"
+                f"會通過(寫入與回讀走同一條錯誤位址),只有全片掃描看得到"
+                f"重疊。請檢查 D{pin} 的接線與殘留測試跳線。",
+                "warn",
+            )
+            return
+    if len(bad) == 1:
+        log(
+            "診斷: 僅單一區塊不符 → 較像資料在 USB 傳輸中損毀(chunk 流無"
+            "線上校驗,MCU 會忠實燒錄收到的內容)。直接重燒一次;若換了"
+            "位置代表傳輸品質問題(換線/換孔),同位置則是晶片該區塊不良。",
+            "warn",
+        )
+    elif len(bad) == n:
+        log(
+            "診斷: 全片不符 → 讀取路徑(CE/OE/資料線)或供電問題,亦可能是"
+            "5V 件(SF010)跑在 3.3V 的邊際行為。確認晶片為 39LF/VF010。",
+            "warn",
+        )
+    else:
+        log(
+            "診斷: 多個分散區塊不符 → 晶片寫入/保持邊際不良(常見於 5V 件"
+            "跑 3.3V)或接觸不良。確認晶片型號與座接觸後重試。",
+            "warn",
+        )
 
 
 def program_firmware(
@@ -169,11 +296,16 @@ def program_firmware(
             padding_size = FILE_SIZE_SUPPORT - len(file_data)
             log(
                 f"File size {file_size} bytes. Padded with {padding_size} bytes "
-                f"to reach {FILE_SIZE_SUPPORT // 1024} KB.",
+                f"of 0xFF to reach {FILE_SIZE_SUPPORT // 1024} KB.",
                 "info",
             )
             if len(file_data) < FILE_SIZE_SUPPORT:
-                file_data += b"\x00" * padding_size
+                # Pad with 0xFF, not 0x00: programming 0xFF into an erased NOR
+                # cell is a no-op (leave-erased), and — unlike 0x00, which
+                # programs successfully over ANY cell state — 0xFF padding
+                # lets the CRC sweep expose an incomplete erase in the padded
+                # tail instead of masking it.
+                file_data += b"\xFF" * padding_size
 
             log(
                 f"Start to transfer firmware to MCU (Chunk Size : {CHUNK_SIZE} bytes)",
@@ -208,9 +340,14 @@ def program_firmware(
 
             # CRC32 sweep over 128 KB at ~10 µs/byte ≈ 1.3 s on the MCU,
             # so allow generous margin on top of handshake_timeout_s.
-            if not _wait_for_line(
-                ser, MCU_VERIFY_OK, log, max(handshake_timeout_s, 30.0)
-            ):
+            # Custom wait (not _wait_for_line): on mismatch the sketch sends
+            # ARDUINO_VERIFY_BLOCKS before ARDUINO_ERROR, and we must capture
+            # that line rather than discard it as chatter.
+            verify_ok, blocks_line = _wait_verify(
+                ser, log, max(handshake_timeout_s, 30.0)
+            )
+            if not verify_ok:
+                _diagnose_verify_failure(file_data, blocks_line, log)
                 return False
 
             # Tell the MCU explicitly that the binary stream is done so it
