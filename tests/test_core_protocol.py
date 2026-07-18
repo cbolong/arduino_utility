@@ -148,13 +148,25 @@ class FlashMcu(FakeSerial):
         return False
 
 
-def _with_flash_mcu(mcu, log):
+DEFAULT_FILE = b"\xA5" * 1000
+# A 108 KB image whose every 4 KB block differs (block index in every byte) —
+# needed by the aliasing test: content must extend past 64 KB with distinct
+# blocks, or the "aliased" chip degenerates to all-identical-FF and the
+# blank-chip guard correctly fires instead.
+VARIED_108K = b"".join(bytes([i]) * core.CHUNK_SIZE for i in range(27))
+
+
+def _padded(content):
+    return content + b"\xFF" * (core.FILE_SIZE_SUPPORT - len(content))
+
+
+def _with_flash_mcu(mcu, log, content=DEFAULT_FILE):
     import serial as _serial
     orig = _serial.Serial
     _serial.Serial = lambda *a, **kw: mcu
     try:
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
-            f.write(b"\xA5" * 1000)
+            f.write(content)
             fw = f.name
         try:
             return core.program_firmware(fw, log, port="COM_T",
@@ -194,11 +206,10 @@ def test_flash_bad_crc():
     print("C12: flash CRC mismatch (old sketch) fails with hint: OK")
 
 
-def _host_block_crcs():
-    """Per-4KB CRCs of the exact padded image _with_flash_mcu programs:
-    1000 bytes of 0xA5 + 0xFF padding to 128 KB."""
+def _host_block_crcs(content=DEFAULT_FILE):
+    """Per-4KB CRCs of the padded image _with_flash_mcu programs."""
     import zlib
-    padded = (b"\xA5" * 1000) + b"\xFF" * (core.FILE_SIZE_SUPPORT - 1000)
+    padded = _padded(content)
     return [
         zlib.crc32(padded[i * core.CHUNK_SIZE:(i + 1) * core.CHUNK_SIZE])
         & 0xFFFFFFFF
@@ -223,16 +234,36 @@ def test_flash_verify_blocks_localised():
 
 def test_flash_verify_blocks_aliasing():
     # A16 stuck: chip content repeats with a 16-block (64 KB) period —
-    # both halves hold the SECOND half's data. Diagnosis must implicate
-    # A16 / Due D24.
+    # both halves hold the SECOND half's data. Needs an image with varied
+    # content past 64 KB (VARIED_108K) so the aliased chip is NOT all-
+    # identical. Diagnosis must implicate A16 / Due D24.
     log, entries = collecting_log()
-    host = _host_block_crcs()
+    host = _host_block_crcs(VARIED_108K)
     chip = host[16:] + host[16:]
-    ok = _with_flash_mcu(FlashMcu(bad_crc=True, chip_blocks=chip), log)
+    ok = _with_flash_mcu(FlashMcu(bad_crc=True, chip_blocks=chip), log,
+                         content=VARIED_108K)
     assert ok is False
     msgs = [m for _, m in entries]
     assert any("A16" in m and "D24" in m for m in msgs), msgs[-4:]
     print("C14: 64KB-period aliasing pattern → A16/D24 diagnosis: OK")
+
+
+def test_flash_verify_blocks_blank_chip():
+    # A chip that never got programmed (WE fault → still all 0xFF) has 32
+    # IDENTICAL block CRCs. That trivially satisfies every period stride, so
+    # without the all-identical guard this would misdiagnose as "A16 stuck".
+    # It must be diagnosed as a write-path problem instead.
+    import zlib
+    log, entries = collecting_log()
+    blank = zlib.crc32(b"\xFF" * core.CHUNK_SIZE) & 0xFFFFFFFF
+    chip = [blank] * 32
+    ok = _with_flash_mcu(FlashMcu(bad_crc=True, chip_blocks=chip), log)
+    assert ok is False
+    msgs = [m for _, m in entries]
+    assert any("從未寫入" in m and "WE" in m for m in msgs), msgs[-4:]
+    assert not any("A16" in m for m in msgs), \
+        f"blank chip must NOT be misdiagnosed as A16: {msgs[-4:]}"
+    print("C16: blank chip → write-path diagnosis, not A16 misdiagnosis: OK")
 
 
 def test_flash_padding_is_ff():
@@ -260,5 +291,6 @@ if __name__ == "__main__":
     test_flash_bad_crc()
     test_flash_verify_blocks_localised()
     test_flash_verify_blocks_aliasing()
+    test_flash_verify_blocks_blank_chip()
     test_flash_padding_is_ff()
     print("PASS test_core_protocol")

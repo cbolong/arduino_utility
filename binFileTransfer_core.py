@@ -78,12 +78,18 @@ def _find_arduino_port() -> str | None:
 
 def _wait_for_line(
     ser: serial.Serial, expected: str, log: LogCallback, timeout_s: float,
-    *, quiet: bool = False
+    *, quiet: bool = False, capture_prefix: str | None = None,
+    capture_sink: list | None = None,
 ) -> bool:
     """Wait until `expected` is seen on the wire. `quiet=True` suppresses the
     "handshake wait" intro and the timeout error — pass it from the fast
     connect probe, where a timeout is the expected miss that falls back to
-    the reset path, not an error to surface."""
+    the reset path, not an error to surface.
+
+    `capture_prefix` + `capture_sink`: lines starting with the prefix are
+    appended to the sink instead of being logged as MCU chatter — the one
+    line pump every handshake shares, so payload capture (e.g. the verify
+    block report) doesn't need a diverging copy of this loop."""
     if not quiet:
         log(f"handshake wait     : {expected}", "wait")
     deadline = time.monotonic() + timeout_s
@@ -96,6 +102,10 @@ def _wait_for_line(
             if line == MCU_ERROR:
                 log("MCU ERROR!!", "err")
                 return False
+            if (capture_prefix is not None and capture_sink is not None
+                    and line.startswith(capture_prefix)):
+                capture_sink.append(line)
+                continue
             if line:
                 log(f"MCU: {line}", "info")
         if time.monotonic() > deadline:
@@ -114,28 +124,12 @@ def _wait_verify(
     """Wait for the verify verdict. Returns (ok, blocks_line) where
     blocks_line is the captured ARDUINO_VERIFY_BLOCKS payload on failure
     (None when the sketch predates the feature or on timeout)."""
-    log(f"handshake wait     : {MCU_VERIFY_OK}", "wait")
-    blocks_line = None
-    deadline = time.monotonic() + timeout_s
-    while True:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode(errors="ignore").strip()
-            if line == MCU_VERIFY_OK:
-                log(f"handshake received : {MCU_VERIFY_OK}", "ok")
-                return True, None
-            if line == MCU_ERROR:
-                log("MCU ERROR!!", "err")
-                return False, blocks_line
-            if line.startswith(MCU_VERIFY_BLOCKS_PREFIX):
-                blocks_line = line
-                continue          # capture silently; the diff replaces it
-            if line:
-                log(f"MCU: {line}", "info")
-        if time.monotonic() > deadline:
-            log(f"Timeout after {timeout_s:.1f}s waiting for: {MCU_VERIFY_OK}",
-                "err")
-            return False, blocks_line
-        time.sleep(POLL_SLEEP_S)
+    sink: list[str] = []
+    ok = _wait_for_line(
+        ser, MCU_VERIFY_OK, log, timeout_s,
+        capture_prefix=MCU_VERIFY_BLOCKS_PREFIX, capture_sink=sink,
+    )
+    return ok, (sink[-1] if sink else None)
 
 
 # addrPins[] index → Due pin, for the address bits the block-period heuristic
@@ -197,6 +191,22 @@ def _diagnose_verify_failure(
             s = b
     log(f"區塊比對: {len(bad)}/{n} 個 4KB 區塊不符 → " + ", ".join(ranges),
         "err")
+
+    # All 32 blocks identical means the chip holds one repeating 4 KB
+    # pattern — in practice a chip that never got programmed (still all
+    # 0xFF after erase, or all 0x00). This MUST be checked before the
+    # period heuristic below: identical blocks trivially satisfy every
+    # stride and would misdiagnose as a stuck A16.
+    if all(c == chip[0] for c in chip):
+        blank = zlib.crc32(b"\xFF" * CHUNK_SIZE) & 0xFFFFFFFF
+        what = ("全片仍為 0xFF(erase 後從未寫入)" if chip[0] == blank
+                else "全片為單一重複內容")
+        log(
+            f"診斷: 32 個區塊內容完全相同 — {what} → 寫入路徑問題:檢查 "
+            "WE(D25)/CE(D43)接線與資料線,而非位址線。",
+            "warn",
+        )
+        return
 
     # Address-line aliasing: chip content repeats with period `stride` blocks.
     for stride, bit in ((16, 16), (8, 15), (4, 14)):

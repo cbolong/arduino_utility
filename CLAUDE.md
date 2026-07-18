@@ -63,7 +63,7 @@ Forced shutdown (Disconnect mid-recording) goes through `_live_stop.set()` + `jo
 2. Host sends `ARDUINO_ERASE_TRIGGER`.
 3. Sketch chip-erases, samples first 1 KB == `0xFF`, emits `ARDUINO_READY_TO_RECEIVED_DATA`.
 4. Host pads `firmware.bin` to 128 KB, sends 32 × 4 KB chunks. After each chunk it waits for `ARDUINO_RECEIVED_LINE_DONE`.
-5. Host sends `ARDUINO_VERIFY_REQUEST <crc32_hex>` → sketch sweeps the chip with bitwise CRC32 (~1.3 s for 128 KB) → `ARDUINO_VERIFY_OK` or `ARDUINO_ERROR`. **CRC32 is the primary integrity check; the per-chunk read-back compare in the sketch's program loop is a redundant inner check.**
+5. Host sends `ARDUINO_VERIFY_REQUEST <crc32_hex>` → sketch sweeps the chip with bitwise CRC32 (~1.3 s for 128 KB) → `ARDUINO_VERIFY_OK`, or on mismatch `ARDUINO_VERIFY_BLOCKS <32×8-hex>` (per-4KB-block CRCs, parsed by the host's `_diagnose_verify_failure` into a located diagnosis) followed by `ARDUINO_ERROR`. **CRC32 is the primary end-to-end integrity check; the inner check is per-byte Data# polling in `programChunkData` (the old per-chunk read-back compare was retired). Note the inner check verifies what *arrived*, not what the host *sent* — the chunk stream has no wire-level checksum, so transit corruption is only caught by the final CRC.**
 6. Host sends `ARDUINO_TRANSFER_DONE_SIGNAL` → sketch prints timing report → `ARDUINO_DATA_COMPLETED`.
 
 The 10 s `RECEIVED_DATA_TIMEOUT` in the sketch is a **legacy fallback** for old hosts that didn't send `ARDUINO_TRANSFER_DONE_SIGNAL`. New hosts always send the explicit signal and never hit it.
