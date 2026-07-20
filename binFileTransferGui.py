@@ -22,16 +22,18 @@ from PySide6.QtWidgets import (
 
 import gui_theme as T
 from binFileTransfer_core import (
-    GpioSession, RecordSession, TdbgSession, open_due_link,
+    GpioSession, RecordSession, SgpioSession, TdbgSession, open_due_link,
 )
-from gui_pages import FlashPage, GpioPage, RecordPage, TdbgPage, Worker
+from gui_pages import (
+    FlashPage, GpioPage, RecordPage, SgpioPage, TdbgPage, Worker,
+)
 from gui_widgets import Sidebar
 
 APP_TITLE = "Arduino應用軟體"
 AUTO_DETECT_LABEL = "Auto-detect (Arduino Due Programming Port)"
 DUE_TARGET_VID = 0x2341
 DUE_TARGET_PID = 0x003D
-PAGE_NAMES = ["燒錄 ROM", "GPIO 設定", "TDBG", "波形錄製"]
+PAGE_NAMES = ["燒錄 ROM", "GPIO 設定", "TDBG", "波形錄製", "SGPIO"]
 
 
 def _resource_path(rel: str) -> str:
@@ -61,11 +63,13 @@ class MainWindow(QMainWindow):
         self.gpio_session = None
         self.tdbg_session = None
         self.record_session = None
+        self.sgpio_session = None
         # Page instances are created lazily (see _ensure_page); None until built.
         self.flash_page = None
         self.gpio_page = None
         self.tdbg_page = None
         self.record_page = None
+        self.sgpio_page = None
         self._conn_worker = Worker()
         self.connDoneSig.connect(self._on_connect_done)
         self.disDoneSig.connect(self._on_disconnect_done)
@@ -104,8 +108,9 @@ class MainWindow(QMainWindow):
             lambda: GpioPage(self),
             lambda: TdbgPage(self),
             lambda: RecordPage(self),
+            lambda: SgpioPage(self),
         ]
-        self._pages: list = [None, None, None, None]
+        self._pages: list = [None, None, None, None, None]
         right_lay.addWidget(self.stack, 1)
         outer.addWidget(right, 1)
         self.setCentralWidget(root)
@@ -116,7 +121,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
         self._on_nav(0)   # build + show the first page
 
-    _PAGE_ATTR = ("flash_page", "gpio_page", "tdbg_page", "record_page")
+    _PAGE_ATTR = ("flash_page", "gpio_page", "tdbg_page", "record_page",
+                  "sgpio_page")
 
     @property
     def pages(self) -> list:
@@ -130,7 +136,9 @@ class MainWindow(QMainWindow):
             setattr(self, self._PAGE_ATTR[i], pg)
             self.stack.addWidget(pg)
             # A page built AFTER connect must inherit the live state.
-            if i in (1, 2, 3) and self._connected:
+            # Indexes 1..N are the connectable pages (GPIO/TDBG/RECORD/SGPIO);
+            # 0 is FlashPage, which manages its own connection.
+            if i >= 1 and self._connected:
                 pg.set_connected(True)
         return pg
 
@@ -293,21 +301,29 @@ class MainWindow(QMainWindow):
             self._page_log_cb("tdbg_page"), ser=ser, lock=self._serial_lock)
         self.record_session = RecordSession(
             self._page_log_cb("record_page"), ser=ser, lock=self._serial_lock)
+        self.sgpio_session = SgpioSession(
+            self._page_log_cb("sgpio_page"), ser=ser, lock=self._serial_lock)
         self._connected = True
         self._set_conn("已連線", T.PALETTE["success_dark"])
         self.disconnect_btn.setEnabled(True)
-        for pg in (self.gpio_page, self.tdbg_page, self.record_page):
+        for pg in (self.gpio_page, self.tdbg_page, self.record_page,
+                   self.sgpio_page):
             if pg is not None:
                 pg.set_connected(True)
         self.status("Connected", "ok")
 
-    def set_recording(self, active: bool) -> None:
+    def set_recording(self, active: bool, origin=None) -> None:
+        # A RECORD or SGPIO capture owns the MCU's single interrupt-capture
+        # path, so grey out every OTHER connectable tab while one runs (the
+        # `origin` page stays live so it can manage its own Stop button). The
+        # firmware also refuses a second capture, so this is UX polish over a
+        # hard guard.
         if not self._connected:
             return
-        if self.gpio_page is not None:
-            self.gpio_page.set_connected(not active)
-        if self.tdbg_page is not None:
-            self.tdbg_page.set_connected(not active)
+        for pg in (self.gpio_page, self.tdbg_page, self.record_page,
+                   self.sgpio_page):
+            if pg is not None and pg is not origin:
+                pg.set_connected(not active)
 
     def disconnect_then(self, on_done) -> None:
         if not self._connected:
@@ -316,11 +332,13 @@ class MainWindow(QMainWindow):
             return
         self._set_conn("斷線中…", T.PALETTE["warning_dark"])
         self.disconnect_btn.setEnabled(False)
-        for pg in (self.gpio_page, self.tdbg_page, self.record_page):
+        for pg in (self.gpio_page, self.tdbg_page, self.record_page,
+                   self.sgpio_page):
             if pg is not None:
                 pg.set_connected(False)
-        sessions = [s for s in (self.record_session, self.tdbg_session,
-                                self.gpio_session) if s is not None]
+        sessions = [s for s in (self.sgpio_session, self.record_session,
+                                self.tdbg_session, self.gpio_session)
+                    if s is not None]
         ser = self._ser
 
         def work():
@@ -349,6 +367,7 @@ class MainWindow(QMainWindow):
         self.gpio_session = None
         self.tdbg_session = None
         self.record_session = None
+        self.sgpio_session = None
         self._connected = False
         self._set_conn("未連線", T.PALETTE["danger_dark"])
         self.connect_btn.setEnabled(True)
@@ -363,7 +382,8 @@ class MainWindow(QMainWindow):
         # reader thread, so the daemon stops touching the port before we drop
         # it. Closing only self._ser (as before) could leave that thread
         # reading a closed handle mid-recording.
-        for s in (self.record_session, self.tdbg_session, self.gpio_session):
+        for s in (self.sgpio_session, self.record_session, self.tdbg_session,
+                  self.gpio_session):
             if s is not None:
                 try:
                     s.close()

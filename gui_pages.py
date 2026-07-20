@@ -12,13 +12,13 @@ import threading
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
-    QPushButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 import gui_data as D
 import gui_theme as T
-from binFileTransfer_core import program_firmware
+from binFileTransfer_core import SgpioFraming, program_firmware
 from gui_widgets import (
     Card, LogPane, PinGrid, WaveformView, open_waveform_preview,
 )
@@ -529,7 +529,7 @@ class RecordPage(Page):
             self._stop.setEnabled(True)
             self._add_btn.setEnabled(False)
             self._thumb.setVisible(False)
-            self.app.set_recording(True)
+            self.app.set_recording(True, self)
             for r in self._rows:
                 r.set_combo_enabled(False)
                 r.set_live_state(None)
@@ -576,7 +576,7 @@ class RecordPage(Page):
     def _on_fail(self) -> None:
         self._recording = False
         self._stop.setEnabled(False)
-        self.app.set_recording(False)
+        self.app.set_recording(False, self)
         for r in self._rows:
             r.set_combo_enabled(self._connected)
         self._sync_row_controls()
@@ -614,7 +614,7 @@ class RecordPage(Page):
 
     def _on_stop_done(self, result) -> None:
         self._recording = False
-        self.app.set_recording(False)
+        self.app.set_recording(False, self)
         for r in self._rows:
             r.set_combo_enabled(self._connected)
         self._sync_row_controls()
@@ -652,3 +652,268 @@ class RecordPage(Page):
             ev = [(d, 1 if st.get(p) else 0) for d, st in events]
             traces.append((f"D{p}", ev[0][1] if ev else 0, ev))
         open_waveform_preview(self, "錄製波形", [traces], D.format_us, min_ppu=0.05)
+
+
+# --------------------------------------------------------------------------
+class SgpioPage(Page):
+    """SGPIO (SFF-8485) passive decoder tab.
+
+    Pick the three input pins (SClock / SLoad / SDataOut), set the framing
+    (how the captured bits split into per-drive Activity/Locate/Fault), press
+    Start. The MCU streams a decoded bit frame every time it CHANGES; this
+    page decodes each frame with the same host-side parser the tests pin down
+    (parse_sgpio_frame) and lights the per-drive dots. A frame whose length
+    disagrees with the framing is flagged red — that is the "is the data
+    right?" check surfaced in the UI."""
+    frameSig = Signal(str)          # raw bitstring from the live thread
+    doneSig = Signal(bool, str)     # (ok, action) for start/stop handshakes
+    failSig = Signal()
+
+    def __init__(self, app) -> None:
+        super().__init__(app)
+        self._active = False
+        self._connected = False
+        self._drive_cells: list = []    # per-drive (act, loc, flt, val) labels
+        self.frameSig.connect(self._apply_frame)
+        self.doneSig.connect(self._on_done)
+        self.failSig.connect(self._on_fail)
+
+        lay = self._frame()
+        card = Card("SGPIO 被動解碼")
+
+        # --- pin pickers ---------------------------------------------------
+        pins = QHBoxLayout()
+        self._c_sclk = _pin_combo()
+        self._c_sload = _pin_combo()
+        self._c_sdata = _pin_combo()
+        for lbl, combo in (("SClock", self._c_sclk), ("SLoad", self._c_sload),
+                           ("SDataOut", self._c_sdata)):
+            pins.addWidget(QLabel(lbl))
+            combo.setFixedWidth(150)
+            combo.currentIndexChanged.connect(self._refresh_start)
+            pins.addWidget(combo)
+        pins.addStretch(1)
+        card.body.addLayout(pins)
+
+        # --- framing config ------------------------------------------------
+        fr = QHBoxLayout()
+        self._sp_drives = QSpinBox(); self._sp_drives.setRange(1, 64)
+        self._sp_drives.setValue(4)
+        self._sp_bits = QSpinBox(); self._sp_bits.setRange(1, 8)
+        self._sp_bits.setValue(3)
+        self._sp_header = QSpinBox(); self._sp_header.setRange(0, 64)
+        self._sp_header.setValue(0)
+        self._cb_msb = QCheckBox("MSB first"); self._cb_msb.setChecked(True)
+        self._cb_rising = QCheckBox("SClock 上升沿取樣")
+        self._cb_rising.setChecked(True)
+        self._cb_sload_hi = QCheckBox("SLoad active-high")
+        self._cb_sload_hi.setChecked(True)
+        for lbl, w in (("drives", self._sp_drives), ("bits/drive", self._sp_bits),
+                       ("header bits", self._sp_header)):
+            fr.addWidget(QLabel(lbl))
+            fr.addWidget(w)
+        fr.addWidget(self._cb_msb)
+        fr.addStretch(1)
+        card.body.addLayout(fr)
+        fr2 = QHBoxLayout()
+        fr2.addWidget(self._cb_rising)
+        fr2.addWidget(self._cb_sload_hi)
+        self._frame_lbl = QLabel("每幀 12 bits")
+        self._frame_lbl.setObjectName("Muted")
+        self._sp_drives.valueChanged.connect(self._refresh_frame_len)
+        self._sp_bits.valueChanged.connect(self._refresh_frame_len)
+        self._sp_header.valueChanged.connect(self._refresh_frame_len)
+        fr2.addWidget(self._frame_lbl)
+        fr2.addStretch(1)
+        card.body.addLayout(fr2)
+
+        # --- actions -------------------------------------------------------
+        act = QHBoxLayout()
+        self._start = QPushButton("開始")
+        self._start.setObjectName("accent")
+        self._start.setEnabled(False)
+        self._start.clicked.connect(self._on_start)
+        self._stop = QPushButton("停止")
+        self._stop.setEnabled(False)
+        self._stop.clicked.connect(self._on_stop)
+        clear = QPushButton("清除紀錄")
+        clear.clicked.connect(self.log_pane.clear)
+        act.addWidget(self._start)
+        act.addWidget(self._stop)
+        act.addStretch(1)
+        act.addWidget(clear)
+        card.body.addLayout(act)
+
+        # --- live drive table ---------------------------------------------
+        self._table = QGridLayout()
+        self._table.setHorizontalSpacing(14)
+        self._table.setVerticalSpacing(3)
+        card.body.addLayout(self._table)
+        self._raw_lbl = QLabel("—")
+        self._raw_lbl.setObjectName("Muted")
+        card.body.addWidget(self._raw_lbl)
+
+        lay.addWidget(card)
+        lay.addWidget(self.log_pane, 1)
+        self._rebuild_table(4)
+
+    # -- helpers ------------------------------------------------------------
+    @property
+    def _session(self):
+        return self.app.sgpio_session
+
+    def _framing(self) -> SgpioFraming:
+        return SgpioFraming(
+            num_drives=self._sp_drives.value(),
+            bits_per_drive=self._sp_bits.value(),
+            header_bits=self._sp_header.value(),
+            msb_first=self._cb_msb.isChecked(),
+        )
+
+    def _refresh_frame_len(self) -> None:
+        self._frame_lbl.setText(f"每幀 {self._framing().frame_len} bits")
+
+    def _selected_pins(self):
+        return (_combo_pin(self._c_sclk), _combo_pin(self._c_sload),
+                _combo_pin(self._c_sdata))
+
+    def _rebuild_table(self, num_drives: int) -> None:
+        while self._table.count():
+            item = self._table.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        self._drive_cells = []
+        for col, head in enumerate(("Drive", "A", "L", "F", "value")):
+            h = QLabel(head)
+            h.setObjectName("Muted")
+            self._table.addWidget(h, 0, col)
+        for d in range(num_drives):
+            self._table.addWidget(QLabel(f"D#{d}"), d + 1, 0)
+            dots = []
+            for col in range(1, 4):
+                dot = QLabel("●")
+                dot.setStyleSheet(f"color: {T.PALETTE['text_disabled']};")
+                self._table.addWidget(dot, d + 1, col)
+                dots.append(dot)
+            val = QLabel("—")
+            self._table.addWidget(val, d + 1, 4)
+            self._drive_cells.append((dots[0], dots[1], dots[2], val))
+
+    def set_connected(self, connected: bool) -> None:
+        self._connected = connected
+        if self._active and not connected:
+            # Dropped mid-decode — reset UI (session already torn down by App).
+            self._active = False
+            self._stop.setEnabled(False)
+        for w in (self._c_sclk, self._c_sload, self._c_sdata, self._sp_drives,
+                  self._sp_bits, self._sp_header, self._cb_msb,
+                  self._cb_rising, self._cb_sload_hi):
+            w.setEnabled(connected and not self._active)
+        self._refresh_start()
+
+    def _refresh_start(self) -> None:
+        sc, sl, sd = self._selected_pins()
+        ready = (self._connected and not self._active
+                 and None not in (sc, sl, sd) and len({sc, sl, sd}) == 3)
+        self._start.setEnabled(ready)
+
+    # -- start / frame / stop ----------------------------------------------
+    def _on_start(self) -> None:
+        if self._session is None or self._active:
+            return
+        sc, sl, sd = self._selected_pins()
+        if None in (sc, sl, sd) or len({sc, sl, sd}) != 3:
+            self.log("請選三支不同的腳位。", "warn")
+            return
+        framing = self._framing()
+        rising = self._cb_rising.isChecked()
+        sload_hi = self._cb_sload_hi.isChecked()
+        try:
+            self._active = True
+            self._start.setEnabled(False)
+            self._stop.setEnabled(True)
+            self.set_connected(True)   # disables the config widgets
+            self.app.set_recording(True, self)   # grey out the other tabs
+            self._rebuild_table(framing.num_drives)
+            self.app.status("SGPIO decoding…", "warn")
+        except Exception as e:
+            self.log(f"SGPIO start setup failed: {e}", "err")
+            self.failSig.emit()
+            return
+
+        self._live_framing = framing
+
+        def cmd():
+            sess = self._session
+            if sess is None:
+                self.failSig.emit()
+                return
+            try:
+                ok = sess.start(
+                    sc, sl, sd, framing,
+                    sample_rising=rising, sload_active_high=sload_hi,
+                    on_frame=lambda b: self.frameSig.emit(b))
+            except Exception as e:
+                self.log(f"SGPIO start exception: {e}", "err")
+                self.failSig.emit()
+                return
+            self.doneSig.emit(bool(ok), "start")
+
+        self.enqueue(cmd)
+
+    def _apply_frame(self, bits: str) -> None:
+        f = getattr(self, "_live_framing", None) or self._framing()
+        self._raw_lbl.setText(f"frame ({len(bits)} bits): {bits}")
+        try:
+            from binFileTransfer_core import parse_sgpio_frame
+            drives = parse_sgpio_frame(bits, f)
+        except ValueError:
+            # Structural mismatch — flag it instead of decoding garbage.
+            self._raw_lbl.setStyleSheet(f"color: {T.PALETTE['danger']};")
+            self.log(f"幀長 {len(bits)} != 預期 {f.frame_len} — 檢查 framing / "
+                     "SLoad 設定", "err")
+            return
+        self._raw_lbl.setStyleSheet("")
+        for cell, drv in zip(self._drive_cells, drives):
+            act, loc, flt, val = cell
+            for dot, key in ((act, "activity"), (loc, "locate"), (flt, "fault")):
+                on = drv.get(key, False)
+                color = T.PALETTE["success"] if on else T.PALETTE["text_disabled"]
+                dot.setStyleSheet(f"color: {color};")
+            val.setText(f"{drv['bits']} ({drv['value']})")
+
+    def _on_stop(self) -> None:
+        if not self._active:
+            return
+        self._stop.setEnabled(False)
+        self.app.status("SGPIO stopping…", "warn")
+
+        def cmd():
+            sess = self._session
+            ok = sess.stop() if sess is not None else False
+            self.doneSig.emit(bool(ok), "stop")
+
+        self.enqueue(cmd)
+
+    def _on_done(self, ok: bool, action: str) -> None:
+        if action == "start" and not ok:
+            self._on_fail()
+            return
+        if action == "stop":
+            self._active = False
+            self.app.set_recording(False, self)   # re-enable the other tabs
+            self.set_connected(self._connected)
+            self.app.status("SGPIO stopped" if ok else "SGPIO stop error",
+                            "ok" if ok else "err")
+
+    def _on_fail(self) -> None:
+        self._active = False
+        self._stop.setEnabled(False)
+        self.app.set_recording(False, self)       # re-enable the other tabs
+        self.set_connected(self._connected)
+        self.app.status("SGPIO start failed", "err")
+
+    def _on_worker_failure(self, detail: str, tb: str) -> None:
+        if self._active:
+            self._on_fail()

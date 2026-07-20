@@ -78,7 +78,26 @@
 | RECORD_OVERFLOW | host log warn,錄製繼續(MCU 停累積) | HIL(需 >4096 邊緣) |
 | 錄製中按斷線 | live thread 收斂、port 正常釋放 | HIL |
 
-## 6. 波形預覽
+## 6. SGPIO 被動解碼
+
+| 情境 | 預期行為 | 驗證 |
+|---|---|---|
+| 標準幀解碼(N drives × 3 bits) | 每 drive 正確 Activity/Locate/Fault | 自動 `test_sgpio G1` |
+| 幀長不符 framing | `sgpio_frame_valid` False + parse raise + UI 標紅 | 自動 G2、G10 |
+| 非二進位字元 | 拒絕 | 自動 G3 |
+| header bits | 前導 bits 跳過,drive 欄位不錯位 | 自動 G4 |
+| MSB/LSB order | 翻轉欄位顯著性 | 自動 G5 |
+| bits/drive ≠ 3 | 只給 value,無具名欄位 | 自動 G6 |
+| framing 設定不合理 | `validate_config` 擋下 | 自動 G7 |
+| session start→frame→stop | fake serial 全回合 | 自動 G8 |
+| 腳位重複 / 超範圍 / 壞 framing | 本地拒絕不上線 | 自動 G9 |
+| GUI 分頁(第 5 項)即時解碼 + 標紅 + 停止 | offscreen 全流程 | 自動 G10 |
+| RECORD/SGPIO 互斥 | firmware 雙向拒絕 + GUI 灰化 sibling 分頁 | firmware HIL;GUI 灰化=自動(set_recording origin) |
+| **真實 SGPIO 來源解碼** | 接 HBA/backplane → drive 表格對應實際 LED | HIL |
+| **TDBG loopback 自測** | TDBG 產生已知 SGPIO 圖樣 → 接回 SGPIO 3 腳 → 解碼應等於送出 | HIL(免真 initiator) |
+| 電平/共地 | 確認 3.3V、共地;非 3.3V 加 shifter | HIL |
+
+## 7. 波形預覽
 
 | 情境 | 預期行為 | 驗證 |
 |---|---|---|
@@ -89,7 +108,7 @@
 | 縮圖 | 無軌線、點擊開預覽 | 自動 W6 |
 | 放大後拖曳平移 | 左鍵拖 = 捲動,游標手勢回饋 | 自動 W7 |
 
-## 7. Worker / 基礎設施
+## 8. Worker / 基礎設施
 
 | 情境 | 預期行為 | 驗證 |
 |---|---|---|
@@ -110,4 +129,5 @@
 2. GPIO:任一腳圈圈讀取、Read All、自動讀取 1s。
 3. TDBG:preset 1 用邏輯分析儀看 64-bit pattern;校準 pattern 看四組週期。
 4. RECORD:錄 D22 手動切 HIGH/LOW → 預覽看方波 → 放大/拖曳。
-5. 拔線/插回、按 RESET、再連線 — 全程 UI 不卡死。
+5. SGPIO:接三支腳(SClock/SLoad/SDataOut)→ 開始 → drive 表格對應實際燈號;或用 TDBG loopback 自測。
+6. 拔線/插回、按 RESET、再連線 — 全程 UI 不卡死。

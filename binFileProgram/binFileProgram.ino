@@ -1154,9 +1154,19 @@ static void (* const recordIsrs[RECORD_MAX_PINS])() = {
   recordIsr0, recordIsr1, recordIsr2, recordIsr3,
 };
 
+// Defined with the SGPIO block further down; forward-declared here so the
+// RECORD start can refuse while an SGPIO capture owns the interrupt.
+extern volatile bool sgpioActive;
+
 void handleRecordStart(const String& cmd) {
   if (recordActive) {
     Serial.println("RECORD_ERROR already_active");
+    return;
+  }
+  if (sgpioActive) {
+    // Both features drive attachInterrupt; only one interrupt-capture mode
+    // at a time.
+    Serial.println("RECORD_ERROR sgpio_active");
     return;
   }
   // Parse pin tokens after the command word.
@@ -1255,6 +1265,159 @@ void handleRecordStop() {
   } else {
     Serial.println("RECORD_DONE 0000");
   }
+}
+
+
+// ----------------------------------------------------------------------------
+// SGPIO (SFF-8485) passive decoder — the "SGPIO" host tab / SgpioSession.
+//
+// Taps three signals as INPUTS (never drives the bus): SClock (interrupt),
+// SLoad (frame delimiter), SDataOut (data sampled per clock). On each SClock
+// edge the ISR samples one SDataOut bit; SLoad marks the frame boundary. A
+// completed frame is ping-pong latched for sgpioPump() (idle loop) to emit as
+//   SGPIO_FRAME <bitstring>          // ASCII '0'/'1', first char = first bit
+// only when the content CHANGES, plus a periodic heartbeat. Frame SEMANTICS
+// (bits→drives) live on the host; the MCU just captures raw bits.
+//
+// Wire: SGPIO_START <sclk> <sload> <sdata> <rising 0|1> <sloadActiveHigh 0|1>
+//       <frameLen>  ->  SGPIO_STARTED | SGPIO_ERROR <why>
+//       SGPIO_STOP  ->  SGPIO_STOPPED
+//
+// Framing model: when SLoad is sampled ASSERTED at a clock edge, the bits
+// accumulated so far form one frame and that edge's bit starts the next. The
+// host validates each frame's length against its framing, so an off-by-one
+// convention shows up as a flagged frame (not silent mis-decode) — tune the
+// polarity / edge settings in the GUI if so.
+// ----------------------------------------------------------------------------
+
+#define SGPIO_MAX_FRAME_BITS 256      // 64 drives x 3 + header headroom
+
+// Non-static (external linkage) so handleRecordStart, which is defined above
+// this block, can forward-declare and check it. See the extern near RECORD.
+volatile bool sgpioActive = false;
+static uint8_t  sgpioSclkPin = 0, sgpioSloadPin = 0, sgpioSdataPin = 0;
+static bool     sgpioSloadActiveHigh = true;
+static uint16_t sgpioFrameLen = 0;    // informational; host owns semantics
+
+// Ping-pong frame buffers: ISR fills sgpioWrIdx, latches a completed frame
+// into sgpioReadyIdx for the pump, then flips to the other buffer. The pump
+// resets sgpioReadyIdx to -1 once consumed, so the ISR never overwrites a
+// frame the pump is still reading.
+static char     sgpioBuf[2][SGPIO_MAX_FRAME_BITS + 1];
+static volatile uint8_t  sgpioWrIdx = 0;
+static volatile uint16_t sgpioBitCount = 0;
+static volatile int8_t   sgpioReadyIdx = -1;
+static volatile uint16_t sgpioReadyLen = 0;
+static volatile bool     sgpioOverrun = false;
+
+static char     sgpioLastFrame[SGPIO_MAX_FRAME_BITS + 1];
+static uint16_t sgpioLastLen = 0;
+static unsigned long sgpioLastHeartbeatMs = 0;
+#define SGPIO_HEARTBEAT_MS 200
+
+static void sgpioIsr() {
+  if (!sgpioActive) return;
+  char sdata = digitalRead(sgpioSdataPin) ? '1' : '0';
+  bool sload = (digitalRead(sgpioSloadPin) == (sgpioSloadActiveHigh ? HIGH : LOW));
+  if (sload && sgpioBitCount > 0) {
+    if (sgpioReadyIdx < 0) {
+      sgpioBuf[sgpioWrIdx][sgpioBitCount] = '\0';
+      sgpioReadyLen = sgpioBitCount;
+      sgpioReadyIdx = sgpioWrIdx;
+      sgpioWrIdx ^= 1;                 // fill the other buffer next
+    } else {
+      sgpioOverrun = true;            // pump hasn't drained the last frame
+    }
+    sgpioBitCount = 0;
+  }
+  if (sgpioBitCount < SGPIO_MAX_FRAME_BITS) {
+    sgpioBuf[sgpioWrIdx][sgpioBitCount++] = sdata;
+  }
+}
+
+// Called from the pre-erase idle loop while sgpioActive. Emits a frame only
+// when it differs from the last one sent, plus a keep-alive heartbeat.
+void sgpioPump() {
+  if (!sgpioActive) return;
+  if (sgpioReadyIdx >= 0) {
+    int8_t idx = sgpioReadyIdx;        // stable: ISR won't relatch until -1
+    uint16_t len = sgpioReadyLen;
+    if (len != sgpioLastLen || memcmp(sgpioBuf[idx], sgpioLastFrame, len) != 0) {
+      Serial.print("SGPIO_FRAME ");
+      Serial.println(sgpioBuf[idx]);
+      memcpy(sgpioLastFrame, sgpioBuf[idx], len);
+      sgpioLastFrame[len] = '\0';
+      sgpioLastLen = len;
+    }
+    sgpioReadyIdx = -1;                // consumed → ISR may latch the next
+  }
+  unsigned long now = millis();
+  if ((now - sgpioLastHeartbeatMs) >= SGPIO_HEARTBEAT_MS) {
+    sgpioLastHeartbeatMs = now;
+    if (sgpioLastLen > 0) {
+      Serial.print("SGPIO_FRAME ");
+      Serial.println(sgpioLastFrame);
+    }
+    if (sgpioOverrun) {
+      Serial.println("SGPIO_OVERRUN");
+      sgpioOverrun = false;
+    }
+  }
+}
+
+void handleSgpioStart(const String& cmd) {
+  if (sgpioActive) { Serial.println("SGPIO_ERROR already_active"); return; }
+  if (recordActive) { Serial.println("SGPIO_ERROR record_active"); return; }
+  // Parse: SGPIO_START <sclk> <sload> <sdata> <rising> <activehigh> <framelen>
+  int vals[6];
+  uint8_t n = 0;
+  int p = cmd.indexOf(' ');
+  while (p >= 0 && n < 6) {
+    int q = cmd.indexOf(' ', p + 1);
+    String tok = (q >= 0) ? cmd.substring(p + 1, q) : cmd.substring(p + 1);
+    tok.trim();
+    if (tok.length() == 0) break;
+    vals[n++] = tok.toInt();
+    if (q < 0) break;
+    p = q;
+  }
+  if (n < 6) { Serial.println("SGPIO_ERROR bad_args"); return; }
+  int sclk = vals[0], sload = vals[1], sdata = vals[2];
+  for (int pin : {sclk, sload, sdata}) {
+    if (pin < 0 || pin > 65) { Serial.println("SGPIO_ERROR bad_pin"); return; }
+  }
+  if (sclk == sload || sclk == sdata || sload == sdata) {
+    Serial.println("SGPIO_ERROR dup_pin"); return;
+  }
+  if (vals[5] < 1 || vals[5] > SGPIO_MAX_FRAME_BITS) {
+    Serial.println("SGPIO_ERROR bad_framelen"); return;
+  }
+  sgpioSclkPin = (uint8_t)sclk;
+  sgpioSloadPin = (uint8_t)sload;
+  sgpioSdataPin = (uint8_t)sdata;
+  sgpioSloadActiveHigh = (vals[4] != 0);
+  sgpioFrameLen = (uint16_t)vals[5];
+  pinMode(sgpioSclkPin, INPUT);
+  pinMode(sgpioSloadPin, INPUT);
+  pinMode(sgpioSdataPin, INPUT);
+  sgpioWrIdx = 0;
+  sgpioBitCount = 0;
+  sgpioReadyIdx = -1;
+  sgpioOverrun = false;
+  sgpioLastLen = 0;
+  sgpioLastFrame[0] = '\0';
+  sgpioLastHeartbeatMs = millis();
+  sgpioActive = true;
+  attachInterrupt(digitalPinToInterrupt(sgpioSclkPin), sgpioIsr,
+                  (vals[3] != 0) ? RISING : FALLING);
+  Serial.println("SGPIO_STARTED");
+}
+
+void handleSgpioStop() {
+  if (!sgpioActive) { Serial.println("SGPIO_ERROR not_active"); return; }
+  detachInterrupt(digitalPinToInterrupt(sgpioSclkPin));
+  sgpioActive = false;
+  Serial.println("SGPIO_STOPPED");
 }
 
 
@@ -1367,9 +1530,10 @@ void setup() {
   // command (single-pin set/read). GPIO commands keep the wait open;
   // strEraseTrigger breaks out and proceeds to chip erase + program.
   while (true) {
-    // Record mode keeps a heartbeat going in the background while we
+    // Record / SGPIO modes keep their background streaming going while we
     // sit here waiting for the next command line.
     recordPump();
+    sgpioPump();
 
     if (Serial.available() > 0) {
       String input = Serial.readStringUntil('\n');
@@ -1404,12 +1568,16 @@ void setup() {
         handleRecordStart(input);
       } else if (input == "RECORD_STOP") {
         handleRecordStop();
+      } else if (input.startsWith("SGPIO_START")) {
+        handleSgpioStart(input);
+      } else if (input == "SGPIO_STOP") {
+        handleSgpioStop();
       } else if (input == "ARDUINO_PING") {
         // Fast-connect probe: host opens the port with DTR held low (no
         // bootloader reset) and pings to check whether a sketch is already
-        // running. Only reply when not mid-RECORD; otherwise the stray
-        // ARDUINO_ERASE_READY would land in the host's live-reader thread.
-        if (!recordActive) {
+        // running. Only reply when idle; a stray ARDUINO_ERASE_READY during
+        // RECORD / SGPIO streaming would land in the host's live reader.
+        if (!recordActive && !sgpioActive) {
           Serial.println(strEraseReady);
         }
       }

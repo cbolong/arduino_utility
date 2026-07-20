@@ -1480,3 +1480,260 @@ class RecordSession(_Session):
             self._log(f"blob decode error: {e}", "err")
             return None
         return list(self._pins), events
+
+
+# ---------------------------------------------------------------------------
+# SGPIO (SFF-8485) passive decode — the "SGPIO" GUI tab and SgpioSession.
+#
+# The Due taps three of the four SGPIO signals as INPUTS (it never drives the
+# bus — this is a passive decoder / sniffer, not a responding target):
+#   SClock    — sample clock (interrupt source on the MCU)
+#   SLoad     — frame delimiter (marks the latch boundary)
+#   SDataOut  — the serial data stream from the initiator, sampled per clock
+# (SDataIn is left untouched.)
+#
+# The MCU captures the bits of one SLoad-delimited frame and, only when the
+# frame content CHANGES (SGPIO state is mostly static LED levels), sends
+#   SGPIO_FRAME <bitstring>
+# where bitstring is ASCII '0'/'1' in sample order (first char = first bit
+# sampled after the frame boundary). Frames are tiny (drives x bits_per_drive,
+# typically 12-96 bits) so ASCII is both ample for 115200 and human-readable
+# in the log — exactly what you want for "is the data right?". The framing
+# SEMANTICS (how those bits split into per-drive fields) live entirely on the
+# host so they can change without reflashing.
+# ---------------------------------------------------------------------------
+
+import dataclasses
+
+SGPIO_MAX_DRIVES = 64           # frame ceiling; well past any real backplane
+MCU_SGPIO_STARTED = "SGPIO_STARTED"
+MCU_SGPIO_FRAME_PREFIX = "SGPIO_FRAME"
+MCU_SGPIO_STOPPED = "SGPIO_STOPPED"
+MCU_SGPIO_ERROR_PREFIX = "SGPIO_ERROR"
+HOST_SGPIO_STOP_CMD = b"SGPIO_STOP\n"
+
+# SFF-8485 per-drive convention: 3 bits, in order Activity / Locate / Fault.
+SGPIO_FIELD_NAMES = ("activity", "locate", "fault")
+
+
+@dataclasses.dataclass(frozen=True)
+class SgpioFraming:
+    """How a captured bit frame splits into per-drive fields. Everything the
+    host needs to turn a raw SGPIO_FRAME bitstring into meaning — all of it
+    user-editable in the GUI, none of it baked into the firmware.
+
+    A frame is `header_bits` leading bits (vendor/reserved, skipped) followed
+    by `num_drives` groups of `bits_per_drive` bits. `msb_first` picks whether
+    the first sampled bit of a drive's group is its most- or least-significant
+    field. For the SFF-8485 default (3 bits) the fields are named
+    Activity / Locate / Fault in significance order.
+    """
+    num_drives: int = 4
+    bits_per_drive: int = 3
+    header_bits: int = 0
+    msb_first: bool = True
+
+    @property
+    def frame_len(self) -> int:
+        return self.header_bits + self.num_drives * self.bits_per_drive
+
+    def validate_config(self) -> str | None:
+        """Return an error string if the framing itself is nonsensical, else
+        None. Guards the GUI/API against a config that can never match."""
+        if not (1 <= self.num_drives <= SGPIO_MAX_DRIVES):
+            return f"num_drives {self.num_drives} out of range (1..{SGPIO_MAX_DRIVES})"
+        if not (1 <= self.bits_per_drive <= 8):
+            return f"bits_per_drive {self.bits_per_drive} out of range (1..8)"
+        if self.header_bits < 0:
+            return f"header_bits {self.header_bits} negative"
+        return None
+
+
+def sgpio_frame_valid(bitstring: str, framing: SgpioFraming) -> bool:
+    """True iff `bitstring` is exactly the expected length and is pure 0/1.
+
+    This is the structural "is the data right?" check: the initiator clocks a
+    fixed number of bits between every pair of SLoad pulses, so a frame whose
+    length disagrees with the framing means a sampling glitch, a wrong SLoad
+    polarity/edge setting, or a framing mismatch — never valid data."""
+    return (
+        len(bitstring) == framing.frame_len
+        and bitstring != ""
+        and all(c in "01" for c in bitstring)
+    )
+
+
+def parse_sgpio_frame(bitstring: str, framing: SgpioFraming) -> list[dict]:
+    """Decode one SGPIO frame bitstring into a list of per-drive dicts.
+
+    Each dict: {"drive": i, "bits": "011", "value": 3} plus, when
+    bits_per_drive == 3, the named booleans activity/locate/fault. Raises
+    ValueError on a structurally invalid frame (mirrors parse_record_blob) so
+    callers can't silently decode misaligned garbage."""
+    if not sgpio_frame_valid(bitstring, framing):
+        raise ValueError(
+            f"frame length {len(bitstring)} != expected {framing.frame_len} "
+            f"(or non-binary chars)"
+        )
+    out: list[dict] = []
+    body = bitstring[framing.header_bits:]
+    w = framing.bits_per_drive
+    for d in range(framing.num_drives):
+        group = body[d * w:(d + 1) * w]
+        # Significance order: msb_first means group[0] is the MSB.
+        ordered = group if framing.msb_first else group[::-1]
+        value = int(ordered, 2)
+        entry = {"drive": d, "bits": group, "value": value}
+        if w == 3:
+            # ordered is [MSB..LSB]; map to Activity/Locate/Fault in that order.
+            for name, ch in zip(SGPIO_FIELD_NAMES, ordered):
+                entry[name] = ch == "1"
+        out.append(entry)
+    return out
+
+
+class SgpioSession(_Session):
+    """Passive SGPIO decode session. Same lifecycle shape as RecordSession
+    but far simpler: no binary blob, just a text SGPIO_FRAME stream the live
+    thread dispatches to `on_frame(bitstring)`.
+
+    Workflow:
+        s = SgpioSession(log, ser=..., lock=...)
+        s.start(sclock, sload, sdataout, framing,
+                on_frame=lambda bits: ...)     # fires on each changed frame
+        # ...
+        s.stop()
+    """
+
+    def __init__(
+        self,
+        log: LogCallback,
+        *,
+        port: str | None = None,
+        handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+        ser: "serial.Serial | None" = None,
+        lock=None,
+    ) -> None:
+        super().__init__(
+            log, port=port, handshake_timeout_s=handshake_timeout_s,
+            ser=ser, lock=lock,
+        )
+        self._on_frame = None
+        self._live_thread: threading.Thread | None = None
+        self._live_stop = threading.Event()
+        self._pins: tuple[int, int, int] = (0, 0, 0)
+
+    def close(self) -> None:
+        self._live_stop.set()
+        if self._live_thread is not None:
+            self._live_thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
+            if self._live_thread.is_alive():
+                self._log("SGPIO live thread did not exit within 2s", "warn")
+            self._live_thread = None
+        super().close()
+
+    def start(
+        self,
+        sclock: int,
+        sload: int,
+        sdataout: int,
+        framing: SgpioFraming,
+        *,
+        sample_rising: bool = True,
+        sload_active_high: bool = True,
+        on_frame=None,
+    ) -> bool:
+        if not self.is_open:
+            self._log("SGPIO session not open.", "err")
+            return False
+        pins = (sclock, sload, sdataout)
+        if len(set(pins)) != 3:
+            self._log(f"SGPIO pins must be distinct: {pins}", "err")
+            return False
+        for p in pins:
+            if not (0 <= p <= 65):
+                self._log(f"bad SGPIO pin: {p}", "err")
+                return False
+        cfg_err = framing.validate_config()
+        if cfg_err:
+            self._log(f"SGPIO framing invalid: {cfg_err}", "err")
+            return False
+
+        self._pins = pins
+        self._on_frame = on_frame
+        self._live_stop.clear()
+
+        # The MCU only needs the capture knobs (pins, edge, SLoad polarity).
+        # frame_len is passed so the firmware knows how many bits a frame
+        # holds without having to infer it — the host owns the semantics.
+        cmd = (f"SGPIO_START {sclock} {sload} {sdataout} "
+               f"{1 if sample_rising else 0} {1 if sload_active_high else 0} "
+               f"{framing.frame_len}")
+        self._log(f"send: {cmd}", "info")
+        self._ser.write(f"{cmd}\n".encode("UTF-8"))
+
+        reply = _read_line(self._ser, self._log, COMMAND_TIMEOUT_S)
+        if reply != MCU_SGPIO_STARTED:
+            if reply and reply.startswith(MCU_SGPIO_ERROR_PREFIX):
+                self._log(f"recv: {reply}", "err")
+            else:
+                self._log(
+                    f"recv: {reply or '(no reply)'} (expected SGPIO_STARTED)",
+                    "err")
+            return False
+        self._log(f"recv: {reply}", "ok")
+
+        self._live_thread = threading.Thread(
+            target=self._live_loop, name="SgpioLive", daemon=True,
+        )
+        self._live_thread.start()
+        return True
+
+    def _live_loop(self) -> None:
+        """Read SGPIO_FRAME lines while active, dispatch each to on_frame.
+        Non-frame lines are logged; SGPIO_STOPPED (or _live_stop) ends it."""
+        while not self._live_stop.is_set():
+            line = _read_line(self._ser, self._log, PLAY_WAIT_SLICE_S,
+                              quiet=True)
+            if line is None:
+                continue
+            if line.startswith(MCU_SGPIO_FRAME_PREFIX):
+                parts = line.split()
+                if len(parts) >= 2 and self._on_frame is not None:
+                    try:
+                        self._on_frame(parts[1])
+                    except Exception as e:
+                        self._log(f"on_frame callback error: {e}", "warn")
+                continue
+            if line == MCU_SGPIO_STOPPED:
+                return
+            if line:
+                self._log(f"recv: {line}", "info")
+
+    def stop(self) -> bool:
+        """Stop decoding. Returns True on a clean SGPIO_STOPPED handshake."""
+        if not self.is_open:
+            self._log("SGPIO session not open.", "err")
+            return False
+        # Wind down the live reader first so it doesn't race us for the
+        # SGPIO_STOPPED line, then do the stop handshake on this thread.
+        self._live_stop.set()
+        if self._live_thread is not None:
+            self._live_thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
+            self._live_thread = None
+
+        self._log("send: SGPIO_STOP", "info")
+        self._ser.write(HOST_SGPIO_STOP_CMD)
+        # Drain up to the ack; frames may still be buffered ahead of it.
+        deadline = time.monotonic() + COMMAND_TIMEOUT_S
+        while time.monotonic() < deadline:
+            line = _read_line(self._ser, self._log, PLAY_WAIT_SLICE_S,
+                              quiet=True)
+            if line is None:
+                continue
+            if line == MCU_SGPIO_STOPPED:
+                self._log("recv: SGPIO_STOPPED", "ok")
+                return True
+            # ignore trailing frames / chatter while draining to the ack
+        self._log("timeout waiting for SGPIO_STOPPED", "err")
+        return False

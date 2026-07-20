@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A utility that programs SST39xF010-family parallel NOR flash chips using an **Arduino Due** as the bit-banged programmer. The PDF datasheet is in `spec/`.
 
-- `binFileProgram/binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol, a TDBG waveform-replay protocol (load captured pattern into RAM, play on a chosen pin via DWT timing), and a RECORD live-capture protocol (interrupt-driven multi-pin recorder, 1–4 pins, 4096 events × 5 bytes RAM).
+- `binFileProgram/binFileProgram.ino` — sketch on the Due. Drives 19 address pins, 8 data pins, CE/OE/WE. Also exposes a single-pin GPIO debug protocol, a TDBG waveform-replay protocol (load captured pattern into RAM, play on a chosen pin via DWT timing), a RECORD live-capture protocol (interrupt-driven multi-pin recorder, 1–4 pins, 4096 events × 5 bytes RAM), and an SGPIO passive decoder (SFF-8485; taps SClock/SLoad/SDataOut as inputs, decodes frames, streams changed frames to the host).
 - `binFileTransfer_core.py` — host-side library. All handshake logic, port detection, timeout handling, CRC32 verify, `GpioSession`, `TdbgSession`, `RecordSession`, `parse_acute_txt`, `parse_record_blob` live here. The two front-ends are thin shells.
 - `binFileTransfer.py` — CLI front-end (argparse around `core.program_firmware()`). No TDBG/RECORD sub-commands yet; `TdbgSession` / `RecordSession` are library-only.
 - `binFileTransferGui.py` — **PySide6/Qt** GUI front-end (rewritten from Tkinter). Dark left sidebar nav + light card-based content area, blue accent. Four pages: `燒錄 ROM` (flash), `GPIO 設定` (manual pin poker with per-row read dot + Read All + auto-read timer), `TDBG` (pin picker + three one-click preset waveforms TDBG1/2/3 via `TDBG_PRESET`), `波形錄製` (live multi-pin recorder with fit-to-width waveform preview: zoom toolbar, HIGH/LOW rails, drag-pan). Split across sibling modules: `gui_theme.py` (QSS stylesheet + the `PALETTE` colour dict), `gui_widgets.py` (`Sidebar` / `Card` / `LogPane` / `PinRow` / `PinGrid`; re-exports the waveform widgets), `gui_waveform.py` (QPainter `WaveformView` + the shared `open_waveform_preview` dialog), `gui_worker.py` (the threaded `Worker` + `Page` base with the `_on_worker_failure` reset hook), `gui_pages.py` (the four page classes), and `gui_data.py` (flash-pin constants, `TDBG_PIN_LABELS`, `format_us`). `binFileTransferGui.py` itself is the `QMainWindow` + the shared-serial connection manager. `binFileTransfer_core.py` is shared by CLI and GUI.
@@ -55,7 +55,7 @@ Forced shutdown (Disconnect mid-recording) goes through `_live_stop.set()` + `jo
 
 ## Architecture: protocol coupling
 
-`binFileProgram/binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **four** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG, RECORD). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
+`binFileProgram/binFileProgram.ino` and `binFileTransfer_core.py` are tightly coupled by **five** string-based serial protocols at 115200 8N1 (Flash, GPIO, TDBG, RECORD, SGPIO). Both sides must change together — the host has no version negotiation, mismatched constants just timeout.
 
 ### Flash flow (8 strings, primary path)
 
@@ -123,6 +123,18 @@ Implementation details that look like they could be simplified but can't:
 2. **`recordCurrentMask` and `recordPrevCycles` are `volatile`** — they cross the ISR/loop boundary. Reads from `recordPump` are racy against ISR writes but the values are single bytes / 32-bit aligned words so torn reads aren't possible on Cortex-M3.
 3. **Same `tdbgCrc16` reused for the blob.** No need for a separate CRC implementation — the polynomial choice is documented once and validated by the host's import-time self-test.
 
+### SGPIO flow (used by `SGPIO` tab and `core.SgpioSession`)
+
+Passive SFF-8485 decoder — the Due taps three signals as INPUTS and never drives the bus (RX-only; SDataIn is untouched). Same pre-erase gating as GPIO/TDBG/RECORD. Wire format:
+
+- `SGPIO_START <sclk> <sload> <sdata> <rising 0|1> <sloadActiveHigh 0|1> <frameLen>` → MCU `attachInterrupt` on SClock (RISING/FALLING per arg) → `SGPIO_STARTED` (or `SGPIO_ERROR <why>`)
+- Decoding: `sgpioIsr()` samples one SDataOut bit per SClock edge; when SLoad is sampled asserted, the accumulated bits form one frame (ping-pong buffered) and that edge's bit starts the next frame. `sgpioPump()` (idle loop) emits `SGPIO_FRAME <bitstring>` (ASCII `0`/`1`, first char = first bit sampled) **only when the frame content changes**, plus a ~200 ms heartbeat. Buffer contention (pump too slow) → `SGPIO_OVERRUN`.
+- `SGPIO_STOP` → detach interrupt → `SGPIO_STOPPED`.
+
+Frame **semantics live entirely on the host** — the MCU captures raw bits; `parse_sgpio_frame(bitstring, SgpioFraming)` splits them into per-drive Activity/Locate/Fault. `sgpio_frame_valid()` is the structural "is the data right?" check (length must equal `header_bits + num_drives × bits_per_drive`). All framing is GUI-editable, so a vendor variant or an off-by-one SLoad convention is a settings change, not a reflash — a wrong length is *flagged*, never silently mis-decoded.
+
+RECORD and SGPIO are mutually exclusive (both own `attachInterrupt`): each `handle*Start` refuses while the other is active (`sgpioActive` is non-static + forward-declared before `handleRecordStart` so the RECORD-side guard compiles despite the .ino ordering), and the GUI greys out the sibling capture tabs via `App.set_recording(active, origin=<page>)`.
+
 ### Constants that must stay in sync
 
 | Constant | `.ino` | `binFileTransfer_core.py` |
@@ -143,6 +155,9 @@ Implementation details that look like they could be simplified but can't:
 | RECORD buffer cap | `RECORD_MAX_EVENTS` (4096) | `RECORD_MAX_EVENTS` |
 | RECORD event format | `recordBuf` packs `uint32_le delta_us + uint8 mask` | `parse_record_blob()` uses `struct.unpack_from('<IB', ...)` |
 | RECORD pin cap | `RECORD_MAX_PINS` (4) | `RECORD_MAX_PINS` |
+| SGPIO strings | inline literals in `handleSgpioStart/Stop` / `sgpioPump` | `MCU_SGPIO_*` constants in `SgpioSession` |
+| SGPIO start args | `SGPIO_START <sclk> <sload> <sdata> <rising> <activehigh> <frameLen>` order | same order built in `SgpioSession.start` |
+| SGPIO frame cap | `SGPIO_MAX_FRAME_BITS` (256) | `SGPIO_MAX_DRIVES` (64) bounds the GUI |
 
 If you change a string, grep both files. The CLI sets `FILE_NAME = "firmware.bin"` as the only host-side default the core itself doesn't know.
 
