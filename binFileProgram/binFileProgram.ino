@@ -239,6 +239,16 @@ void programChunkData(uint32_t chunk) {
     uint32_t targetAddr = (uint32_t)i + (uint32_t)addr;
     uint8_t targetData = buffer[i];
 
+    // 0xFF needs no programming: this flow ALWAYS runs after doChipErase(),
+    // so every cell is already 0xFF, and programming 0xFF clears no bits by
+    // definition. Skipping saves the 4-cycle command + Data#-poll per byte —
+    // ~18 s on a 108 KB image whose tail is 0xFF padding. The final CRC32
+    // sweep still reads these addresses, so an incomplete erase (cell not
+    // actually 0xFF) is caught there rather than masked.
+    if (targetData == 0xFF) {
+      continue;
+    }
+
     // Byte-Program Sequence (4-cycle program command)
     writeByte(0x5555, 0xAA); // Cycle 1 (Unlock)
     writeByte(0x2AAA, 0x55); // Cycle 2 (Unlock)

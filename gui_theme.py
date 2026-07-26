@@ -172,7 +172,7 @@ QPushButton#readdot {{
 QPushButton#readdot:hover {{ border-color: {p['accent']}; }}
 QPushButton#readdot[level="high"] {{ background: {p['success_dark']};
                                      border-color: {p['success_dark']}; }}
-QPushButton#readdot[level="low"]  {{ background: transparent;
+QPushButton#readdot[level="low"]  {{ background: {p['text_secondary']};
                                      border-color: {p['text_secondary']}; }}
 QPushButton#readdot[level="none"] {{ background: transparent;
                                      border-color: {p['separator']}; }}

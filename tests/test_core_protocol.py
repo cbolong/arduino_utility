@@ -42,6 +42,28 @@ def test_gpio_set():
     print("C2: local validation blocks bad mode/value: OK")
 
 
+def test_gpio_read_quiet():
+    """quiet=True suppresses the routine send/recv logs (auto-read sweep);
+    errors still log. quiet=False keeps full logging (manual reads)."""
+    log, entries = collecting_log()
+    ser = FakeSerial(script={"GPIO_READ": b"GPIO_VALUE 7 1\r\n"})
+    sess = core.GpioSession(log, ser=ser, lock=None)
+
+    assert sess.read_pin(7, quiet=True) == "HIGH"
+    assert entries == [], f"quiet read must not log: {entries}"
+
+    assert sess.read_pin(7) == "HIGH"
+    assert any("send:" in m for _, m in entries), "verbose read must log send"
+    assert any("recv:" in m for _, m in entries), "verbose read must log recv"
+
+    entries.clear()
+    ser.script = {"GPIO_READ": b"BANANA\r\n"}
+    assert sess.read_pin(7, quiet=True) is None
+    assert any(lvl == "err" for lvl, _ in entries), \
+        "errors must still log even when quiet"
+    print("C17: read_pin quiet suppresses routine logs, keeps errors: OK")
+
+
 def test_gpio_read():
     log, entries = collecting_log()
     ser = FakeSerial(script={"GPIO_READ": b"GPIO_VALUE 7 1\r\n"})
@@ -187,6 +209,41 @@ def test_flash_happy():
     print(f"C10: flash happy path, {mcu.chunks} chunks + CRC OK: OK")
 
 
+def test_flash_progress_callback():
+    """on_progress fires once per ACKed chunk with (done, total), monotonic
+    up to (32, 32); a raising callback must not abort the flash."""
+    import serial as _serial
+    import tempfile as _tf
+    log, entries = collecting_log()
+    calls = []
+
+    def on_progress(done, total):
+        calls.append((done, total))
+        if done == 5:
+            raise RuntimeError("progress display broke")   # must be swallowed
+
+    mcu = FlashMcu()
+    orig = _serial.Serial
+    _serial.Serial = lambda *a, **kw: mcu
+    try:
+        with _tf.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            f.write(b"\xA5" * 1000)
+            fw = f.name
+        try:
+            ok = core.program_firmware(fw, log, port="COM_T",
+                                       handshake_timeout_s=3.0,
+                                       on_progress=on_progress)
+        finally:
+            os.unlink(fw)
+    finally:
+        _serial.Serial = orig
+    assert ok is True
+    assert len(calls) == 32, f"expected 32 progress calls, got {len(calls)}"
+    assert calls[0] == (1, 32) and calls[-1] == (32, 32)
+    assert [c[0] for c in calls] == list(range(1, 33)), "must be monotonic"
+    print("C18: on_progress fires 32x, raising callback swallowed: OK")
+
+
 def test_flash_refusal():
     log, entries = collecting_log()
     ok = _with_flash_mcu(FlashMcu(refuse_erase=True), log)
@@ -283,6 +340,8 @@ def test_flash_padding_is_ff():
 if __name__ == "__main__":
     test_gpio_set()
     test_gpio_read()
+    test_gpio_read_quiet()
+    test_flash_progress_callback()
     test_tdbg_preset()
     test_tdbg_pack()
     test_record_parse()

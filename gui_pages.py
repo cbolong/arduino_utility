@@ -13,12 +13,15 @@ import threading
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
-    QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 
 import gui_data as D
 import gui_theme as T
-from binFileTransfer_core import SgpioFraming, program_firmware
+from binFileTransfer_core import (
+    SgpioFraming, parse_sgpio_frame, program_firmware,
+)
 from gui_widgets import (
     Card, LogPane, PinGrid, WaveformView, open_waveform_preview,
 )
@@ -42,11 +45,13 @@ def _combo_pin(combo: QComboBox):
 # --------------------------------------------------------------------------
 class FlashPage(Page):
     doneSig = Signal(bool)
+    progSig = Signal(int, int)   # (done_chunks, total_chunks) → GUI thread
 
     def __init__(self, app) -> None:
         super().__init__(app)
         self.firmware_path: str | None = None
         self.doneSig.connect(self._on_done)
+        self.progSig.connect(self._on_progress)
 
         lay = self._frame()
         card = Card("韌體燒錄 ROM")
@@ -70,6 +75,15 @@ class FlashPage(Page):
         row2.addWidget(clear)
         row2.addStretch(1)
         card.body.addLayout(row2)
+
+        # Chunk progress: a flash is ~70 s of scrolling log otherwise —
+        # this is the at-a-glance answer to "how far along is it?".
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 32)
+        self._progress.setFormat("燒錄中 %v / %m chunks (%p%)")
+        self._progress.setVisible(False)
+        card.body.addWidget(self._progress)
+
         lay.addWidget(card)
         lay.addWidget(self.log_pane, 1)
 
@@ -99,10 +113,14 @@ class FlashPage(Page):
             # the port locked. Guard with try/finally so _on_done always runs.
             ok = False
             try:
-                ok = bool(program_firmware(path, self.log_cb, port=port))
+                ok = bool(program_firmware(
+                    path, self.log_cb, port=port,
+                    on_progress=lambda d, t: self.progSig.emit(d, t)))
             finally:
                 self.doneSig.emit(ok)
 
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
         self.app.status("Programming…", "warn")
         # The shared link was just released (program_firmware owns the port
         # for the duration), so the sidebar would read 未連線 mid-flash —
@@ -111,12 +129,20 @@ class FlashPage(Page):
         self.app.lock_port(True)
         self.enqueue(work)
 
+    def _on_progress(self, done: int, total: int) -> None:
+        if self._progress.maximum() != total:
+            self._progress.setRange(0, total)
+        self._progress.setValue(done)
+        self.app.status(f"Programming… {done}/{total} ({100*done//total}%)",
+                        "warn")
+
     def _on_worker_failure(self, detail: str, tb: str) -> None:
         # Safety net: if work() somehow doesn't reach its try/finally,
         # this still re-enables _start and unlocks the port so the page
         # never wedges. doneSig already does this in normal failures.
         if not self._start.isEnabled():
             self._start.setEnabled(True)
+            self._progress.setVisible(False)
             self.app.lock_port(False)
             try:
                 self.app._set_conn("未連線", T.PALETTE["danger_dark"])
@@ -139,6 +165,7 @@ class FlashPage(Page):
         # Flash is done either way and the shared link really is closed now —
         # restore the true indicator (matches _on_disconnect_done).
         self.app._set_conn("未連線", T.PALETTE["danger_dark"])
+        self._progress.setVisible(False)
         self._start.setEnabled(True)
         self.app.lock_port(False)
 
@@ -158,7 +185,9 @@ class GpioPage(Page):
         ctl = QHBoxLayout()
         self._read_all = QPushButton("Read All")
         self._read_all.setEnabled(False)
-        self._read_all.clicked.connect(self._on_read_all)
+        # Explicit lambda: clicked emits a `checked` bool that would land in
+        # _on_read_all's quiet parameter by accident otherwise.
+        self._read_all.clicked.connect(lambda: self._on_read_all(quiet=False))
         self._auto = QCheckBox("自動讀取，每")
         self._auto.setEnabled(False)
         self._auto.toggled.connect(self._on_toggle_auto)
@@ -238,7 +267,11 @@ class GpioPage(Page):
 
         self.enqueue(cmd)
 
-    def _on_read_all(self) -> None:
+    def _on_read_all(self, quiet: bool = False) -> None:
+        """Sweep-read all pins. `quiet=True` (the auto-read timer) suppresses
+        the per-pin send/recv logs — 66 pins × 2 lines at 1 Hz floods the
+        5000-line pane in ~40 s and buries every real message; the read dots
+        already carry the data. Errors still log either way."""
         if self._session is None:
             self.log("尚未連線，無法讀取", "warn")
             return
@@ -248,7 +281,8 @@ class GpioPage(Page):
                 if self._abort.is_set():
                     break
                 sess = self._session
-                v = sess.read_pin(pin) if sess is not None else None
+                v = (sess.read_pin(pin, quiet=quiet)
+                     if sess is not None else None)
                 if v is not None:
                     self.readSig.emit(pin, v)
 
@@ -272,9 +306,10 @@ class GpioPage(Page):
             self._timer.stop()
             return
         # Skip this tick if the worker is still busy; the repeating timer
-        # will catch up on the next one (no pile-up).
+        # will catch up on the next one (no pile-up). quiet=True: the sweep's
+        # routine logs would drown the pane — dots carry the data.
         if not self.is_busy():
-            self._on_read_all()
+            self._on_read_all(quiet=True)
 
 
 # --------------------------------------------------------------------------
@@ -454,6 +489,11 @@ class RecordPage(Page):
         act.addWidget(self._start)
         act.addWidget(self._stop)
         act.addWidget(self._thumb)
+        # Persistent capture summary — the status bar version is overwritten
+        # by whatever happens next; this stays until the next recording.
+        self._summary_lbl = QLabel("")
+        self._summary_lbl.setObjectName("Muted")
+        act.addWidget(self._summary_lbl)
         act.addStretch(1)
         act.addWidget(clear)
         card.body.addLayout(act)
@@ -631,8 +671,11 @@ class RecordPage(Page):
         # not a real transition — back it out of the user-facing edge count.
         edge_count = max(0, len(events) - 1)
         if edge_count == 0:
+            self._summary_lbl.setText("0 邊緣(電位未變)")
             self.app.status("RECORD done: no edges (level held constant)", "warn")
         else:
+            self._summary_lbl.setText(
+                f"{edge_count} 邊緣 · {total_us/1000:.3f} ms")
             self.app.status(
                 f"RECORD done: {edge_count} edges, {total_us/1000:.3f} ms", "ok")
 
@@ -674,6 +717,8 @@ class SgpioPage(Page):
         self._active = False
         self._connected = False
         self._drive_cells: list = []    # per-drive (act, loc, flt, val) labels
+        self._frame_count = 0           # liveness: every SGPIO_FRAME arrival
+        self._last_bits: str | None = None   # skip re-render on heartbeats
         self.frameSig.connect(self._apply_frame)
         self.doneSig.connect(self._on_done)
         self.failSig.connect(self._on_fail)
@@ -749,9 +794,14 @@ class SgpioPage(Page):
         self._table.setHorizontalSpacing(14)
         self._table.setVerticalSpacing(3)
         card.body.addLayout(self._table)
+        raw_row = QHBoxLayout()
         self._raw_lbl = QLabel("—")
         self._raw_lbl.setObjectName("Muted")
-        card.body.addWidget(self._raw_lbl)
+        self._count_lbl = QLabel("")
+        self._count_lbl.setObjectName("Muted")
+        raw_row.addWidget(self._raw_lbl, 1)
+        raw_row.addWidget(self._count_lbl)
+        card.body.addLayout(raw_row)
 
         lay.addWidget(card)
         lay.addWidget(self.log_pane, 1)
@@ -784,9 +834,12 @@ class SgpioPage(Page):
             if w is not None:
                 w.setParent(None)
         self._drive_cells = []
+        _TIPS = {"A": "Activity", "L": "Locate", "F": "Fault"}
         for col, head in enumerate(("Drive", "A", "L", "F", "value")):
             h = QLabel(head)
             h.setObjectName("Muted")
+            if head in _TIPS:
+                h.setToolTip(_TIPS[head])
             self._table.addWidget(h, 0, col)
         for d in range(num_drives):
             self._table.addWidget(QLabel(f"D#{d}"), d + 1, 0)
@@ -836,6 +889,9 @@ class SgpioPage(Page):
             self.set_connected(True)   # disables the config widgets
             self.app.set_recording(True, self)   # grey out the other tabs
             self._rebuild_table(framing.num_drives)
+            self._frame_count = 0
+            self._last_bits = None
+            self._count_lbl.setText("已收 0 幀")
             self.app.status("SGPIO decoding…", "warn")
         except Exception as e:
             self.log(f"SGPIO start setup failed: {e}", "err")
@@ -862,11 +918,32 @@ class SgpioPage(Page):
 
         self.enqueue(cmd)
 
+    @staticmethod
+    def _group_bits(bits: str, framing: SgpioFraming) -> str:
+        """Display-format a frame per drive: '100010001111' → '100 010 001
+        111', with any header bits split off by '|'. Pure formatting — the
+        decode itself stays in parse_sgpio_frame."""
+        head = bits[:framing.header_bits]
+        body = bits[framing.header_bits:]
+        w = framing.bits_per_drive
+        groups = [body[i:i + w] for i in range(0, len(body), w)]
+        return (f"{head} | " if head else "") + " ".join(groups)
+
     def _apply_frame(self, bits: str) -> None:
         f = getattr(self, "_live_framing", None) or self._framing()
-        self._raw_lbl.setText(f"frame ({len(bits)} bits): {bits}")
+        # Liveness: count every arrival (including the ~200 ms heartbeat
+        # re-send of an unchanged frame) so a quiet bus still visibly ticks.
+        self._frame_count += 1
+        self._count_lbl.setText(f"已收 {self._frame_count} 幀")
+        # Heartbeats repeat the same frame 5x/s — skip the full re-parse +
+        # re-style when nothing changed. (This is host-side polish; the MCU's
+        # delta-report already keeps the serial link quiet.)
+        if bits == self._last_bits:
+            return
+        self._last_bits = bits
+        self._raw_lbl.setText(
+            f"frame ({len(bits)} bits): {self._group_bits(bits, f)}")
         try:
-            from binFileTransfer_core import parse_sgpio_frame
             drives = parse_sgpio_frame(bits, f)
         except ValueError:
             # Structural mismatch — flag it instead of decoding garbage.

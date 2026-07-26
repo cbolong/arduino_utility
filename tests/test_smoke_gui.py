@@ -49,7 +49,7 @@ def main():
     gpio_page = win.gpio_page
     gpio_page.set_connected(True)
     row = gpio_page._grid.rows[18]
-    win.gpio_session.read_pin = lambda pin: "HIGH"
+    win.gpio_session.read_pin = lambda pin, **kw: "HIGH"
     row._read_btn.click()
     assert drain(app, lambda: row._read_btn.property("level") == "high"), \
         "read dot didn't light"
@@ -57,7 +57,7 @@ def main():
     print("S4: per-pin read dot: OK")
 
     seen = []
-    win.gpio_session.read_pin = lambda pin: (seen.append(pin), "LOW")[1]
+    win.gpio_session.read_pin = lambda pin, **kw: (seen.append(pin), "LOW")[1]
     gpio_page._on_read_all()
     assert drain(app, lambda: len(seen) >= 66, timeout=5.0), \
         f"Read All covered only {len(seen)} pins"

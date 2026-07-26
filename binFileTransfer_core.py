@@ -247,6 +247,7 @@ def program_firmware(
     *,
     port: str | None = None,
     handshake_timeout_s: float = DEFAULT_HANDSHAKE_TIMEOUT_S,
+    on_progress=None,
 ) -> bool:
     """Program the given firmware.bin to a connected Arduino-Due-driven SST39 flash.
 
@@ -254,6 +255,10 @@ def program_firmware(
     If `port` is given, skip USB VID/PID auto-detection and use it directly.
     `handshake_timeout_s` bounds each wait for an MCU response so a stuck MCU
     no longer hangs the caller forever.
+    `on_progress(done_chunks, total_chunks)`, when given, is called after each
+    chunk is ACKed — the GUI drives its progress bar off this; the CLI passes
+    nothing and is unaffected. Exceptions from the callback are swallowed
+    (progress display must never abort a flash).
     Returns True on success, False on any failure. Never calls sys.exit / input.
     """
     if port is None:
@@ -334,6 +339,12 @@ def program_firmware(
                     ser, MCU_RECEIVED_LINE_RESPONSE, log, handshake_timeout_s
                 ):
                     return False
+                if on_progress is not None:
+                    try:
+                        on_progress(chunk_count,
+                                    len(file_data) // CHUNK_SIZE)
+                    except Exception:
+                        pass    # progress display must never abort a flash
 
             log(
                 f"File transfer completed. Total {chunk_count:2d} chunks.",
@@ -571,7 +582,7 @@ class _Session:
 
     def _transact(
         self, cmd: str, *, timeout_s: float = COMMAND_TIMEOUT_S,
-        flush: bool = False,
+        flush: bool = False, quiet: bool = False,
     ) -> str | None:
         """Send `cmd` and return one reply line (stripped). None on timeout.
 
@@ -580,8 +591,14 @@ class _Session:
         flush() for short commands to avoid Tx buffering), wait one line,
         and let the caller parse the reply. Log emit lives OUTSIDE the
         serial-guard so a queued Qt log handler can never deadlock the
-        critical section."""
-        self._log(f"send: {cmd}", "info")
+        critical section.
+
+        `quiet=True` suppresses the routine "send:" log — pass it from
+        high-frequency polling callers (the GPIO auto-read sweep) where the
+        log would drown real messages. Errors are the caller's to log and
+        stay visible regardless."""
+        if not quiet:
+            self._log(f"send: {cmd}", "info")
         with _serial_guard(self._lock):
             self._ser.write(f"{cmd}\n".encode("UTF-8"))
             if flush:
@@ -622,20 +639,26 @@ class GpioSession(_Session):
         self._log(f"recv: {reply or '(no reply)'}", "err")
         return False
 
-    def read_pin(self, pin: int) -> str | None:
-        """Returns 'HIGH' or 'LOW' on success, None on any error."""
+    def read_pin(self, pin: int, *, quiet: bool = False) -> str | None:
+        """Returns 'HIGH' or 'LOW' on success, None on any error.
+
+        `quiet=True` (the auto-read sweep) suppresses the routine send/recv
+        logs so a 1 Hz × 66-pin poll doesn't wash every real message out of
+        the 5000-line log pane. Failures still log — those are the ones the
+        user needs to see."""
         if not self.is_open:
             self._log("GPIO session not open.", "err")
             return None
 
         cmd = f"GPIO_READ {pin}"
-        reply = self._transact(cmd, timeout_s=GPIO_READ_TIMEOUT_S)
+        reply = self._transact(cmd, timeout_s=GPIO_READ_TIMEOUT_S, quiet=quiet)
         if reply and reply.startswith(GPIO_VALUE_PREFIX):
             # Format: "GPIO_VALUE <pin> <0|1>"
             parts = reply.split()
             if len(parts) == 3 and parts[2] in ("0", "1"):
                 level = "HIGH" if parts[2] == "1" else "LOW"
-                self._log(f"recv: {reply} -> {level}", "ok")
+                if not quiet:
+                    self._log(f"recv: {reply} -> {level}", "ok")
                 return level
         self._log(f"recv: {reply or '(no reply)'}", "err")
         return None

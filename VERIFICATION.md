@@ -31,6 +31,9 @@
 | CRC 失敗 — 全片未寫入(WE 斷) | 32 區塊全同 → 指向寫入路徑,**不得**誤報位址線 | 自動 C16 |
 | 補頁位元組 | 不足 128KB 補 0xFF(leave-erased,可暴露 erase 不完全) | 自動 C15 |
 | 燒錄中側欄狀態 | 「燒錄中…」→ 結束回「未連線」 | 自動 `test_smoke_gui S9` |
+| 燒錄進度回報 | `on_progress` 每 chunk ACK 觸發 (1..32,32);callback 拋例外不中斷燒錄 | 自動 C18 |
+| GUI 進度條 | 燒錄中顯示 chunk n/32 + %,結束隱藏 | offscreen 截圖(視覺);progSig 佈線=smoke S9 家族 |
+| FF-skip 提速 | firmware 跳過 0xFF 位元組(~18s/108K 檔);CRC 掃描仍驗補頁區 | HIL(對照 Timing 報告 program 時間) |
 | 燒錄前有 GPIO/TDBG 連線 | 先釋放共用連線再開始 | 自動 S9(disconnect_then 鏈) |
 | 燒錄後想用 GPIO/TDBG/RECORD | 需按 Due RESET + 重新連線(訊息有提示) | HIL |
 | worker 在 done 前死掉 | `_on_worker_failure` 還原按鈕+解鎖 port | 自動 `test_stuck_states R6` |
@@ -47,6 +50,8 @@
 | Read All 全 66 腳 | 逐腳讀,每腳結果更新對應列 | 自動 S5 |
 | Read All 中按斷線 | `_abort` set → 最多再等 1 腳就停 | 自動(stuck_states R5 家族);真斷線 HIL |
 | 自動讀取 timer | 斷線即停、checkbox 取消 | 自動 `test_stuck_states R5` |
+| 自動讀取不洗版 | auto sweep quiet(無 send/recv log,錯誤照常);手動 Read All 照常 log | 自動 C17 |
+| 圈圈三態視覺 | 空心=未讀、灰實心=LOW、綠實心=HIGH | offscreen 截圖(QSS) |
 | 戳 flash 匯流排腳 | 允許但匯流排狀態未定義 — 燒錄前需 RESET | HIL(行為 by design) |
 | reconnect 後 UI vs MCU 腳位狀態 | fast-connect 不 reset:MCU 保留舊態,UI 歸零 — 點圈圈重讀對齊 | HIL |
 
@@ -73,6 +78,7 @@
 | blob CRC 不符 | `stop()` 回 None,不崩 | 自動 RS3 |
 | 腳數 0 / >4 / 非法腳號 | 本地拒絕 | 自動 RS4 |
 | start 拋例外(如 USB handle 失效) | failSig → 頁面重置,可再按 | 自動 `test_stuck_states R1` |
+| 錄後摘要持久顯示 | 縮圖旁「N 邊緣 · X ms」,不被狀態列洗掉 | offscreen(smoke S8 家族) |
 | stop 拋例外 | stopSig(None) → 頁面重置 | 自動 R2 |
 | 同一腳選兩列 | `_selected_pins` 去重成一支 | 自動 `test_stuck_states R9` |
 | RECORD_OVERFLOW | host log warn,錄製繼續(MCU 停累積) | HIL(需 >4096 邊緣) |
@@ -92,6 +98,8 @@
 | session start→frame→stop | fake serial 全回合 | 自動 G8 |
 | 腳位重複 / 超範圍 / 壞 framing | 本地拒絕不上線 | 自動 G9 |
 | GUI 分頁(第 5 項)即時解碼 + 標紅 + 停止 | offscreen 全流程 | 自動 G10 |
+| frame 分組顯示 | `100 010 001 111`(header 以 `|` 隔開) | 自動 G11 |
+| heartbeat 同幀跳過重繪 | 幀數遞增但不重 parse;新幀才 parse | 自動 G10(spy) |
 | RECORD/SGPIO 互斥 | firmware 雙向拒絕 + GUI 灰化 sibling 分頁 | firmware HIL;GUI 灰化=自動(set_recording origin) |
 | **真實 SGPIO 來源解碼** | 接 HBA/backplane → drive 表格對應實際 LED | HIL |
 | **TDBG loopback 自測** | TDBG 產生已知 SGPIO 圖樣 → 接回 SGPIO 3 腳 → 解碼應等於送出 | HIL(免真 initiator) |

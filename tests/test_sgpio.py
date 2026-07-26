@@ -141,6 +141,21 @@ def test_session_validation():
     print("G9: SgpioSession rejects bad pins/framing: OK")
 
 
+def test_group_bits_display():
+    """Display grouping: bits split per drive, header split off with '|'."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from gui_pages import SgpioPage
+
+    f = SgpioFraming(num_drives=4, bits_per_drive=3)
+    assert SgpioPage._group_bits("100010001111", f) == "100 010 001 111"
+    fh = SgpioFraming(num_drives=2, bits_per_drive=3, header_bits=4)
+    assert SgpioPage._group_bits("1010111000", fh) == "1010 | 111 000"
+    print("G11: frame display grouped per drive (+header |): OK")
+
+
 def test_gui_tab():
     """The SGPIO sidebar tab exists (5th), builds, connects, decodes a live
     frame into the drive table, flags a bad frame, and stops cleanly."""
@@ -197,6 +212,25 @@ def test_gui_tab():
     # drive0 activity dot green, drive1 fault dot green.
     assert T.PALETTE["success"] in page._drive_cells[0][0].styleSheet()
     assert T.PALETTE["success"] in page._drive_cells[1][2].styleSheet()
+    assert page._frame_count == 1 and "1" in page._count_lbl.text()
+    # Raw display is grouped per drive.
+    assert "100 001" in page._raw_lbl.text()
+
+    # Heartbeat re-send of the SAME frame: counter ticks (liveness) but the
+    # table is NOT re-parsed/re-styled.
+    import gui_pages as _gp
+    parse_calls = []
+    orig_parse = _gp.parse_sgpio_frame
+    _gp.parse_sgpio_frame = (
+        lambda b, fr: (parse_calls.append(1), orig_parse(b, fr))[1])
+    try:
+        page._apply_frame("100" "001")     # identical → skip
+        assert page._frame_count == 2
+        assert parse_calls == [], "identical heartbeat must skip re-parse"
+        page._apply_frame("110" "001")     # changed → full decode
+        assert parse_calls == [1]
+    finally:
+        _gp.parse_sgpio_frame = orig_parse
 
     # A bad-length frame flags red, does not crash.
     page._apply_frame("10101")   # 5 bits != expected 6
@@ -222,5 +256,6 @@ if __name__ == "__main__":
     test_validate_config()
     test_session_round_trip()
     test_session_validation()
+    test_group_bits_display()
     test_gui_tab()
     print("PASS test_sgpio")
