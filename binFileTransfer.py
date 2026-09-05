@@ -81,7 +81,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if success:
         cli_log(f"{os.path.basename(firmware_path)} Program Successful.", "ok")
-    input(PYTHON_DONE)
+    # The pause exists so a double-clicked console window doesn't vanish
+    # before the result is readable. Only meaningful on a real terminal:
+    # under a pipe / CI / redirected stdin, input() raises EOFError, which
+    # escaped main() and made a SUCCESSFUL flash exit 1 with a traceback.
+    if sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input(PYTHON_DONE)
+        except (EOFError, KeyboardInterrupt):
+            pass
     return 0 if success else 1
 
 

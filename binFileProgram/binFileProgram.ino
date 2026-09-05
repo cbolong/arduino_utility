@@ -297,6 +297,30 @@ void programChunkData(uint32_t chunk) {
 // Reset the Due before attempting a flash again.
 // ----------------------------------------------------------------------------
 
+// Capture-mode flags, defined with the RECORD and SGPIO blocks further down.
+// Forward-declared here because the GPIO handlers (and RECORD's start) need
+// to refuse while either capture owns the interrupt path.
+extern volatile bool recordActive;
+extern volatile bool sgpioActive;
+
+// Shared guards for the GPIO handlers. A capture (RECORD or SGPIO) owns the
+// interrupt path AND is mid-stream on the serial link, so a GPIO command
+// then both races the reply parsing and — for SGPIO — would drive the very
+// pins the decoder is passively tapping, breaking its "never drives the bus"
+// contract. Range-check too: pinMode() indexes g_APinDescription[] with no
+// bounds check of its own.
+static bool gpioGuard(int pin) {
+  if (recordActive || sgpioActive) {
+    Serial.println("GPIO_ERROR capture_active");
+    return false;
+  }
+  if (pin < 0 || pin > 65) {
+    Serial.println("GPIO_ERROR bad_pin");
+    return false;
+  }
+  return true;
+}
+
 void handleGpioSet(const String& cmd) {
   // "GPIO_SET <pin> <mode> [value]"
   int p1 = cmd.indexOf(' ');
@@ -308,6 +332,7 @@ void handleGpioSet(const String& cmd) {
   int p3 = cmd.indexOf(' ', p2 + 1);
 
   int pin = cmd.substring(p1 + 1, p2).toInt();
+  if (!gpioGuard(pin)) return;
   String modeStr = (p3 > 0) ? cmd.substring(p2 + 1, p3) : cmd.substring(p2 + 1);
   String valueStr = (p3 > 0) ? cmd.substring(p3 + 1) : String("");
 
@@ -345,6 +370,7 @@ void handleGpioRead(const String& cmd) {
     return;
   }
   int pin = cmd.substring(p1 + 1).toInt();
+  if (!gpioGuard(pin)) return;
   pinMode(pin, INPUT);
   int value = digitalRead(pin);
   Serial.print("GPIO_VALUE ");
@@ -1119,7 +1145,7 @@ static volatile uint16_t recordEventCount = 0;
 static uint8_t  recordPinList[RECORD_MAX_PINS];
 static uint8_t  recordPinCount = 0;
 static volatile uint8_t  recordCurrentMask = 0;
-static volatile bool     recordActive = false;
+volatile bool            recordActive = false;
 static volatile bool     recordOverflow = false;
 static volatile uint32_t recordPrevCycles = 0;
 static unsigned long     recordLastLiveMs = 0;
@@ -1163,10 +1189,6 @@ static void recordIsr3() { recordIsrHandler(); }
 static void (* const recordIsrs[RECORD_MAX_PINS])() = {
   recordIsr0, recordIsr1, recordIsr2, recordIsr3,
 };
-
-// Defined with the SGPIO block further down; forward-declared here so the
-// RECORD start can refuse while an SGPIO capture owns the interrupt.
-extern volatile bool sgpioActive;
 
 void handleRecordStart(const String& cmd) {
   if (recordActive) {
@@ -1342,6 +1364,14 @@ static void sgpioIsr() {
   }
   if (sgpioBitCount < SGPIO_MAX_FRAME_BITS) {
     sgpioBuf[sgpioWrIdx][sgpioBitCount++] = sdata;
+  } else {
+    // Bit-level saturation: SLoad never asserted, so the frame never closed.
+    // Almost always a wrong SLoad pin / polarity / sample edge — the exact
+    // setting the user is expected to tune. Without this the failure is
+    // completely silent: no frame ever latches, and the heartbeat is gated
+    // on sgpioLastLen > 0, so the host sees SGPIO_STARTED then nothing at
+    // all. Reuse the overrun signal so the pump reports it.
+    sgpioOverrun = true;
   }
 }
 

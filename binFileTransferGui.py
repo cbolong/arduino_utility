@@ -60,6 +60,13 @@ class MainWindow(QMainWindow):
         self._serial_lock = threading.Lock()
         self._connected = False
         self._conn_busy = False
+        # The page currently owning a RECORD/SGPIO capture, or None. Held on
+        # the window (not only on the pages) so a page built LATER — during a
+        # capture — can inherit the lock in _ensure_page().
+        self._capture_page = None
+        # Set by FlashPage after a successful flash: the MCU has left its
+        # idle loop, so the other pages need a board reset before 連線 works.
+        self._needs_reset = False
         self.gpio_session = None
         self.tdbg_session = None
         self.record_session = None
@@ -119,6 +126,10 @@ class MainWindow(QMainWindow):
         self._status_lbl = QLabel("Idle")
         self._status.addWidget(self._status_lbl)
         self.setStatusBar(self._status)
+        # Paint the indicator through the semantic path from the very first
+        # frame, so its startup appearance can never drift from the states
+        # _set_conn() produces later.
+        self._set_conn("未連線", "err")
         self._on_nav(0)   # build + show the first page
 
     _PAGE_ATTR = ("flash_page", "gpio_page", "tdbg_page", "record_page",
@@ -138,8 +149,17 @@ class MainWindow(QMainWindow):
             # A page built AFTER connect must inherit the live state.
             # Indexes 1..N are the connectable pages (GPIO/TDBG/RECORD/SGPIO);
             # 0 is FlashPage, which manages its own connection.
-            if i >= 1 and self._connected:
-                pg.set_connected(True)
+            #
+            # It must ALSO inherit an in-progress capture lock. set_recording()
+            # can only reach pages that already exist, so without this a page
+            # first opened DURING a RECORD/SGPIO capture came up fully live —
+            # and its commands would then race the capture's unlocked live
+            # reader for the shared port. `_capture_page` is the origin page,
+            # which stays interactive so it can drive its own Stop button.
+            if i >= 1:
+                live = self._connected and (
+                    self._capture_page is None or self._capture_page is pg)
+                pg.set_connected(live)
         return pg
 
     def _build_header(self) -> QFrame:
@@ -242,8 +262,21 @@ class MainWindow(QMainWindow):
         self.set_status(
             text, T.PALETTE[self._STATUS_COLORS.get(level, "text_secondary")])
 
-    def _set_conn(self, text: str, color: str) -> None:
-        self.sidebar.set_connection(text, color)
+    # Connection-indicator level → colour. These MUST come from the palette's
+    # "bright indicator hues (on dark canvases / dots)" group, not the
+    # "*_dark (text on light)" group: the indicator lives on the dark sidebar
+    # (#1b1e27), where the *_dark variants measure 2.8-3.4:1 — below the
+    # 4.5:1 WCAG AA floor, i.e. effectively unreadable in the default
+    # 未連線 state. The bright variants measure 4.7-7.6:1.
+    _CONN_COLORS = {"ok": "success", "err": "danger", "warn": "warning"}
+
+    def _set_conn(self, text: str, level: str) -> None:
+        """Semantic connection-indicator update. Takes a LEVEL, not a raw
+        colour — mirroring status() — so no call site can pick the wrong
+        palette group. (Nine call sites previously passed raw *_dark colours
+        and every one of them was the wrong group for a dark background.)"""
+        self.sidebar.set_connection(
+            text, T.PALETTE[self._CONN_COLORS.get(level, "danger")])
 
     def _on_connect(self) -> None:
         if self._connected or self._conn_busy:
@@ -258,7 +291,7 @@ class MainWindow(QMainWindow):
         # the connection or pin the worker to the GUI thread.
         port = self.get_port()
         self._conn_busy = True
-        self._set_conn("連線中…", T.PALETTE["warning_dark"])
+        self._set_conn("連線中…", "warn")
         self.connect_btn.setEnabled(False)
         self.lock_port(True)
         self.status("Connecting…", "warn")
@@ -289,7 +322,7 @@ class MainWindow(QMainWindow):
     def _on_connect_done(self, ser) -> None:
         self._conn_busy = False
         if ser is None:
-            self._set_conn("未連線", T.PALETTE["danger_dark"])
+            self._set_conn("未連線", "err")
             self.connect_btn.setEnabled(True)
             self.lock_port(False)
             self.status("Connect failed", "err")
@@ -304,7 +337,8 @@ class MainWindow(QMainWindow):
         self.sgpio_session = SgpioSession(
             self._page_log_cb("sgpio_page"), ser=ser, lock=self._serial_lock)
         self._connected = True
-        self._set_conn("已連線", T.PALETTE["success_dark"])
+        self._needs_reset = False       # a live link proves the MCU is idle
+        self._set_conn("已連線", "ok")
         self.disconnect_btn.setEnabled(True)
         for pg in (self.gpio_page, self.tdbg_page, self.record_page,
                    self.sgpio_page):
@@ -318,6 +352,11 @@ class MainWindow(QMainWindow):
         # `origin` page stays live so it can manage its own Stop button). The
         # firmware also refuses a second capture, so this is UX polish over a
         # hard guard.
+        #
+        # Record the owner on the window too: this loop can only reach pages
+        # that already exist, and _ensure_page() needs the flag to lock a page
+        # that gets built later, mid-capture.
+        self._capture_page = origin if active else None
         if not self._connected:
             return
         for pg in (self.gpio_page, self.tdbg_page, self.record_page,
@@ -330,7 +369,7 @@ class MainWindow(QMainWindow):
             if on_done is not None:
                 on_done()
             return
-        self._set_conn("斷線中…", T.PALETTE["warning_dark"])
+        self._set_conn("斷線中…", "warn")
         self.disconnect_btn.setEnabled(False)
         for pg in (self.gpio_page, self.tdbg_page, self.record_page,
                    self.sgpio_page):
@@ -364,12 +403,15 @@ class MainWindow(QMainWindow):
 
     def _on_disconnect_done(self, on_done) -> None:
         self._ser = None
+        # No session left to own a capture — clear the lock so a page built
+        # after the next connect isn't greyed out by a dead capture.
+        self._capture_page = None
         self.gpio_session = None
         self.tdbg_session = None
         self.record_session = None
         self.sgpio_session = None
         self._connected = False
-        self._set_conn("未連線", T.PALETTE["danger_dark"])
+        self._set_conn("未連線", "err")
         self.connect_btn.setEnabled(True)
         self.lock_port(False)
         self.status("Disconnected", "info")
@@ -406,7 +448,7 @@ def main() -> None:
     app.setFont(QFont(T.UI_FONT_FAMILY, 10))
     app.setStyleSheet(T.build_qss())
     win = MainWindow()
-    win._set_conn("未連線", T.PALETTE["danger_dark"])
+    win._set_conn("未連線", "err")
     win.show()
     sys.exit(app.exec())
 

@@ -90,6 +90,8 @@ class Page(QWidget):
             on_failure=lambda d, tb: self.workerFailSig.emit(d, tb),
         )
         self.log_pane = LogPane()
+        self.log_pane.set_hint(self.GATE_HINT)   # nothing calls
+        # set_connected() at construction, so seed the gated wording here.
         self.logSig.connect(self.log_pane.append)
         self.workerFailSig.connect(self._on_worker_failure)
 
@@ -110,6 +112,28 @@ class Page(QWidget):
 
     def is_busy(self) -> bool:
         return self.worker.is_busy()
+
+    # Shown in the empty log pane while the page's controls are gated, so a
+    # dead-looking page always says why. Subclasses override READY_HINT with
+    # what to do once connected.
+    GATE_HINT = "請先按右上角「連線」，本頁功能才會啟用。"
+    READY_HINT = ""
+    # Shown instead of GATE_HINT right after a flash: erasing takes the MCU
+    # out of its idle loop, so 連線 alone will NOT bring these pages back.
+    # That instruction was previously logged only to FlashPage — the one page
+    # the user is leaving when they need it.
+    AFTER_FLASH_HINT = ("剛完成燒錄：請先按 Due 板上的 reset 鈕，"
+                        "再按右上角「連線」，本頁功能才會恢復。")
+
+    def apply_gate_hint(self, connected: bool) -> None:
+        """Refresh the empty-state hint. Called by the pages from their own
+        set_connected() so the wording is chosen in one place."""
+        if connected:
+            self.log_pane.set_hint(self.READY_HINT)
+        elif getattr(self.app, "_needs_reset", False):
+            self.log_pane.set_hint(self.AFTER_FLASH_HINT)
+        else:
+            self.log_pane.set_hint(self.GATE_HINT)
 
     def set_connected(self, connected: bool) -> None:
         pass

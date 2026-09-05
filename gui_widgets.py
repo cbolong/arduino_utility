@@ -103,6 +103,17 @@ class LogPane(QPlainTextEdit):
         self.setMaximumBlockCount(5000)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+    def set_hint(self, text: str) -> None:
+        """Set the placeholder shown while the pane is empty.
+
+        Qt draws it only when there is no content and drops it the moment a
+        line arrives, so it costs no layout and cannot cover real output.
+        This is where a page explains WHY its controls are dead — previously
+        nothing in the app did (a disabled page just sat there), and the
+        pages' own '尚未連線' messages are unreachable because the gating
+        disables the very controls that would emit them."""
+        self.setPlaceholderText(text)
+
     def append(self, message: str, level: str = "info") -> None:
         color = T.LOG_COLORS.get(level, T.LOG_COLORS["info"])
         safe = html.escape(message)

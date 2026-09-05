@@ -44,6 +44,12 @@ def _combo_pin(combo: QComboBox):
 
 # --------------------------------------------------------------------------
 class FlashPage(Page):
+    # Flash does NOT need 連線 — program_firmware opens the port itself and
+    # in fact drops any shared link first. Override the inherited gate
+    # wording so this page never tells the user to connect.
+    GATE_HINT = "選擇 .bin 檔後按「開始燒錄」。此操作會抹除晶片並中斷連線。"
+    READY_HINT = GATE_HINT
+    AFTER_FLASH_HINT = GATE_HINT
     doneSig = Signal(bool)
     progSig = Signal(int, int)   # (done_chunks, total_chunks) → GUI thread
 
@@ -125,7 +131,7 @@ class FlashPage(Page):
         # The shared link was just released (program_firmware owns the port
         # for the duration), so the sidebar would read 未連線 mid-flash —
         # technically true but alarming. Show what's actually happening.
-        self.app._set_conn("燒錄中…", T.PALETTE["warning_dark"])
+        self.app._set_conn("燒錄中…", "warn")
         self.app.lock_port(True)
         self.enqueue(work)
 
@@ -145,7 +151,7 @@ class FlashPage(Page):
             self._progress.setVisible(False)
             self.app.lock_port(False)
             try:
-                self.app._set_conn("未連線", T.PALETTE["danger_dark"])
+                self.app._set_conn("未連線", "err")
             except Exception:
                 pass
 
@@ -160,11 +166,17 @@ class FlashPage(Page):
                      "GPIO / TDBG / 波形錄製。", "info")
             self.app.status("Success — reset Due to use GPIO/TDBG/RECORD",
                             "ok")
+            # Let the other pages surface the reset requirement in their own
+            # empty-state hint; cleared on the next successful connect.
+            self.app._needs_reset = True
+            for pg in self.app.pages:
+                if pg is not self:
+                    pg.apply_gate_hint(False)
         else:
             self.app.status("Error", "err")
         # Flash is done either way and the shared link really is closed now —
         # restore the true indicator (matches _on_disconnect_done).
-        self.app._set_conn("未連線", T.PALETTE["danger_dark"])
+        self.app._set_conn("未連線", "err")
         self._progress.setVisible(False)
         self._start.setEnabled(True)
         self.app.lock_port(False)
@@ -173,6 +185,7 @@ class FlashPage(Page):
 # --------------------------------------------------------------------------
 class GpioPage(Page):
     readSig = Signal(int, str)
+    READY_HINT = "點各列圓點讀取單一腳位，或按 Read All 掃描全部。"
 
     def __init__(self, app) -> None:
         super().__init__(app)
@@ -196,6 +209,10 @@ class GpioPage(Page):
         self._interval.setSingleStep(0.5)
         self._interval.setValue(1.0)
         self._interval.setFixedWidth(70)
+        # Match _read_all / _auto: set_connected() governs this afterwards,
+        # but it is never called at construction — without this the interval
+        # spinbox was the single live control on an otherwise dead page.
+        self._interval.setEnabled(False)
         self._interval.valueChanged.connect(self._on_interval_changed)
         clear = QPushButton("清除紀錄")
         clear.clicked.connect(self.log_pane.clear)
@@ -223,6 +240,7 @@ class GpioPage(Page):
         return self.app.gpio_session
 
     def set_connected(self, connected: bool) -> None:
+        self.apply_gate_hint(connected)
         self._read_all.setEnabled(connected)
         self._auto.setEnabled(connected)
         self._interval.setEnabled(connected)
@@ -316,6 +334,7 @@ class GpioPage(Page):
 class TdbgPage(Page):
     # (success, preset_n) marshalled back to the GUI thread.
     doneSig = Signal(bool, int)
+    READY_HINT = "選輸出腳位後，按 TDBG1/2/3 送出對應波形。"
 
     def __init__(self, app) -> None:
         super().__init__(app)
@@ -358,6 +377,7 @@ class TdbgPage(Page):
         return self.app.tdbg_session
 
     def set_connected(self, connected: bool) -> None:
+        self.apply_gate_hint(connected)
         self._combo.setEnabled(connected)
         for b in self._btns:
             b.setEnabled(connected)
@@ -449,6 +469,7 @@ class _RecordPinRow(QWidget):
 
 class RecordPage(Page):
     MAX_PINS = 4   # RECORD_MAX_PINS in binFileTransfer_core / firmware
+    READY_HINT = "選 1-4 支腳位後按「開始」錄製；按「結束」取回波形。"
     liveSig = Signal(dict)
     stopSig = Signal(object)
     failSig = Signal()
@@ -507,6 +528,7 @@ class RecordPage(Page):
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
+        self.apply_gate_hint(connected)
         if self._recording:
             return
         for r in self._rows:
@@ -708,6 +730,7 @@ class SgpioPage(Page):
     (parse_sgpio_frame) and lights the per-drive dots. A frame whose length
     disagrees with the framing is flagged red — that is the "is the data
     right?" check surfaced in the UI."""
+    READY_HINT = "選 SClock / SLoad / SDataOut 三支腳並設定 framing 後按「開始」。"
     frameSig = Signal(str)          # raw bitstring from the live thread
     doneSig = Signal(bool, str)     # (ok, action) for start/stop handshakes
     failSig = Signal()
@@ -855,6 +878,7 @@ class SgpioPage(Page):
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
+        self.apply_gate_hint(connected)
         if self._active and not connected:
             # Dropped mid-decode — reset UI (session already torn down by App).
             self._active = False
@@ -892,6 +916,13 @@ class SgpioPage(Page):
             self._frame_count = 0
             self._last_bits = None
             self._count_lbl.setText("已收 0 幀")
+            # Also clear the raw-frame line. Without this a run that ended on
+            # a flagged frame leaves that red text next to "已收 0 幀" of the
+            # NEW run — showing the old framing's error beside the new
+            # config, which is exactly the misreading this panel exists to
+            # prevent.
+            self._raw_lbl.setText("—")
+            self._raw_lbl.setStyleSheet("")
             self.app.status("SGPIO decoding…", "warn")
         except Exception as e:
             self.log(f"SGPIO start setup failed: {e}", "err")

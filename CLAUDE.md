@@ -35,7 +35,7 @@ The sketch is uploaded with the Arduino IDE: board **Arduino Due (Programming Po
 
 ```bash
 # Run the offscreen regression suite (no hardware, no display needed)
-python tests/run_all.py            # all 6 modules
+python tests/run_all.py            # all 8 modules
 python tests/run_all.py smoke      # filter by name
 ```
 
@@ -157,7 +157,9 @@ RECORD and SGPIO are mutually exclusive (both own `attachInterrupt`): each `hand
 | RECORD pin cap | `RECORD_MAX_PINS` (4) | `RECORD_MAX_PINS` |
 | SGPIO strings | inline literals in `handleSgpioStart/Stop` / `sgpioPump` | `MCU_SGPIO_*` constants in `SgpioSession` |
 | SGPIO start args | `SGPIO_START <sclk> <sload> <sdata> <rising> <activehigh> <frameLen>` order | same order built in `SgpioSession.start` |
-| SGPIO frame cap | `SGPIO_MAX_FRAME_BITS` (256) | `SGPIO_MAX_DRIVES` (64) bounds the GUI |
+| SGPIO frame cap | `SGPIO_MAX_FRAME_BITS` (256) | `SGPIO_MAX_FRAME_BITS` (mirrored; `validate_config` rejects a longer frame locally) |
+| Max pin number | `gpioGuard()` / RECORD / SGPIO handlers bound to 65 | `MAX_DUE_PIN` via `_Session._check_pin()` |
+| GPIO capture refusal | `"GPIO_ERROR capture_active"` in `gpioGuard` | surfaces as the reply mismatch in `GpioSession` |
 
 If you change a string, grep both files. The CLI sets `FILE_NAME = "firmware.bin"` as the only host-side default the core itself doesn't know.
 
@@ -177,6 +179,10 @@ If wiring changes, only the two arrays move. The bit-banging code indexes throug
 - **`RECEIVED_DATA_TIMEOUT` (10 s)** is a fallback, not the primary terminator. The current host sends `ARDUINO_TRANSFER_DONE_SIGNAL` to end transfer immediately. Touching the timeout only matters if you also remove the explicit signal.
 - **Host always pads to 128 KB.** The sketch programs the full chip; original file size is unrecoverable. SST39xF020/040 needs both sides updated (more address pins, larger size, ID table).
 - **`verifyReadData()` is dead code.** It's defined but never called — superseded by the CRC32 sweep. Leave it alone unless asked to delete.
+- **FF-skip trades an exact erase-failure address for a 4 KB block guess — accepted.** `programChunkData` skips `0xFF` bytes, so an unerased cell at an address whose image byte is `0xFF` is no longer caught immediately by Data# polling (which used to report `Byte program timeout at 0x<addr>` and halt). It now surfaces at the end of the run as a CRC mismatch, localised by `_diagnose_verify_failure` to a 4 KB block. `doChipErase` only samples the first 1 KB, so on an image with a large `0xFF` tail that tail is exactly where erase faults are least precisely reported. This is the accepted cost of ~18 s saved per flash; the fault is still *caught*, just less precisely located.
+- **The GPIO handlers refuse during a capture, and the guard has to be forward-declared.** `handleGpioSet` / `handleGpioRead` call `gpioGuard()`, which checks `recordActive || sgpioActive` (a GPIO command mid-capture would race the reply parsing and, for SGPIO, drive the very pins being passively tapped) and bounds the pin to 0..65 (`pinMode()` indexes `g_APinDescription[]` unchecked). Both flags are **non-static with an `extern` forward declaration above the GPIO handlers** — the .ino defines them hundreds of lines later, and C++ has no tentative definitions, so `static` + a second declaration would not compile.
+- **The connection indicator takes a semantic level, not a colour.** `_set_conn(text, level)` maps through `MainWindow._CONN_COLORS` to the palette's *bright* group. The `*_dark` variants are for text on light backgrounds and measure 2.8-3.4:1 on the dark sidebar — below WCAG AA. Nine call sites previously passed raw `*_dark` colours and every one was wrong; the level API makes that unrepresentable. `QLabel#ConnDot` also carries a default colour in QSS because nothing calls `set_connection()` before the first connect.
+- **`_ensure_page` inherits the capture lock, not just the connection.** `MainWindow._capture_page` records which page owns a RECORD/SGPIO capture. `set_recording()` can only reach pages that already exist, so a page first opened *during* a capture would otherwise come up fully live and race the capture's live reader for the shared port.
 - **GUI GPIO page does not auto-Read on connect.** Rows start with an unlit read dot until the user clicks the dot (single-pin `GPIO_READ`), `Read All`, or enables the auto-read timer. An in-flight Read All is interruptible: disconnect sets the page's `_abort` event so the loop bails after at most one pending pin's `GPIO_READ_TIMEOUT_S` (1 s) instead of 66.
 - **TDBG default engine is `tdbgPlayOnceTc` (compare-interrupt), not the DWT spin loop.** The spin loop (`tdbgPlayOnceSpin`) is kept behind `#define TDBG_USE_TC_ENGINE 0` for instant rollback but its loop body itself eats ~30 cycles, so it can't honour deltas that small no matter how interrupts are masked. The TC engine's floor is ISR latency (~50-60 cycles), and crucially the floor is *deterministic* — interrupt jitter doesn't compound across events because each event is scheduled absolutely from `tdbgTcDeadline`, not relative to "where we got to in the loop". See "TDBG flow" above.
 - **Don't try to fold the long-gap chunking out of the TC ISR.** SAM3X TC channels are 16-bit native — a single RC compare can't reach more than 65535 ticks (~1.56 ms at 42 MHz). The chunking is what lets us schedule a 670 ms gap without falling off the end of the counter; collapsing it into one giant RC arm would silently miss compare matches.
@@ -197,3 +203,5 @@ The `.ino` MUST sit in a same-named subfolder (`binFileProgram/binFileProgram.in
 ## CI / release
 
 `.github/workflows/build-release.yml` builds `Arduino_Utility.exe` (PyInstaller `--onefile`, Python 3.12, Windows runner) on every push to `main` that touches non-doc files, and on `workflow_dispatch`. Onefile was chosen for distribution simplicity (single .exe, no surrounding folder) at the cost of a 5-10 s `%TEMP%` extraction on every cold launch — the GUI's lazy imports / background port scan / lazy GPIO panel only help once Python is running, they don't speed up the bootloader. There was a brief onedir+zip experiment (commit 11a5e0a, reverted) that's only relevant for understanding old release assets. Each build creates an `Auto build build-<ts>-<sha>` release marked Latest; the prune step keeps EXE assets (and any leftover legacy `.zip`) only on the 4 newest auto-builds (older release notes/tags survive). Manually-tagged semver releases (`v0.1.0`-style) are untouched by the prune.
+
+`.github/workflows/tests.yml` runs the same regression suite on **pull requests** (`ubuntu-latest`, Python 3.12). It exists as a separate workflow because `build-release.yml` triggers only on push and ends in a `make_latest` release step — adding `pull_request` there would publish a release from an unmerged branch. The apt step (`libegl1 libgl1 libxkbcommon0 libdbus-1-3 fontconfig`) is what `ldd` reports as needed by `libqoffscreen.so` / `libQt6Gui.so.6`; Qt needs them even under the offscreen platform plugin. Under the repo's usual commit-straight-to-`main` convention this workflow never fires — it only matters when work goes through a PR.

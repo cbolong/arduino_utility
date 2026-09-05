@@ -1,0 +1,53 @@
+name: Tests
+
+# Runs the offscreen regression suite on pull requests. build-release.yml
+# already runs the same suite on push to main, but it triggers only on push
+# and ends in a gh-release step marked make_latest — so it cannot be reused
+# here without publishing a release from an unmerged branch. Hence a separate,
+# read-only workflow.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Unlike build-release.yml (cancel-in-progress: false — a publish must not be
+  # halved), a superseded PR test run is dead weight: cancel it.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Qt needs these even under the offscreen platform plugin. The list is
+      # what `ldd` reports as missing for libqoffscreen.so / libQt6Gui.so.6:
+      # libEGL.so.1, libGL.so.1 (+libGLX/libGLdispatch), libxkbcommon.so.0,
+      # libdbus-1.so.3, libfontconfig.so.1. libX11.so.6 ships with the runner.
+      - name: Install Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 fontconfig
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # tests/_helpers.py already does setdefault("QT_QPA_PLATFORM",
+      # "offscreen"); setting it here too is explicit, not redundant-harmful.
+      - name: Run regression suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/run_all.py
