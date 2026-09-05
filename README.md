@@ -13,8 +13,8 @@ arduino_utility/
 │   └── binFileProgram.ino   # Arduino 端燒錄程式（燒入 Arduino Due；Arduino IDE 慣例：sketch 與資料夾同名）
 ├── binFileTransfer_core.py  # 共用核心：握手協定 + 傳輸主流程
 ├── binFileTransfer.py       # CLI 入口（argparse 包 core）
-├── binFileTransferGui.py    # Tkinter GUI 入口（包 core）
-├── requirements.txt         # PC 端 Python 相依（pyserial）
+├── binFileTransferGui.py    # PySide6 GUI 入口（QMainWindow + 共用連線管理）
+├── requirements.txt         # PC 端 Python 相依（pyserial + PySide6）
 ├── firmware.bin             # 要燒錄的二進位檔（自行放置，與 .py 同目錄；已被 .gitignore 排除）
 ├── .github/workflows/build-release.yml  # Release 觸發的 Windows EXE build
 └── spec/
@@ -34,10 +34,10 @@ arduino_utility/
 | `0xBF` (SST) | `0xB5` | SST39SF010 / SST39SF010A | 128 KB（1 Mbit）|
 | `0xBF` (SST) | `0xD5` | SST39LF010 / SST39VF010 | 128 KB（1 Mbit）|
 
-不是這兩顆會直接送 `ARDUINO_ERROR` 並停在 `while(1)`。
+不是這兩顆會印 `EEPROM ID ERROR` 但**不再停機** —— 仍進 idle loop，GPIO/TDBG/RECORD/SGPIO 照常可用；只有 `ARDUINO_ERASE_TRIGGER` 會被擋下（且會先重新偵測一次，接好晶片後直接再按燒錄即可，不必 reset）。
 如果未來要支援 SST39xF020 / SST39xF040，需要：
 - 在 `binFileProgram/binFileProgram.ino` 增加新的 `deviceID_*` 常數並修改 `readSoftwareID()` 判斷
-- 在 `binFileTransfer.py` 把 `FILE_SIZE_SUPPORT` 從 `128 * 1024` 改成 256K / 512K
+- 在 `binFileTransfer_core.py` 把 `FILE_SIZE_SUPPORT` 從 `128 * 1024` 改成 256K / 512K
 - 注意 SST39xF020 多一條 A17、SST39xF040 多到 A18，硬體接線與 `addrPins[]` 也要擴充
 
 詳細命令時序請參考 `spec/` 內的 datasheet（Section 3 / Section 4 / Figure 7-x）。
@@ -83,7 +83,7 @@ arduino_utility/
   ```bash
   pip install -r requirements.txt
   ```
-  目前只有 `pyserial>=3.5`。`tkinter` 是 Python 標準庫，GUI 不額外裝。
+  `pyserial>=3.5` 與 `PySide6>=6.6`。GUI 是 PySide6/Qt（不是 tkinter），`pip install -r requirements.txt` 會一併裝上。
 - Arduino IDE（用來燒 `binFileProgram/binFileProgram.ino` 進 Arduino Due）
 - *（可選）*想自己打 Windows EXE：`pip install pyinstaller==6.11.1`
 
@@ -102,7 +102,7 @@ arduino_utility/
 - CLI 版：預設找 `binFileTransfer.py` 同目錄下的 `firmware.bin`；要改路徑 / 改副檔名用 `--file` 指定
 - 檔案 ≤ 128 KB，超過會被腳本拒絕
 - 0 byte 空檔會被拒絕（避免使用者誤選空檔導致整片寫 0）
-- 不足 128 KB 會自動用 `0x00` padding 到 128 KB 整片寫入
+- 不足 128 KB 會自動用 `0xFF` padding 到 128 KB 整片寫入（刻意用 `0xFF` 而非 `0x00`:erase 後的 cell 本來就是 `0xFF`，燒 `0xFF` 是 no-op，因此補頁區的 erase 不完全仍會被最終 CRC 抓到而不會被遮蔽）
 - 內容只看 bytes，不檢查格式：選錯檔（例如挑到 .txt 或 .docx）會把錯誤資料燒進去，CRC32 還是會 OK，**但對目標系統就是垃圾 firmware**。重燒一次即可救回
 
 ### Step 3：執行上傳
@@ -238,9 +238,9 @@ CLI 端 `gpio_set` / `gpio_read` 仍是 one-shot（每次 open/close），給 sc
 
 容量限制：MCU 端 buffer = `TDBG_MAX_EVENTS × 5 = 20 KB`（`TDBG_MAX_EVENTS` 預設 `4096`）。原始擷取超過 4096 個 transition 時，host 端的 `parse_acute_txt` 會直接拒絕並提示。
 
-GUI 操作：在 **TDBG** tab，按 [Connect] 開啟 serial → 從 **Pin** 下拉選一個 Due GPIO（**沒有預設值**，每次都要選；Flash 匯流排上的腳位會在標籤顯示 `(WE#)` / `(A0)` 等註記讓你警覺）→ 按 [Send]。波形是寫死在 `binFileTransferGui.py` 的 `_TDBG_BUILTIN_TXT` 常數裡（單一 hard-coded pattern，沒有檔案選擇器、沒有 channel 下拉、沒有迭代次數）；按一次 Send 播一次,結束後可再按。
+GUI 操作：先按右上角 [連線] → 切到 **TDBG** 分頁 → 從 **輸出腳位** 下拉選一個 Due GPIO（**沒有預設值**，每次都要選；Flash 匯流排上的腳位會在標籤顯示 `(WE#)` / `(A0)` 等註記讓你警覺）→ 按 [TDBG1] / [TDBG2] / [TDBG3] 其中之一。三段波形是**燒在韌體裡的 preset**，host 只送 `TDBG_PRESET <n> <pin>`，MCU 自己 bit-bang 出對應圖樣後回 `TDBG_PRESET_OK <n>`。
 
-要換波形：把新的 Acute `.txt` 內容貼進 `_TDBG_BUILTIN_TXT` 三引號字串裡即可，第一次 Send 時才會 parse,壞掉的內容會在 log 裡顯示 parse error。
+要換波形：三段 preset 是 hard-coded 在 `binFileProgram.ino` 的 `sendTdbgPreset1/2/3()` 裡（三者只差最後一個 byte），改完需用 Arduino IDE 重新上傳。`TdbgSession.load()` / `play()` 的「上傳任意擷取波形」路徑仍是 library API，但 GUI 沒有對應按鈕。
 
 CLI 端目前**沒有**對應的 sub-command；要 scripting 或載入任意波形,直接 `from binFileTransfer_core import TdbgSession, parse_acute_txt`(library 端仍支援多 channel、迭代、stop event)。
 
@@ -286,6 +286,46 @@ CLI 端**沒有**對應 sub-command；要 scripting 請直接 `from binFileTrans
 > 改字串時 **兩邊一定要一起改**，否則 PC 端會等到 `handshake_timeout_s`（預設 30 秒）超時並退出，MCU 端則卡在 `while(true)`。
 > 改 `BAUD` 也是兩邊都改。混搭不同 baud 會收到亂碼。
 
+### SGPIO 被動解碼模式（GUI「SGPIO」tab 用）
+
+SFF-8485 SGPIO 的**被動解碼器**：Due 把三條訊號當**輸入**接上、全程不驅動匯流排
+（RX-only，不碰 SDataIn），解出 initiator 送給背板的 LED 控制位元流。
+
+| 訊號 | 方向 | Due 角色 |
+|---|---|---|
+| SClock | initiator → | 取樣時脈（中斷來源） |
+| SLoad | initiator → | 分幀標記 |
+| SDataOut | initiator → target | 被取樣的資料位元 |
+| ~~SDataIn~~ | target → initiator | **不接**（本工具不回應） |
+
+⚠️ 訊號需為 **3.3V**（Due 不是 5V 容忍），且必須與 SGPIO 來源**共地**。
+
+握手：
+
+| 方向 | 字串 |
+|---|---|
+| PC → MCU | `SGPIO_START <sclk> <sload> <sdata> <rising 0\|1> <sloadActiveHigh 0\|1> <frameLen>` |
+| MCU → PC | `SGPIO_STARTED`，或 `SGPIO_ERROR <why>` |
+| MCU → PC | `SGPIO_FRAME <bitstring>`（ASCII `0`/`1`，首字元 = 該幀第一個取樣位元） |
+| MCU → PC | `SGPIO_OVERRUN`（pump 來不及排空，或位元計數飽和 = SLoad 從未 assert） |
+| PC → MCU | `SGPIO_STOP` → `SGPIO_STOPPED` |
+
+MCU 只負責**擷取原始位元**：每個 SClock 有效邊緣取樣一個 SDataOut 位元，SLoad 判定幀邊界，
+並且**只在幀內容改變時**才回傳（外加約 200 ms heartbeat）—— SGPIO 是連續不停的時脈流，
+全送會塞爆 115200。
+
+**幀的語意完全在 host 端**，所以換 vendor 變體或 SLoad 慣例差一個 bit 都只是改設定、不必重燒：
+分頁裡可設 drives 數、bits/drive、header bits、MSB/LSB、取樣邊緣、SLoad 極性。
+`parse_sgpio_frame()` 依設定拆成每個 drive 的 Activity / Locate / Fault；
+`sgpio_frame_valid()` 檢查幀長是否等於 `header_bits + drives × bits/drive` ——
+**對不上就標紅，不會靜默解錯**。畫面上每個 drive 一列 A/L/F 燈號 + 原始位元 + 「已收 N 幀」。
+
+> RECORD 與 SGPIO **互斥**（兩者都要獨佔 MCU 的中斷擷取路徑）：韌體雙向拒絕，
+> GUI 也會在其中一個進行中把其他分頁灰掉。
+
+> 不需要真的 HBA 也能自測：用本工具的 **TDBG** 在三支腳打出一段已知圖樣、接回 SGPIO 的
+> 三支輸入腳，解碼結果應等於送出的內容。
+
 ---
 
 ## 7. SST39 命令序列（datasheet 整理）
@@ -323,7 +363,7 @@ Datasheet 標稱 Chip Erase typ. 70 ms。`.ino` 目前用 `delay(100)` 後做 10
 
 | 症狀 | 可能原因 | 解法 |
 |------|----------|------|
-| `Error: Arduino Device not found.` | USB 沒接 / 接到 Native Port 而非 Programming Port | 換到 Due 靠近 DC 插座那個 Port；或設 `AUTO_DETECT = 0` 手動指定 |
+| `Error: Arduino Device not found.` | USB 沒接 / 接到 Native Port 而非 Programming Port | 換到 Due 靠近 DC 插座那個 Port；或在 GUI 右上角的 Port 下拉選單手動指定（CLI 用 `--port`） |
 | `EEPROM ID ERROR!!` | 接線錯、IC 不在支援清單、VCC 沒供電 | 用三用電表先量 VDD/VSS；對著上面接線表逐條 check；不是 SST39SF010 / LF010 / VF010 就要改程式 |
 | `CHIP ERASE FAILED!` | WE# 沒接好、VCC 不穩、IC 已經寫壞 | 先試另一顆新 IC；量 WE# 訊號 |
 | `Data compare failed at 0x...` | Program 時資料線雜訊、`delayMicroseconds(30)` 不夠 | 縮短跳線、加 0.1 µF decoupling cap；必要時加大 program delay |
@@ -387,7 +427,7 @@ PyInstaller 鎖在 `==6.11.1`、Python `3.12`，避免上游升版突然壞掉�
 
 `Arduino_Utility.exe` 直接 build 在 Windows runner 上，**單檔可執行，不用裝 Python、不用裝 Visual C++ Redist、不用 pip**。Build 內含：
 - Python 3.12 直譯器
-- `tkinter` GUI runtime（標準庫，PyInstaller 自動包入）
+- PySide6/Qt GUI runtime（PyInstaller 自動包入；workflow 明確 `--exclude-module tkinter`）
 - `pyserial` + Windows COM port enumeration backend（用 `--collect-submodules serial` + `--hidden-import serial.tools.list_ports_windows` 強制納入，避免 PyInstaller 漏掉動態載入的子模組）
 
 唯一 host 端要有的東西是 **Arduino Due Programming Port 的 USB CDC driver**，這個 Windows Update 在第一次插上 Due 時會自動安裝，不用人工處理。

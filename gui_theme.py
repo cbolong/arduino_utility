@@ -93,7 +93,12 @@ QPushButton#NavButton:checked {{
     color: #ffffff; background: {p['accent']}; font-weight: 700;
     border-left: 3px solid #ffffff;
 }}
-QLabel#ConnDot {{ font-size: 13px; }}
+/* Default colour matters: set_connection() is what normally paints this
+   label, and nothing called it until the first connect — so on a fresh
+   launch the indicator fell back to Qt's default near-black text on the
+   dark sidebar and was invisible. Seed it with the same bright "not
+   connected" hue the semantic level map uses. */
+QLabel#ConnDot {{ font-size: 13px; color: {p['danger']}; }}
 
 /* ---- header strip ---- */
 QFrame#Header {{
@@ -128,7 +133,11 @@ QPushButton#accent {{
 }}
 QPushButton#accent:hover {{ background: {p['accent_dark']}; }}
 QPushButton#accent:pressed {{ background: {p['accent_dark']}; }}
-QPushButton#accent:disabled {{ background: {p['text_disabled']}; color: #ffffff; }}
+/* Disabled accent buttons are the FIRST thing the user sees on every launch
+   (開始燒錄 / 開始 / TDBG1-3 all start disabled). White on text_disabled
+   measured 1.97:1 — illegible. text_secondary gives 5.07:1, clearing the
+   4.5:1 WCAG AA floor while still reading as unmistakably "off". */
+QPushButton#accent:disabled {{ background: {p['text_secondary']}; color: #ffffff; }}
 
 /* compact toggle/secondary buttons inside dense rows */
 QPushButton#chip {{ padding: 3px 8px; border-radius: 5px; font-size: 12px; }}

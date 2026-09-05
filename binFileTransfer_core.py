@@ -31,6 +31,11 @@ FAST_PING_TIMEOUT_S = 0.5
 # 1 s is plenty and keeps a non-responding pin from stalling Read All.
 GPIO_READ_TIMEOUT_S = 1.0
 
+# Highest addressable Due digital pin. Every session that names a pin bounds
+# it against this via _Session._check_pin(); the firmware mirrors the same
+# range in its GPIO/RECORD/SGPIO handlers.
+MAX_DUE_PIN = 65
+
 # Centralised timeouts — previously these were scattered as bare 5.0 / 0.25 /
 # 0.1 / 2.0 magic numbers across every session. Names make tuning safer and
 # the next reader doesn't have to reverse-engineer "why 0.15".
@@ -580,6 +585,20 @@ class _Session:
             return False
         return True
 
+    def _check_pin(self, pin: int, what: str = "pin") -> bool:
+        """Log + return False when `pin` is outside the Due's 0..65 range.
+
+        One shared guard for every session that names a pin. Previously this
+        identical range test was written out four times (TDBG load and
+        send_preset, RECORD start, SGPIO start) and was missing entirely from
+        GpioSession — so the library/scripting entry point `gpio_set()` could
+        hand the MCU an out-of-range pin, which reaches `pinMode()` and
+        indexes g_APinDescription[] out of bounds on the SAM core."""
+        if not (0 <= pin <= MAX_DUE_PIN):
+            self._log(f"bad {what}: {pin} (valid 0..{MAX_DUE_PIN})", "err")
+            return False
+        return True
+
     def _transact(
         self, cmd: str, *, timeout_s: float = COMMAND_TIMEOUT_S,
         flush: bool = False, quiet: bool = False,
@@ -622,6 +641,8 @@ class GpioSession(_Session):
         if not self.is_open:
             self._log("GPIO session not open.", "err")
             return False
+        if not self._check_pin(pin):
+            return False
         if mode not in ("OUTPUT", "INPUT"):
             self._log(f"Invalid mode: {mode}", "err")
             return False
@@ -649,6 +670,8 @@ class GpioSession(_Session):
         if not self.is_open:
             self._log("GPIO session not open.", "err")
             return None
+        if not self._check_pin(pin):
+            return None
 
         cmd = f"GPIO_READ {pin}"
         reply = self._transact(cmd, timeout_s=GPIO_READ_TIMEOUT_S, quiet=quiet)
@@ -660,7 +683,10 @@ class GpioSession(_Session):
                 if not quiet:
                     self._log(f"recv: {reply} -> {level}", "ok")
                 return level
-        self._log(f"recv: {reply or '(no reply)'}", "err")
+        # Name the pin here, not just in the send: line — under quiet=True
+        # that send: line is suppressed, so without this a failing auto-read
+        # sweep produced 66 unattributable "recv: (no reply)" lines.
+        self._log(f"D{pin} recv: {reply or '(no reply)'}", "err")
         return None
 
 
@@ -974,8 +1000,7 @@ class TdbgSession(_Session):
         if not self.is_open:
             self._log("TDBG session not open.", "err")
             return False
-        if not (0 <= pin <= 65):
-            self._log(f"Invalid pin: {pin}", "err")
+        if not self._check_pin(pin):
             return False
         if initial_state not in (0, 1):
             self._log(f"Invalid initial state: {initial_state}", "err")
@@ -1108,8 +1133,7 @@ class TdbgSession(_Session):
         if n not in (1, 2, 3):
             self._log(f"Invalid preset: {n} (1..3)", "err")
             return False
-        if not (0 <= pin <= 65):
-            self._log(f"Invalid pin: {pin}", "err")
+        if not self._check_pin(pin):
             return False
         cmd = f"TDBG_PRESET {n} {pin}"
         reply = self._transact(cmd, flush=True)
@@ -1297,8 +1321,7 @@ class RecordSession(_Session):
             )
             return False
         for p in pins:
-            if not (0 <= p <= 65):
-                self._log(f"bad pin: {p}", "err")
+            if not self._check_pin(p):
                 return False
 
         self._pins = list(pins)
@@ -1529,6 +1552,10 @@ class RecordSession(_Session):
 import dataclasses
 
 SGPIO_MAX_DRIVES = 64           # frame ceiling; well past any real backplane
+# Must equal SGPIO_MAX_FRAME_BITS in binFileProgram.ino — the MCU's capture
+# buffer size. Mirrored host-side so a too-large framing is rejected locally
+# instead of after a serial round trip.
+SGPIO_MAX_FRAME_BITS = 256
 MCU_SGPIO_STARTED = "SGPIO_STARTED"
 MCU_SGPIO_FRAME_PREFIX = "SGPIO_FRAME"
 MCU_SGPIO_STOPPED = "SGPIO_STOPPED"
@@ -1569,6 +1596,14 @@ class SgpioFraming:
             return f"bits_per_drive {self.bits_per_drive} out of range (1..8)"
         if self.header_bits < 0:
             return f"header_bits {self.header_bits} negative"
+        # Mirror the firmware's SGPIO_MAX_FRAME_BITS ceiling (as RECORD
+        # mirrors RECORD_MAX_PINS). num_drives=64 x bits_per_drive=8 is 512
+        # bits — accepted by the checks above but rejected by the MCU, so
+        # without this the user waits for a round trip to get an opaque
+        # SGPIO_ERROR bad_framelen for a config the host already validated.
+        if self.frame_len > SGPIO_MAX_FRAME_BITS:
+            return (f"frame_len {self.frame_len} exceeds firmware limit "
+                    f"{SGPIO_MAX_FRAME_BITS}")
         return None
 
 
@@ -1674,8 +1709,7 @@ class SgpioSession(_Session):
             self._log(f"SGPIO pins must be distinct: {pins}", "err")
             return False
         for p in pins:
-            if not (0 <= p <= 65):
-                self._log(f"bad SGPIO pin: {p}", "err")
+            if not self._check_pin(p, "SGPIO pin"):
                 return False
         cfg_err = framing.validate_config()
         if cfg_err:

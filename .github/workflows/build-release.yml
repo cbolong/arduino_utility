@@ -35,6 +35,15 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.11.1
 
+      # Gate the release on the offscreen suite. Every push to main becomes
+      # the "Latest" download, so shipping without running the tests that
+      # already exist means users get whatever compiled. QT_QPA_PLATFORM
+      # makes the GUI modules run headless on the CI runner.
+      - name: Run regression suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/run_all.py
+
       - name: Generate Windows version-info file
         shell: bash
         run: |

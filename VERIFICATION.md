@@ -116,7 +116,20 @@
 | 縮圖 | 無軌線、點擊開預覽 | 自動 W6 |
 | 放大後拖曳平移 | 左鍵拖 = 捲動,游標手勢回饋 | 自動 W7 |
 
-## 8. Worker / 基礎設施
+## 8. 窮舉驗證(test_exhaustive.py)
+
+| 情境 | 預期行為 | 驗證 |
+|---|---|---|
+| `set_pin` mode × value 全 12 組 | 合法組合上線且 wire 格式正確;非法組合本地拒絕不上線 | 自動 E1 |
+| `parse_sgpio_frame` bits 1..8 × MSB/LSB 全 16 組 | value 算術正確;具名欄位僅 bits==3 | 自動 E2 |
+| `validate_config` 各參數 min-1/min/max/max+1 + frame_len 上限 | 邊界內外皆正確 | 自動 E3 |
+| `parse_record_blob` 事件數 0/1/多 × pin 數 1..4 | mask bit i → pins[i];畸零長度 raise | 自動 E4 |
+| `play` iterations {-1,0,1,2,5} | <1 拒絕;==1 送 PLAY;>=2 送 PLAY_LOOP | 自動 E5 |
+| 五個 session 進入點 × pin {-1,0,65,66} | 越界一律本地拒絕、不上線 | 自動 E6 |
+| capture 中「首次」建立的頁面 | 必須繼承鎖定;capture 結束後恢復;斷線清除鎖 | 自動 E7 |
+| 連線指示器 + 停用按鈕對比 | 啟動時與所有狀態皆 ≥4.5:1(程式化計算) | 自動 E8 |
+
+## 9. Worker / 基礎設施
 
 | 情境 | 預期行為 | 驗證 |
 |---|---|---|
